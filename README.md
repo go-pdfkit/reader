@@ -55,10 +55,12 @@ the **document structure**:
   otherwise every candidate EI is tried until the data before one actually
   decodes.
 - **Writing** — the exact inverse of the parser: objects rendered in PDF
-  syntax with stable dictionary ordering, and a `Writer` that copies whole
-  object graphs out of one or more documents, renumbering as it goes, then
-  lays down a cross-reference table and a trailer.
-
+  syntax with stable dictionary ordering and strings in whichever of the two
+  forms is shorter, and a `Writer` that copies whole object graphs out of one
+  or more documents, renumbering as it goes, then lays down a cross-reference
+  table and a trailer. `NewPackedWriter` instead puts what it can into
+  compressed **object streams** and ends in a **cross-reference stream**,
+  which is what makes a file small.
 Measured against a corpus of **118 863 real PDFs** — Matplotlib, cairo,
 pdfTeX, Ghostscript, Adobe, R, Apache FOP, PDF 1.3 through 1.7 — `Open`
 succeeds on **118 833** of them and finds 138 337 pages, in 8 seconds, with no
@@ -79,7 +81,9 @@ decode, and no operator outside the seventy the format defines — beyond four
 Rewriting is checked the same way: every one of the **118 833** files that
 open is copied object by object into a new file, which is then re-read and
 compared on page count, media boxes and the bytes of every content stream.
-**All 118 833 match**, 35.5 GB in and 35.2 GB out, in twenty-eight seconds.
+**All 118 833 match**, 35.5 GB in and 35.2 GB out, in twenty-eight seconds —
+and **all 118 833 match again** when the packed writer is used instead, which
+brings the output down to **94.6%** of the input.
 
 Next wave: the operations built on all of this.
 
