@@ -15,20 +15,29 @@ var inheritable = []Name{"Resources", "MediaBox", "CropBox", "Rotate"}
 // A Document is a parsed PDF file: its cross-reference information, its
 // trailer, and lazy access to every object in it.
 type Document struct {
-	buf      []byte
-	xref     map[int]xrefEntry
-	trailer  Dict
-	cache    map[int]Object
-	loading  map[int]bool
-	objStms  map[int]map[int]Object
-	pages    []Ref
-	repaired bool
+	buf          []byte
+	xref         map[int]xrefEntry
+	trailer      Dict
+	cache        map[int]Object
+	loading      map[int]bool
+	objStms      map[int]map[int]Object
+	pages        []Ref
+	decrypt      *decryptor
+	encryptNum   int
+	encryptKnown bool
+	repaired     bool
 }
 
-// Open parses the cross-reference information of a PDF file held in memory.
-// A file whose tables are damaged is rebuilt by scanning it, so Open fails
-// only when there is no usable document structure at all.
-func Open(b []byte) (*Document, error) {
+// Open parses the cross-reference information of a PDF file held in memory,
+// using the empty password. A file whose tables are damaged is rebuilt by
+// scanning it, so Open fails only when there is no usable document structure
+// at all, or when the file is encrypted and the empty password does not open
+// it — [OpenWithPassword] then does.
+func Open(b []byte) (*Document, error) { return OpenWithPassword(b, "") }
+
+// OpenWithPassword is Open with a password to try. The password is tried both
+// as the user password and as the owner password, the empty one as well.
+func OpenWithPassword(b []byte, password string) (*Document, error) {
 	d := &Document{
 		buf:     b,
 		xref:    map[int]xrefEntry{},
@@ -38,6 +47,10 @@ func Open(b []byte) (*Document, error) {
 	}
 	err := d.loadXref()
 	if err == nil {
+		if derr := d.setUpDecryption(password); derr != nil {
+			return nil, derr
+		}
+		d.cache = map[int]Object{}
 		if _, cerr := d.Catalog(); cerr == nil {
 			return d, nil
 		}
@@ -46,6 +59,15 @@ func Open(b []byte) (*Document, error) {
 	}
 	if rerr := d.repair(); rerr != nil {
 		return nil, err
+	}
+	if d.decrypt == nil {
+		if derr := d.setUpDecryption(password); derr != nil {
+			return nil, derr
+		}
+		// Whatever was read while the key was still unknown must be read again.
+		d.cache = map[int]Object{}
+		d.objStms = map[int]map[int]Object{}
+		d.pages = nil
 	}
 	return d, nil
 }
@@ -120,6 +142,9 @@ func (d *Document) getAtOffset(num int, e xrefEntry) (Object, error) {
 	if got.Num != num {
 		return d.retryAfterRepair(num, fmt.Errorf("reader: offset %d holds object %d, not %d", e.offset, got.Num, num))
 	}
+	if d.decrypt != nil {
+		obj = d.decrypt.decryptObject(num, got.Gen, obj)
+	}
 	return obj, nil
 }
 
@@ -138,6 +163,9 @@ func (d *Document) retryAfterRepair(num int, cause error) (Object, error) {
 	got, obj, _, err := ParseIndirectObject(d.buf[e.offset:], d.Get)
 	if err != nil || got.Num != num {
 		return Null{}, nil
+	}
+	if d.decrypt != nil {
+		obj = d.decrypt.decryptObject(num, got.Gen, obj)
 	}
 	return obj, nil
 }
