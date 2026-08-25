@@ -196,6 +196,7 @@ type Writer struct {
 	copied  map[*Document]map[int]Ref
 	err     error
 	pack    bool
+	encrypt *encrypter
 }
 
 // NewWriter starts a file with the given version in its header, "1.7" when the
@@ -259,15 +260,38 @@ func (w *Writer) Put(ref Ref, o Object) {
 	w.writeInline(ref, o)
 }
 
-// writeInline writes an object where it stands in the file.
+// writeInline writes an object where it stands in the file, compressed and
+// then encrypted — in that order, since encrypted bytes do not compress.
 func (w *Writer) writeInline(ref Ref, o Object) {
-	if s, ok := o.(*Stream); ok && w.pack && s.Dict.Get("Filter").Kind() == KindNull {
-		// Nothing this package generated arrives compressed, and a packed
-		// file is being written to be small.
-		s = &Stream{Dict: cloneDict(s.Dict), Raw: flateCompress(s.Raw)}
-		s.Dict["Filter"] = Name("FlateDecode")
-		o = s
+	o = w.compressStream(o)
+	if w.encrypt != nil {
+		o = w.encrypt.apply(ref.Num, ref.Gen, o)
 	}
+	w.emit(ref, o)
+}
+
+// writeInlineRaw writes an object that must not be encrypted: the /Encrypt
+// dictionary itself, and the cross-reference stream, neither of which a
+// reader could decrypt, since it needs them to work out how.
+func (w *Writer) writeInlineRaw(ref Ref, o Object) {
+	w.emit(ref, w.compressStream(o))
+}
+
+// compressStream deflates a stream that arrives with no filter of its own,
+// when the file is being written to be small.
+func (w *Writer) compressStream(o Object) Object {
+	s, ok := o.(*Stream)
+	if !ok || !w.pack || s.Dict.Get("Filter").Kind() != KindNull {
+		return o
+	}
+	// Nothing this package generated arrives compressed.
+	out := &Stream{Dict: cloneDict(s.Dict), Raw: flateCompress(s.Raw)}
+	out.Dict["Filter"] = Name("FlateDecode")
+	return out
+}
+
+// emit writes an object and remembers where it went.
+func (w *Writer) emit(ref Ref, o Object) {
 	w.offsets[ref.Num] = w.buf.Len()
 	fmt.Fprintf(&w.buf, "%d %d obj\n", ref.Num, ref.Gen)
 	w.buf.Write(AppendObject(nil, o))
@@ -304,6 +328,12 @@ func (w *Writer) note(err error) {
 // file. /Size is filled in; the caller supplies /Root and whatever else the
 // trailer needs.
 func (w *Writer) Finish(trailer Dict) ([]byte, error) {
+	// The caller's dictionary is left as it was; what a file needs to say
+	// about its own encryption is added to a copy.
+	trailer = cloneDict(trailer)
+	for k, v := range w.writeEncryptDict() {
+		trailer[k] = v
+	}
 	if w.pack {
 		return w.finishWithXrefStream(trailer)
 	}
@@ -331,6 +361,9 @@ func (w *Writer) Finish(trailer Dict) ([]byte, error) {
 	w.buf.WriteString("trailer\n")
 	w.buf.Write(AppendObject(nil, out))
 	fmt.Fprintf(&w.buf, "\nstartxref\n%d\n%%%%EOF\n", start)
+	if w.encrypt != nil && w.encrypt.err != nil {
+		w.note(w.encrypt.err)
+	}
 	if w.err != nil {
 		return nil, w.err
 	}

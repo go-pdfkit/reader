@@ -42,12 +42,13 @@ the **document structure**:
 - **Documents** — `Open`, object resolution with cycle and recursion guards,
   the trailer, the catalogue, and the page tree with the four attributes a
   page inherits from its ancestors.
-- **Encryption** — the standard security handler in every revision: RC4 at 40
-  and 128 bits, AESV2, and the AES-256 of `/R 5` and `/R 6`, with crypt
-  filters, `/Identity`, and `/EncryptMetadata`. A password is tried as the
-  user password and as the owner password, and `Open` uses the empty one, so
-  a file protected only against editing opens with no password at all.
-- **Content streams** — a tokeniser that yields operators with their operands
+- **Encryption** — the standard security handler in every revision, both ways:
+  reading RC4 at 40 and 128 bits, AESV2, and the AES-256 of `/R 5` and `/R 6`,
+  with crypt filters, `/Identity` and `/EncryptMetadata`; and writing AES-256
+  or AES-128, with permissions, a user password and an owner password.
+  A password is tried as the user password and as the owner password, and
+  `Open` uses the empty one, so a file protected only against editing opens
+  with no password at all.
   and steps over rubbish rather than losing the operations around it, with
   inline images read whole. Where an inline image ends is the one genuinely
   ambiguous thing in a content stream, since its data may spell EI itself;
