@@ -159,14 +159,34 @@ func (l *lexer) keyword(start int) token {
 	return token{kind: tokKeyword, text: l.buf[start:p], pos: start}
 }
 
-// number reads an integer or a real.
+// number reads an integer or a real. It stops at the first byte that cannot
+// continue the number rather than swallowing the whole run of regular
+// characters: producers do write "3.4-5" for two numbers, and a reader that
+// rejects that loses the rest of the content stream.
 func (l *lexer) number(start int) (token, error) {
 	p := l.pos
-	for p < len(l.buf) && isRegular(l.buf[p]) {
+	for p < len(l.buf) && (l.buf[p] == '+' || l.buf[p] == '-') {
 		p++
 	}
+	digits, dot := 0, false
+	for p < len(l.buf) {
+		c := l.buf[p]
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.' && !dot:
+			dot = true
+		default:
+			goto done
+		}
+		p++
+	}
+done:
 	s := l.buf[l.pos:p]
 	l.pos = p
+	if digits == 0 {
+		return token{}, &SyntaxError{start, "malformed number " + strconv.Quote(string(s))}
+	}
 	if i, err := strconv.ParseInt(string(s), 10, 64); err == nil {
 		return token{kind: tokInteger, i: i, f: float64(i), pos: start}, nil
 	}
@@ -177,11 +197,11 @@ func (l *lexer) number(start int) (token, error) {
 	return token{kind: tokReal, i: int64(f), f: f, pos: start}, nil
 }
 
-// parseReal accepts what producers actually write, which is a superset of what
-// the grammar allows: "4.", "-.002", and the doubled sign of "--5" (only the
-// first sign counts). An exponent is not PDF syntax and is rejected.
+// parseReal accepts the doubled sign of "--5", which producers do write; only
+// the first sign counts. Everything else has already been filtered out by the
+// scan above.
 func parseReal(s []byte) (float64, error) {
-	clean := make([]byte, 0, len(s)+1)
+	clean := make([]byte, 0, len(s))
 	i := 0
 	if i < len(s) && (s[i] == '+' || s[i] == '-') {
 		clean = append(clean, s[i])
@@ -190,28 +210,9 @@ func parseReal(s []byte) (float64, error) {
 	for i < len(s) && (s[i] == '+' || s[i] == '-') {
 		i++
 	}
-	digits, dot := 0, false
-	for ; i < len(s); i++ {
-		switch c := s[i]; {
-		case c >= '0' && c <= '9':
-			digits++
-			clean = append(clean, c)
-		case c == '.' && !dot:
-			dot = true
-			clean = append(clean, c)
-		default:
-			return 0, errNotANumber
-		}
-	}
-	if digits == 0 {
-		return 0, errNotANumber
-	}
+	clean = append(clean, s[i:]...)
 	return strconv.ParseFloat(string(clean), 64)
 }
-
-// errNotANumber is internal: [lexer.number] turns it into a SyntaxError that
-// carries the offset.
-var errNotANumber = fmt.Errorf("reader: not a number")
 
 // literalString reads a (parenthesised) string, resolving escapes. Nested
 // parentheses nest; an end-of-line inside the string, however written, becomes

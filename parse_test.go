@@ -59,13 +59,13 @@ func TestParseObjectErrors(t *testing.T) {
 		"]",          // a token no object starts with
 		"endobj",     // an unexpected keyword
 		"[1",         // unterminated array
-		"[1.2.3]",    // a lexer error inside an array
 		"<< /A 1",    // unterminated dictionary
 		"<< 1 2 >>",  // a key that is not a name
 		"<< /A ] >>", // a bad value
 		"<< /A",      // a value that is missing entirely
 		"<< /A#2 1 >>",
 		"[/A#2]",
+		"(",        // a lexer error where an object should start
 		"[1 -2 R]", // a stray keyword where a value belongs
 	} {
 		if _, _, err := ParseObject([]byte(src)); err == nil {
@@ -126,9 +126,8 @@ func TestParseIndirectObjectErrors(t *testing.T) {
 		"7 0 obj ] endobj",            // the body does not parse
 		"7 0 obj 1 stream\n",          // a stream keyword after a non-dictionary
 		"7 0 obj\n<< >>\nstream\nabc", // no endstream
-		"7 0 obj 1.2.3 endobj",        // a lexer error in the body
-		"7 1.2.3 obj 1 endobj",        // a lexer error in the generation
-		"1.2.3 0 obj 1 endobj",        // a lexer error in the object number
+		"7 1.2.3 obj 1 endobj",        // a generation number that is not an integer
+		"1.2.3 0 obj 1 endobj",        // an object number that is not an integer
 	} {
 		if _, _, _, err := ParseIndirectObject([]byte(src), nil); err == nil {
 			t.Errorf("%q: want an error", src)
