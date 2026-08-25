@@ -41,6 +41,11 @@ the **document structure**:
 - **Documents** — `Open`, object resolution with cycle and recursion guards,
   the trailer, the catalogue, and the page tree with the four attributes a
   page inherits from its ancestors.
+- **Encryption** — the standard security handler in every revision: RC4 at 40
+  and 128 bits, AESV2, and the AES-256 of `/R 5` and `/R 6`, with crypt
+  filters, `/Identity`, and `/EncryptMetadata`. A password is tried as the
+  user password and as the owner password, and `Open` uses the empty one, so
+  a file protected only against editing opens with no password at all.
 
 Measured against a corpus of **118 863 real PDFs** — Matplotlib, cairo,
 pdfTeX, Ghostscript, Adobe, R, Apache FOP, PDF 1.3 through 1.7 — `Open`
@@ -48,8 +53,13 @@ succeeds on **118 833** of them and finds 138 337 pages, in 8 seconds, with no
 panics. Of the thirty it refuses, twenty-seven are PNG files with a `.pdf`
 extension, one is PostScript, and two are PDFs truncated past recovery.
 
-Next waves: the standard security handler (RC4, AESV2, AESV3), the
-content-stream tokeniser, and a serialiser.
+The one encrypted PDF the corpus holds — `/V 4 /R 4`, written by macOS
+Quartz — decrypts to readable metadata and a valid content stream, which is
+the only genuinely independent check of the key derivation there is here;
+the other revisions are round-tripped against a test encryptor written from
+the same algorithms.
+
+Next waves: the content-stream tokeniser and a serialiser.
 
 ## Install
 
