@@ -46,6 +46,13 @@ the **document structure**:
   filters, `/Identity`, and `/EncryptMetadata`. A password is tried as the
   user password and as the owner password, and `Open` uses the empty one, so
   a file protected only against editing opens with no password at all.
+- **Content streams** — a tokeniser that yields operators with their operands
+  and steps over rubbish rather than losing the operations around it, with
+  inline images read whole. Where an inline image ends is the one genuinely
+  ambiguous thing in a content stream, since its data may spell EI itself;
+  the length is computed from the image's own geometry where it can be, and
+  otherwise every candidate EI is tried until the data before one actually
+  decodes.
 
 Measured against a corpus of **118 863 real PDFs** — Matplotlib, cairo,
 pdfTeX, Ghostscript, Adobe, R, Apache FOP, PDF 1.3 through 1.7 — `Open`
@@ -59,7 +66,12 @@ the only genuinely independent check of the key derivation there is here;
 the other revisions are round-tripped against a test encryptor written from
 the same algorithms.
 
-Next waves: the content-stream tokeniser and a serialiser.
+The content-stream tokeniser reads **1 536 769 753 operations** across those
+138 337 pages in a minute and a half, with no panics, no page failing to
+decode, and no operator outside the seventy the format defines — beyond four
+`arc` and six `nan` written by a producer that was simply wrong.
+
+Next waves: a serialiser, and the operations built on it.
 
 ## Install
 
