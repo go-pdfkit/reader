@@ -189,21 +189,42 @@ func appendStream(dst []byte, s *Stream) []byte {
 type Writer struct {
 	buf     bytes.Buffer
 	offsets map[int]int
+	packed  map[int]packedAt
+	pending []pendingObject
+	seen    map[int]bool
 	next    int
 	copied  map[*Document]map[int]Ref
 	err     error
+	pack    bool
 }
 
 // NewWriter starts a file with the given version in its header, "1.7" when the
-// version is empty.
-func NewWriter(version string) *Writer {
+// version is empty. Objects are written one after another and the file ends in
+// a cross-reference table, which every reader that has ever existed can read.
+func NewWriter(version string) *Writer { return newWriter(version, false) }
+
+// NewPackedWriter starts a file that puts what it can into compressed object
+// streams and ends in a cross-reference stream. That is smaller — usually by
+// a lot, since a file is mostly small dictionaries — and has been readable
+// since PDF 1.5, which is 2003; the version in the header is raised to 1.5 if
+// it is lower.
+func NewPackedWriter(version string) *Writer { return newWriter(version, true) }
+
+// newWriter starts a file of either kind.
+func newWriter(version string, pack bool) *Writer {
 	if version == "" {
 		version = "1.7"
 	}
+	if pack && version < "1.5" {
+		version = "1.5"
+	}
 	w := &Writer{
 		offsets: map[int]int{},
+		packed:  map[int]packedAt{},
+		seen:    map[int]bool{},
 		next:    1,
 		copied:  map[*Document]map[int]Ref{},
+		pack:    pack,
 	}
 	fmt.Fprintf(&w.buf, "%%PDF-%s\n", version)
 	// The four bytes above 127 tell every tool downstream that this file is
@@ -221,17 +242,45 @@ func (w *Writer) Reserve() Ref {
 
 // Put writes an object under a reserved number.
 func (w *Writer) Put(ref Ref, o Object) {
-	if _, seen := w.offsets[ref.Num]; seen {
+	if w.seen[ref.Num] {
 		w.note(fmt.Errorf("reader: object %d written twice", ref.Num))
 		return
 	}
+	w.seen[ref.Num] = true
 	if ref.Num >= w.next {
 		w.next = ref.Num + 1
+	}
+	// A stream cannot go inside another stream, and only generation zero may
+	// be packed; everything else can wait to be gathered up at the end.
+	if _, isStream := o.(*Stream); w.pack && !isStream && ref.Gen == 0 {
+		w.pending = append(w.pending, pendingObject{ref: ref, obj: o})
+		return
+	}
+	w.writeInline(ref, o)
+}
+
+// writeInline writes an object where it stands in the file.
+func (w *Writer) writeInline(ref Ref, o Object) {
+	if s, ok := o.(*Stream); ok && w.pack && s.Dict.Get("Filter").Kind() == KindNull {
+		// Nothing this package generated arrives compressed, and a packed
+		// file is being written to be small.
+		s = &Stream{Dict: cloneDict(s.Dict), Raw: flateCompress(s.Raw)}
+		s.Dict["Filter"] = Name("FlateDecode")
+		o = s
 	}
 	w.offsets[ref.Num] = w.buf.Len()
 	fmt.Fprintf(&w.buf, "%d %d obj\n", ref.Num, ref.Gen)
 	w.buf.Write(AppendObject(nil, o))
 	w.buf.WriteString("\nendobj\n")
+}
+
+// cloneDict copies a dictionary one level deep.
+func cloneDict(d Dict) Dict {
+	out := Dict{}
+	for k, v := range d {
+		out[k] = v
+	}
+	return out
 }
 
 // Add reserves a number, writes the object under it and returns the reference.
@@ -255,6 +304,9 @@ func (w *Writer) note(err error) {
 // file. /Size is filled in; the caller supplies /Root and whatever else the
 // trailer needs.
 func (w *Writer) Finish(trailer Dict) ([]byte, error) {
+	if w.pack {
+		return w.finishWithXrefStream(trailer)
+	}
 	high := 0
 	for num := range w.offsets {
 		if num > high {
