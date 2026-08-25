@@ -32,7 +32,11 @@ func TestAppendObject(t *testing.T) {
 		{String("plain"), "(plain)"},
 		{String("a(b)c\\"), `(a\(b\)c\\)`},
 		{String("\n\r\t"), `(\n\r\t)`},
-		{String{0x00, 0xFF}, `(\000\377)`},
+		{String{0x00, 0xFF}, "<00FF>"},
+		// One awkward byte in a long readable string still comes out readable.
+		{String("a readable line with one \x00 in it"), `(a readable line with one \000 in it)`},
+		// Text in UTF-16 goes out as hex, which is half the size.
+		{String{0xFE, 0xFF, 0x00, 0x41}, "<FEFF0041>"},
 		{Name("Simple"), "/Simple"},
 		{Name("With Space"), "/With#20Space"},
 		{Name("h#sh"), "/h#23sh"},
