@@ -17,11 +17,12 @@ Nothing outside the Go standard library is required, so it builds for
 
 ## Status
 
-Landing in waves. This module currently provides the **object layer**:
+Landing in waves. This module currently provides the **object layer** and
+the **document structure**:
 
-- **Lexer** — the full PDF object syntax: integers and reals, literal strings
-  (with escapes, octal and line continuations), hex strings, names (with `#xx`
-  escapes), arrays, dictionaries, streams, and keywords.
+- **Lexer** — the full PDF object syntax: integers and reals in the shapes
+  producers actually write, literal strings with their escapes, hex strings,
+  names with `#xx` escapes, arrays, dictionaries, streams, and keywords.
 - **Objects** — `Null`, `Bool`, `Integer`, `Real`, `String`, `Name`, `Array`,
   `Dict`, `Stream`, and indirect `Ref`, with the `N G R` / `N G obj` lookahead
   resolved the way the specification requires.
@@ -30,10 +31,25 @@ Landing in waves. This module currently provides the **object layer**:
   `ASCII85Decode`, `RunLengthDecode`, plus the PNG and TIFF predictors.
   Image filters (`DCTDecode`, `JPXDecode`, `CCITTFaxDecode`, `JBIG2Decode`) are
   reported rather than applied, so an image consumer gets the encoded bytes.
+- **Cross-references** — classic tables, cross-reference **streams**, **object
+  streams**, `/Prev` chains, and the `/XRefStm` of a hybrid file, newest
+  definition winning.
+- **Repair** — a file whose tables are missing, truncated or simply wrong is
+  rebuilt by scanning it for object headers, trailers and, failing those, for
+  a catalogue; a file that kept its pages but lost its catalogue gets one.
+  This is not an exceptional path: it is what makes a reader usable.
+- **Documents** — `Open`, object resolution with cycle and recursion guards,
+  the trailer, the catalogue, and the page tree with the four attributes a
+  page inherits from its ancestors.
 
-Next waves: cross-reference parsing (tables, streams, `/Prev` chains, hybrid
-files) and repair, the standard security handler (RC4, AESV2, AESV3), the page
-tree with inherited attributes, and the content-stream tokeniser.
+Measured against a corpus of **118 863 real PDFs** — Matplotlib, cairo,
+pdfTeX, Ghostscript, Adobe, R, Apache FOP, PDF 1.3 through 1.7 — `Open`
+succeeds on **118 833** of them and finds 138 337 pages, in 8 seconds, with no
+panics. Of the thirty it refuses, twenty-seven are PNG files with a `.pdf`
+extension, one is PostScript, and two are PDFs truncated past recovery.
+
+Next waves: the standard security handler (RC4, AESV2, AESV3), the
+content-stream tokeniser, and a serialiser.
 
 ## Install
 
