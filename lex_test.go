@@ -100,7 +100,8 @@ func TestLexNumbers(t *testing.T) {
 }
 
 func TestLexMalformedNumbers(t *testing.T) {
-	for _, src := range []string{"1.2.3", "-", "+", ".", "1e5", "12x"} {
+	// A run with no digits at all is the only thing left that is not a number:
+	for _, src := range []string{"-", "+", "."} {
 		if _, err := lexAll(t, src); err == nil {
 			t.Errorf("%q: want an error", src)
 		}
@@ -111,6 +112,33 @@ func TestLexMalformedNumbers(t *testing.T) {
 	}
 }
 
+func TestLexNumbersStopAtTheFirstByteThatCannotContinue(t *testing.T) {
+	// The lexer hands back the number and leaves the rest to be read as
+	// whatever it is, which is what keeps "3.4-5" and "12x" readable.
+	cases := []struct {
+		src   string
+		kinds []tokKind
+	}{
+		{"12x", []tokKind{tokInteger, tokKeyword}},
+		{"1.2.3", []tokKind{tokReal, tokReal}},
+		{"3.4-5", []tokKind{tokReal, tokInteger}},
+		{"1e5", []tokKind{tokInteger, tokKeyword}},
+	}
+	for _, c := range cases {
+		toks, err := lexAll(t, c.src)
+		if err != nil {
+			t.Fatalf("%q: %v", c.src, err)
+		}
+		if len(toks) != len(c.kinds) {
+			t.Fatalf("%q: got %d tokens, want %d", c.src, len(toks), len(c.kinds))
+		}
+		for i, k := range c.kinds {
+			if toks[i].kind != k {
+				t.Errorf("%q: token %d = %v, want %v", c.src, i, toks[i].kind, k)
+			}
+		}
+	}
+}
 func TestLexLiteralStrings(t *testing.T) {
 	cases := []struct{ src, want string }{
 		{"()", ""},
