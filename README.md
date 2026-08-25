@@ -8,10 +8,11 @@
 
 A pure-Go, **zero-C** PDF **reader** — the parsing half of
 [go-pdfkit](https://github.com/go-pdfkit). Where
-[`pdfkit`](https://github.com/go-pdfkit/pdfkit) writes PDF 1.7, this module
-takes existing PDF bytes apart: lexer, object model, cross-reference tables and
-streams, stream filters, the standard security handler, and the page tree.
-
+[`pdfkit`](https://github.com/go-pdfkit/pdfkit) authors new PDF 1.7, this
+module takes existing PDF bytes apart: lexer, object model, cross-reference
+tables and streams, stream filters, the standard security handler, the page
+tree, and content streams. It also writes the same object graph back out,
+which is what every operation on an existing file needs.
 Nothing outside the Go standard library is required, so it builds for
 `GOOS=js/wasm` and every 64-bit architecture the fleet targets.
 
@@ -53,6 +54,10 @@ the **document structure**:
   the length is computed from the image's own geometry where it can be, and
   otherwise every candidate EI is tried until the data before one actually
   decodes.
+- **Writing** — the exact inverse of the parser: objects rendered in PDF
+  syntax with stable dictionary ordering, and a `Writer` that copies whole
+  object graphs out of one or more documents, renumbering as it goes, then
+  lays down a cross-reference table and a trailer.
 
 Measured against a corpus of **118 863 real PDFs** — Matplotlib, cairo,
 pdfTeX, Ghostscript, Adobe, R, Apache FOP, PDF 1.3 through 1.7 — `Open`
@@ -71,7 +76,12 @@ The content-stream tokeniser reads **1 536 769 753 operations** across those
 decode, and no operator outside the seventy the format defines — beyond four
 `arc` and six `nan` written by a producer that was simply wrong.
 
-Next waves: a serialiser, and the operations built on it.
+Rewriting is checked the same way: every one of the **118 833** files that
+open is copied object by object into a new file, which is then re-read and
+compared on page count, media boxes and the bytes of every content stream.
+**All 118 833 match**, 35.5 GB in and 35.2 GB out, in twenty-eight seconds.
+
+Next wave: the operations built on all of this.
 
 ## Install
 
