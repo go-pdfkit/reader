@@ -7,6 +7,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"fmt"
+	"strings"
 )
 
 // Permissions say what a reader may do with a file it can open with the user
@@ -31,6 +32,39 @@ const (
 	AllPermissions = PermPrint | PermModify | PermCopy | PermAnnotate |
 		PermFillForms | PermExtract | PermAssemble | PermPrintFaithful
 )
+
+// permissionNames pairs each permission with what it lets a reader do, in the
+// order a person would want to read them.
+var permissionNames = []struct {
+	bit  Permissions
+	name string
+}{
+	{PermPrint, "print"},
+	{PermPrintFaithful, "print at full resolution"},
+	{PermModify, "modify"},
+	{PermAssemble, "assemble"},
+	{PermCopy, "copy"},
+	{PermExtract, "extract for accessibility"},
+	{PermAnnotate, "annotate"},
+	{PermFillForms, "fill in forms"},
+}
+
+// Allows reports whether every one of the given permissions is granted.
+func (p Permissions) Allows(want Permissions) bool { return p&want == want }
+
+// String lists what is granted, in words.
+func (p Permissions) String() string {
+	var out []string
+	for _, e := range permissionNames {
+		if p.Allows(e.bit) {
+			out = append(out, e.name)
+		}
+	}
+	if len(out) == 0 {
+		return "nothing"
+	}
+	return strings.Join(out, ", ")
+}
 
 // permissionBase is the pattern of reserved bits the specification requires
 // around the permissions themselves.

@@ -363,3 +363,93 @@ func TestRandomnessRunningOutAtEachStep(t *testing.T) {
 		})
 	}
 }
+
+func TestWhatAProtectedFileSaysAboutItself(t *testing.T) {
+	// A file that opened has already been decrypted; what it said about
+	// itself on the way is what a person needs to be told.
+	cases := []struct {
+		name       string
+		enc        Encryption
+		open       string
+		wantMethod string
+		wantRev    int
+		wantOwner  bool
+	}{
+		{"AES-256 opened by the user", Encryption{
+			UserPassword: "u", OwnerPassword: "o", Permissions: PermPrint,
+		}, "u", "AES-256", 6, false},
+		{"AES-256 opened by the owner", Encryption{
+			UserPassword: "u", OwnerPassword: "o", Permissions: PermPrint,
+		}, "o", "AES-256", 6, true},
+		{"AES-128 opened by the user", Encryption{
+			UserPassword: "u", OwnerPassword: "o", Permissions: PermPrint | PermCopy, AES128: true,
+		}, "u", "AES-128", 4, false},
+		{"AES-128 opened by the owner", Encryption{
+			UserPassword: "u", OwnerPassword: "o", Permissions: PermPrint | PermCopy, AES128: true,
+		}, "o", "AES-128", 4, true},
+	}
+	for _, c := range cases {
+		out := protectedFile(t, false, c.enc)
+		d, err := OpenWithPassword(out, c.open)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		p, ok := d.Protection()
+		if !ok {
+			t.Fatalf("%s: an encrypted file says it is not protected", c.name)
+		}
+		if p.Method != c.wantMethod {
+			t.Errorf("%s: method %q, want %q", c.name, p.Method, c.wantMethod)
+		}
+		if p.Revision != c.wantRev {
+			t.Errorf("%s: revision %d, want %d", c.name, p.Revision, c.wantRev)
+		}
+		if p.Owner != c.wantOwner {
+			t.Errorf("%s: opened as owner = %v, want %v", c.name, p.Owner, c.wantOwner)
+		}
+		if p.Permissions != c.enc.Permissions {
+			t.Errorf("%s: permissions %v, want %v", c.name, p.Permissions, c.enc.Permissions)
+		}
+	}
+
+	// A file with nothing to hide says so.
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page}, "Count": Integer(1)})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := d.Protection(); ok {
+		t.Errorf("an unencrypted file reported %+v", p)
+	}
+}
+
+func TestPermissionsInWords(t *testing.T) {
+	cases := []struct {
+		perm Permissions
+		want string
+	}{
+		{0, "nothing"},
+		{PermPrint, "print"},
+		{PermPrint | PermCopy, "print, copy"},
+		{AllPermissions, "print, print at full resolution, modify, assemble, copy, extract for accessibility, annotate, fill in forms"},
+	}
+	for _, c := range cases {
+		if got := c.perm.String(); got != c.want {
+			t.Errorf("%d: %q, want %q", uint32(c.perm), got, c.want)
+		}
+	}
+	if !AllPermissions.Allows(PermPrint | PermCopy) {
+		t.Error("everything does not allow printing and copying")
+	}
+	if (PermPrint).Allows(PermPrint | PermCopy) {
+		t.Error("printing alone allowed copying")
+	}
+}
