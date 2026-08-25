@@ -73,6 +73,8 @@ func flateCompress(data []byte) []byte {
 // rather than a table, which is the only form that can name an object inside
 // an object stream.
 func (w *Writer) finishWithXrefStream(trailer Dict) ([]byte, error) {
+	// Finish has already written the /Encrypt dictionary and put what a
+	// reader needs into the trailer.
 	w.packObjects()
 	xref := w.Reserve()
 	// The cross-reference stream is reserved after everything else — the
@@ -105,8 +107,11 @@ func (w *Writer) finishWithXrefStream(trailer Dict) ([]byte, error) {
 	for k, v := range trailer {
 		dict[k] = v
 	}
-	w.writeInline(xref, &Stream{Dict: dict, Raw: rows})
+	w.writeInlineRaw(xref, &Stream{Dict: dict, Raw: rows})
 	fmt.Fprintf(&w.buf, "startxref\n%d\n%%%%EOF\n", start)
+	if w.encrypt != nil && w.encrypt.err != nil {
+		w.note(w.encrypt.err)
+	}
 	if w.err != nil {
 		return nil, w.err
 	}
