@@ -72,9 +72,47 @@ func appendReal(dst []byte, f float64) []byte {
 	return strconv.AppendFloat(dst, f, 'f', -1, 64)
 }
 
-// appendString writes a literal string, escaping only what has to be escaped
-// and rendering anything unprintable as an octal escape.
+// appendString writes a string in whichever of the two forms a PDF allows is
+// shorter. A literal string spells an unprintable byte as a four-character
+// octal escape, so text in UTF-16 — which is how a PDF says anything that is
+// not Latin-1 — comes out four times its length; the hex form costs two
+// characters a byte whatever the byte is.
 func appendString(dst []byte, s []byte) []byte {
+	if literalStringCost(s) > 2*len(s)+2 {
+		return appendHexString(dst, s)
+	}
+	return appendLiteralString(dst, s)
+}
+
+// literalStringCost is how many characters the literal form would take.
+func literalStringCost(s []byte) int {
+	n := 2
+	for _, c := range s {
+		switch {
+		case c == '(' || c == ')' || c == '\\' || c == '\n' || c == '\r' || c == '\t':
+			n += 2
+		case c < 32 || c > 126:
+			n += 4
+		default:
+			n++
+		}
+	}
+	return n
+}
+
+// appendHexString writes the <hex> form.
+func appendHexString(dst []byte, s []byte) []byte {
+	const hex = "0123456789ABCDEF"
+	dst = append(dst, '<')
+	for _, c := range s {
+		dst = append(dst, hex[c>>4], hex[c&15])
+	}
+	return append(dst, '>')
+}
+
+// appendLiteralString writes the (parenthesised) form, escaping only what has
+// to be escaped and rendering anything unprintable as an octal escape.
+func appendLiteralString(dst []byte, s []byte) []byte {
 	dst = append(dst, '(')
 	for _, c := range s {
 		switch {
