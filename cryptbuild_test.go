@@ -197,8 +197,14 @@ func encryptedFile(t *testing.T, opt encOptions) []byte {
 			meta = "false"
 		}
 		cfm := "V2"
-		if enc.method == cryptAESV2 {
+		switch enc.method {
+		case cryptAESV2:
 			cfm = "AESV2"
+		case cryptNone:
+			// A file that declares a security handler and then protects
+			// nothing with it: rare, legal, and something a person asking
+			// what a file is protected with deserves to be told.
+			cfm = "None"
 		}
 		if opt.v >= 4 {
 			encDict = fmt.Sprintf(
