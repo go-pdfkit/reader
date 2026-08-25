@@ -44,8 +44,56 @@ type decryptor struct {
 	strings   cryptMethod
 	streams   cryptMethod
 	revision  int
+	perm      Permissions
+	owner     bool // the password given was the owner's, not the user's
 	skipObj   int  // the /Encrypt dictionary's own object number, never decrypted
 	skipKnown bool // whether skipObj is meaningful
+}
+
+// A Protection is what a file's security handler says about it: how it is
+// encrypted, and what a reader that opened it with the user password may do.
+type Protection struct {
+	// Method names the algorithm the way a person would say it: "RC4-40",
+	// "RC4-128", "AES-128", "AES-256", or "none" for a file that declares an
+	// /Encrypt dictionary and then encrypts nothing with it.
+	Method string
+	// Revision is the standard security handler's revision: 2, 3, 4, 5 or 6.
+	Revision int
+	// Permissions is what the file grants whoever opened it with the user
+	// password.
+	Permissions Permissions
+	// Owner is true when the password the file was opened with was the
+	// owner's, in which case the permissions do not apply to this reader.
+	Owner bool
+}
+
+// Protection reports how the file is protected, and false when it is not
+// protected at all. A document that opened has already been decrypted; this
+// says what it said about itself on the way.
+func (d *Document) Protection() (Protection, bool) {
+	if d.decrypt == nil {
+		return Protection{}, false
+	}
+	return Protection{
+		Method:      d.decrypt.methodName(),
+		Revision:    d.decrypt.revision,
+		Permissions: d.decrypt.perm,
+		Owner:       d.decrypt.owner,
+	}, true
+}
+
+// methodName says which algorithm protects the streams, which is the one that
+// matters: it is where the content is.
+func (dec *decryptor) methodName() string {
+	switch dec.streams {
+	case cryptAESV3:
+		return "AES-256"
+	case cryptAESV2:
+		return "AES-128"
+	case cryptRC4:
+		return fmt.Sprintf("RC4-%d", len(dec.key)*8)
+	}
+	return "none"
 }
 
 // Encrypted reports whether the file declares an /Encrypt dictionary.
@@ -120,23 +168,24 @@ func newDecryptor(enc Dict, id []byte, password string, r Resolver) (*decryptor,
 		metadata = b
 	}
 
+	dec.perm = Permissions(uint32(perm)) & AllPermissions
 	if rev >= 5 {
-		key, err := deriveKeyR5(enc, password, r)
+		key, asOwner, err := deriveKeyR5(enc, password, r)
 		if err != nil {
 			return nil, err
 		}
-		dec.key = key
+		dec.key, dec.owner = key, asOwner
 		return dec, nil
 	}
 	n := length / 8
 	if rev == 2 {
 		n = 5
 	}
-	key, err := deriveKeyLegacy(password, owner, user, id, perm, n, rev, metadata)
+	key, asOwner, err := deriveKeyLegacy(password, owner, user, id, perm, n, rev, metadata)
 	if err != nil {
 		return nil, err
 	}
-	dec.key = key
+	dec.key, dec.owner = key, asOwner
 	return dec, nil
 }
 
@@ -181,25 +230,32 @@ func (dec *decryptor) readMethods(enc Dict, v int, r Resolver) error {
 
 // deriveKeyLegacy is the pre-2.0 key derivation, trying the password as the
 // user password and then as the owner password.
-func deriveKeyLegacy(password string, owner, user, id []byte, perm int32, n, rev int, metadata bool) ([]byte, error) {
+func deriveKeyLegacy(password string, owner, user, id []byte, perm int32, n, rev int, metadata bool) (key []byte, asOwner bool, err error) {
 	for _, candidate := range legacyCandidates(password, owner, n, rev) {
-		key := legacyFileKey(candidate, owner, id, perm, n, rev, metadata)
-		if legacyUserKeyMatches(key, user, id, rev) {
-			return key, nil
+		k := legacyFileKey(candidate.padded, owner, id, perm, n, rev, metadata)
+		if legacyUserKeyMatches(k, user, id, rev) {
+			return k, candidate.owner, nil
 		}
 	}
-	return nil, ErrWrongPassword
+	return nil, false, ErrWrongPassword
+}
+
+// A legacyCandidate is one padded password to try, and whether reaching it
+// meant knowing the owner's rather than the user's.
+type legacyCandidate struct {
+	padded []byte
+	owner  bool
 }
 
 // legacyCandidates lists the padded passwords worth trying: the one given, the
 // empty one, and the user password the owner password unlocks.
-func legacyCandidates(password string, owner []byte, n, rev int) [][]byte {
-	out := [][]byte{padPassword([]byte(password))}
+func legacyCandidates(password string, owner []byte, n, rev int) []legacyCandidate {
+	out := []legacyCandidate{{padded: padPassword([]byte(password))}}
 	if password != "" {
-		out = append(out, padPassword(nil))
+		out = append(out, legacyCandidate{padded: padPassword(nil)})
 	}
 	if u := userFromOwner([]byte(password), owner, n, rev); u != nil {
-		out = append(out, u)
+		out = append(out, legacyCandidate{padded: u, owner: true})
 	}
 	return out
 }
@@ -284,14 +340,14 @@ func xorKey(key []byte, v int) []byte {
 
 // deriveKeyR5 is the PDF 2.0 derivation, /R 5 and /R 6: the password is
 // validated against a salted hash and then unwraps the file key.
-func deriveKeyR5(enc Dict, password string, r Resolver) ([]byte, error) {
+func deriveKeyR5(enc Dict, password string, r Resolver) (key []byte, asOwner bool, err error) {
 	user, _ := ToString(resolved(enc, "U", r))
 	userE, _ := ToString(resolved(enc, "UE", r))
 	owner, _ := ToString(resolved(enc, "O", r))
 	ownerE, _ := ToString(resolved(enc, "OE", r))
 	rev := int(intOf(resolved(enc, "R", r), 6))
 	if len(user) < 48 {
-		return nil, fmt.Errorf("reader: /U is %d bytes, not the 48 this revision needs", len(user))
+		return nil, false, fmt.Errorf("reader: /U is %d bytes, not the 48 this revision needs", len(user))
 	}
 	pw := []byte(password)
 	for _, candidate := range [][]byte{pw, nil} {
@@ -299,15 +355,15 @@ func deriveKeyR5(enc Dict, password string, r Resolver) ([]byte, error) {
 			break
 		}
 		if key := unlockR5(candidate, user, userE, nil, rev); key != nil {
-			return key, nil
+			return key, false, nil
 		}
 		if len(owner) >= 48 {
 			if key := unlockR5(candidate, owner, ownerE, user[:48], rev); key != nil {
-				return key, nil
+				return key, true, nil
 			}
 		}
 	}
-	return nil, ErrWrongPassword
+	return nil, false, ErrWrongPassword
 }
 
 // unlockR5 checks one password against a 48-byte /U or /O entry and, when it

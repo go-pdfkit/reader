@@ -370,3 +370,37 @@ func TestDecryptAfterAnOffsetRepair(t *testing.T) {
 		t.Errorf("/Producer = %q, want %q", s, encryptedProducer)
 	}
 }
+
+func TestTheMethodAFileIsProtectedWithIsNamedInWords(t *testing.T) {
+	// Every method the reader understands, including the older ones no
+	// writer here produces, and a file that declares a handler and then
+	// protects nothing with it.
+	cases := []struct {
+		name string
+		opts encOptions
+		want string
+	}{
+		{"40-bit RC4", encOptions{v: 1, r: 2, length: 40}, "RC4-40"},
+		{"128-bit RC4", encOptions{v: 2, r: 3, length: 128}, "RC4-128"},
+		{"RC4 through a crypt filter", encOptions{v: 4, r: 4, length: 128, method: cryptRC4}, "RC4-128"},
+		{"AES-128", encOptions{v: 4, r: 4, length: 128, method: cryptAESV2}, "AES-128"},
+		{"AES-256", encOptions{v: 5, r: 6, length: 256, method: cryptAESV3}, "AES-256"},
+		{"a handler that protects nothing", encOptions{v: 4, r: 4, length: 128, method: cryptNone}, "none"},
+	}
+	for _, c := range cases {
+		d, err := Open(encryptedFile(t, c.opts))
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		p, ok := d.Protection()
+		if !ok {
+			t.Fatalf("%s: reported as unprotected", c.name)
+		}
+		if p.Method != c.want {
+			t.Errorf("%s: method %q, want %q", c.name, p.Method, c.want)
+		}
+		if p.Revision != c.opts.r {
+			t.Errorf("%s: revision %d, want %d", c.name, p.Revision, c.opts.r)
+		}
+	}
+}
