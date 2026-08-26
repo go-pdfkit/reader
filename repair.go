@@ -3,6 +3,7 @@ package reader
 import (
 	"bytes"
 	"fmt"
+	"slices"
 )
 
 // repair rebuilds the cross-reference information by reading the file itself
@@ -66,17 +67,19 @@ func (d *Document) loadRepairedTrailer() {
 // objectsOfType lists, in object-number order, the objects whose /Type is the
 // given name.
 func (d *Document) objectsOfType(want Name) []int {
-	high := 0
+	// The objects that exist are walked, in order, rather than every number
+	// up to the largest of them. A file may name any object number it likes:
+	// a 219-byte one in the wild declares object 2147483647, and counting up
+	// to that is two thousand million map lookups for three objects — which
+	// is a quarter of a minute of somebody's afternoon for a file that fits
+	// in a tweet.
+	nums := make([]int, 0, len(d.xref))
 	for num := range d.xref {
-		if num > high {
-			high = num
-		}
+		nums = append(nums, num)
 	}
+	slices.Sort(nums)
 	var out []int
-	for num := 0; num <= high; num++ {
-		if _, ok := d.xref[num]; !ok {
-			continue
-		}
+	for _, num := range nums {
 		o, err := d.Get(Ref{Num: num})
 		if err != nil {
 			continue
