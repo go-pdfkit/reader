@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // brokenDoc is a document whose only cross-reference entry points nowhere and
@@ -487,6 +488,61 @@ func TestObjectStreamBadOffsetsAndBodies(t *testing.T) {
 		}
 		if len(objs) != 0 {
 			t.Errorf("objectStream(%d) yielded %v", num, objs)
+		}
+	}
+}
+
+func TestAFileThatNamesAVeryHighObjectNumber(t *testing.T) {
+	// A file may name any object number it likes. This 219-byte one, from
+	// the wild, declares object 2147483647 — and a reader that looks at every
+	// number up to the largest one, to walk them in order, spends two
+	// thousand million map lookups on three objects. That was twenty-five
+	// seconds for a file that fits in a tweet, which is a denial of service
+	// anybody could post.
+	const bomb = "%PDF-1.7\n" +
+		"1 0 obj <</Type /Catalog /Pages 2 0 R>>\nendobj\n" +
+		"2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n" +
+		"3 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 10 10]>>\nendobj\n\n" +
+		"2147483647 0 obj <</Root 1 0 R>>\nendobj\n"
+
+	done := make(chan *Document, 1)
+	go func() {
+		d, err := Open([]byte(bomb))
+		if err != nil {
+			t.Error(err)
+		}
+		done <- d
+	}()
+	select {
+	case d := <-done:
+		if d.PageCount() != 1 {
+			t.Errorf("read %d pages, wanted one", d.PageCount())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("opening a 219-byte file took more than five seconds")
+	}
+}
+
+func TestObjectsAreListedInOrderHoweverSparseTheNumbersAre(t *testing.T) {
+	// The order is what the walk is for, and it has to survive the numbers
+	// being scattered rather than consecutive.
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.7\n")
+	for _, num := range []int{900, 3, 40000, 17} {
+		fmt.Fprintf(&b, "%d 0 obj <</Type /Page /MediaBox [0 0 10 10]>>\nendobj\n", num)
+	}
+	d, err := Open(b.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := d.objectsOfType("Page")
+	want := []int{3, 17, 900, 40000}
+	if len(got) != len(want) {
+		t.Fatalf("listed %v, wanted %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("listed %v, wanted %v", got, want)
 		}
 	}
 }
