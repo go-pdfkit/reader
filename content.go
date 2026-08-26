@@ -48,22 +48,54 @@ var inlineColourSpaces = map[Name]Name{
 
 // Expanded returns the image's dictionary with the abbreviated keys and colour
 // space names written out, so it can be read like any image XObject.
+//
+// A dictionary may carry both spellings of the same entry — /BPC 8 next to
+// /BitsPerComponent 4 — and one of them has to win. Which one used to depend
+// on the order Go happened to walk the map in, and Go deliberately walks it in
+// a different order every time: the same file, read twice by the same
+// program, gave two different pictures. Worse, the expanded dictionary is what
+// decides where the image's data ends, so an inline image in issue14256.pdf
+// made the whole rest of the content stream tokenise differently — 58
+// operations on one run and 118 on the next, with no error either time.
+//
+// The abbreviation wins. It is the spelling the specification defines for an
+// inline image, so a producer that wrote /BPC 8 meant eight; the long form is
+// the tolerated alternative, and it gives way. What matters more than the
+// choice is that it is a choice, made the same way every time.
 func (im *InlineImage) Expanded() Dict {
 	out := Dict{}
+	// The long and unknown keys first, so that an abbreviation written out
+	// below lands on top of the long form rather than beside it.
 	for k, v := range im.Dict {
-		if long, ok := inlineKeys[k]; ok {
-			k = long
+		if _, abbreviated := inlineKeys[k]; abbreviated {
+			continue
 		}
-		if k == "ColorSpace" {
-			if n, ok := ToName(v); ok {
-				if long, ok := inlineColourSpaces[n]; ok {
-					v = long
-				}
-			}
+		out[k] = expandColourSpace(k, v)
+	}
+	for k, v := range im.Dict {
+		long, abbreviated := inlineKeys[k]
+		if !abbreviated {
+			continue
 		}
-		out[k] = v
+		out[long] = expandColourSpace(long, v)
 	}
 	return out
+}
+
+// expandColourSpace writes out an abbreviated colour space name, which is the
+// one value an inline image abbreviates as well as its key.
+func expandColourSpace(k Name, v Object) Object {
+	if k != "ColorSpace" {
+		return v
+	}
+	n, ok := ToName(v)
+	if !ok {
+		return v
+	}
+	if long, ok := inlineColourSpaces[n]; ok {
+		return long
+	}
+	return v
 }
 
 // A ContentScanner walks a content stream one operation at a time. A stream
