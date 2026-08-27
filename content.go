@@ -48,22 +48,57 @@ var inlineColourSpaces = map[Name]Name{
 
 // Expanded returns the image's dictionary with the abbreviated keys and colour
 // space names written out, so it can be read like any image XObject.
+//
+// A dictionary may say the same thing twice and disagree with itself: /W 20
+// beside /Width 10, /CS /RGB beside /ColorSpace /3chanRGB. The specification
+// permits both spellings in an inline image and says nothing about which wins,
+// and the public implementations disagree — pdf.js asks for the abbreviation
+// and falls back to the written-out name, MuPDF asks the other way round.
+//
+// The abbreviation wins here. Two reasons: it is the spelling Table 93 gives
+// for an inline image, the written-out name being the tolerated alias; and
+// safedocs' own fixture for this case marks the abbreviation as the line to
+// remove "to see the effect", which is a statement about what the reference
+// viewer does.
+//
+// What is not defensible is the answer changing between runs. Expanding in one
+// pass over the map made the winner depend on Go's map iteration order, which
+// is deliberately random: the same file drew differently each time it was
+// opened, with no way for a caller to notice. Two passes settle it — the
+// written-out names first, then the abbreviations over them — and no order
+// within either pass can matter, because the names in each are distinct.
 func (im *InlineImage) Expanded() Dict {
 	out := Dict{}
 	for k, v := range im.Dict {
-		if long, ok := inlineKeys[k]; ok {
-			k = long
+		if _, abbreviated := inlineKeys[k]; abbreviated {
+			continue
 		}
-		if k == "ColorSpace" {
-			if n, ok := ToName(v); ok {
-				if long, ok := inlineColourSpaces[n]; ok {
-					v = long
-				}
-			}
+		out[k] = expandColourSpace(k, v)
+	}
+	for k, v := range im.Dict {
+		long, abbreviated := inlineKeys[k]
+		if !abbreviated {
+			continue
 		}
-		out[k] = v
+		out[long] = expandColourSpace(long, v)
 	}
 	return out
+}
+
+// expandColourSpace writes out an abbreviated colour space name, which is the
+// one value that is abbreviated as well as its key.
+func expandColourSpace(k Name, v Object) Object {
+	if k != "ColorSpace" {
+		return v
+	}
+	n, ok := ToName(v)
+	if !ok {
+		return v
+	}
+	if long, ok := inlineColourSpaces[n]; ok {
+		return long
+	}
+	return v
 }
 
 // A ContentScanner walks a content stream one operation at a time. A stream
