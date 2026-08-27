@@ -3,6 +3,8 @@ package reader
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -104,7 +106,7 @@ func TestMalformedEncryptDictionaries(t *testing.T) {
 		{"not a dictionary", "/Encrypt 42"},
 		{"no /V or /R", "/Encrypt << /Filter /Standard >>"},
 		{"an unknown crypt filter method", "/Encrypt << /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /Nope >> >> /StmF /StdCF >>"},
-		{"/U too short for revision 6", "/Encrypt << /Filter /Standard /V 5 /R 6 /U <00> >>"},
+		{"/U too short for revision 6", "/Encrypt << /Filter /Standard /V 5 /R 6 /U <00> /CF << /StdCF << /CFM /AESV3 >> >> /StmF /StdCF /StrF /StdCF >>"},
 	}
 	for _, c := range cases {
 		b := replaceAll(onePage(), "/Root 1 0 R", "/Root 1 0 R "+c.enc)
@@ -115,12 +117,25 @@ func TestMalformedEncryptDictionaries(t *testing.T) {
 }
 
 func TestEncryptDictionaryDefaults(t *testing.T) {
-	// An absurd /Length falls back to 40 bits, and a /CF entry naming a filter
-	// that is not there means no encryption for that class of data.
+	// An absurd /Length falls back to 40 bits.
 	b := replaceAll(onePage(), "/Root 1 0 R",
-		"/Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 7 /StmF /Missing /StrF /Missing >>")
+		"/Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 7 /CF << /StdCF << /CFM /V2 >> >> /StmF /StdCF /StrF /StdCF >>")
 	if _, err := Open(b); err != ErrWrongPassword {
 		t.Errorf("got %v", err)
+	}
+}
+
+// A /StmF or /StrF that names a crypt filter /CF does not define means no
+// encryption for that class of data: an absent entry is the identity filter,
+// and naming one that is not there comes to the same thing.
+func TestReadMethodsUnknownCryptFilterName(t *testing.T) {
+	dec := &decryptor{}
+	enc := Dict{"CF": Dict{}, "StmF": Name("Missing"), "StrF": Name("Missing")}
+	if err := dec.readMethods(enc, 4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if dec.streams != cryptNone || dec.strings != cryptNone {
+		t.Errorf("streams %v, strings %v", dec.streams, dec.strings)
 	}
 }
 
@@ -341,8 +356,14 @@ func TestOpenRepairedEncryptedFileWithTheWrongPassword(t *testing.T) {
 	// The tables are gone and the password is wrong: the rebuild succeeds and
 	// the key derivation is what fails.
 	b := withoutStartxref(encryptedFile(t, encOptions{v: 2, r: 3, length: 128, userPw: "hunter2"}))
-	if _, err := Open(b); err != ErrWrongPassword {
+	// The rebuild is what reports it now, because the rebuild is what needed
+	// the key; the wrapped error still names the password as the cause.
+	_, err := Open(b)
+	if !errors.Is(err, ErrWrongPassword) {
 		t.Errorf("got %v, want ErrWrongPassword", err)
+	}
+	if !strings.Contains(err.Error(), "no startxref") {
+		t.Errorf("the tables' own error was lost: %v", err)
 	}
 	// With the password, the same damaged file opens.
 	checkDecrypted(t, b, "hunter2")
