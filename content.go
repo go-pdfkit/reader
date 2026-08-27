@@ -253,59 +253,74 @@ func Operations(data []byte) ([]Operation, error) {
 // PageContent returns the decoded content stream of the i'th page, counting
 // from one. A page whose /Contents is an array has its streams joined, as the
 // specification requires, with a newline between them.
+//
+// A content stream whose filters cannot be applied contributes what could be
+// salvaged from it rather than failing the page, which is what a renderer
+// needs; the error is for a page that is not there at all.
+// [Document.PageContentDecoded] says whether any salvaging happened.
 func (d *Document) PageContent(i int) ([]byte, error) {
+	dec, err := d.PageContentDecoded(i)
+	return dec.Data, err
+}
+
+// PageContentDecoded is [Document.PageContent] with the outcome of the decode
+// attached: [Decoded.Recovered] reports that at least one of the page's content
+// streams could not be decoded cleanly, and [Decoded.Cause] says why.
+func (d *Document) PageContentDecoded(i int) (Decoded, error) {
 	page, err := d.Page(i)
 	if err != nil {
-		return nil, err
+		return Decoded{}, err
 	}
 	return d.contentOf(page)
 }
 
 // contentOf decodes a page's /Contents, whether one stream or several.
-func (d *Document) contentOf(page Dict) ([]byte, error) {
+func (d *Document) contentOf(page Dict) (Decoded, error) {
 	o, err := d.Resolve(page.Get("Contents"))
 	if err != nil {
-		return nil, err
+		return Decoded{}, err
 	}
 	switch v := o.(type) {
 	case *Stream:
-		return d.decodedContent(v)
+		return d.decodedContent(v), nil
 	case Array:
-		var out []byte
+		var out Decoded
 		for _, e := range v {
 			eo, err := d.Resolve(e)
 			if err != nil {
-				return nil, err
+				return Decoded{}, err
 			}
 			s, ok := ToStream(eo)
 			if !ok {
 				continue
 			}
-			part, err := d.decodedContent(s)
-			if err != nil {
-				return nil, err
+			part := d.decodedContent(s)
+			if part.Recovered && !out.Recovered {
+				out.Recovered, out.Cause, out.Filter = true, part.Cause, part.Filter
 			}
-			if len(out) > 0 {
-				out = append(out, '\n')
+			if len(out.Data) > 0 {
+				out.Data = append(out.Data, '\n')
 			}
-			out = append(out, part...)
+			out.Data = append(out.Data, part.Data...)
 		}
 		return out, nil
 	}
-	return nil, nil
+	return Decoded{}, nil
 }
 
-// decodedContent decodes one content stream, refusing an image filter, which
-// has no business being there.
-func (d *Document) decodedContent(s *Stream) ([]byte, error) {
-	data, img, err := d.DecodeStream(s)
-	if err != nil {
-		return nil, err
+// decodedContent decodes one content stream. An image filter has no business
+// being there, so the bytes it holds are not content: they are reported as
+// salvage, not handed over as if they could be tokenised.
+func (d *Document) decodedContent(s *Stream) Decoded {
+	dec := d.DecodeStreamRecovering(s)
+	if dec.Image != "" {
+		return Decoded{
+			Recovered: true,
+			Filter:    dec.Image,
+			Cause:     fmt.Errorf("reader: a content stream is filtered as an image (/%s)", dec.Image),
+		}
 	}
-	if img != "" {
-		return nil, fmt.Errorf("reader: a content stream is filtered as an image (/%s)", img)
-	}
-	return data, nil
+	return dec
 }
 
 // PageOperations tokenises the i'th page's content stream, counting from one.

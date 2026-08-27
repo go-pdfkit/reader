@@ -200,10 +200,13 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 	if !ok {
 		return objs, nil
 	}
-	data, img, err := d.DecodeStream(s)
-	if err != nil || img != "" {
+	// An object stream that stops in the middle still holds whole objects in
+	// the part that did decode, and losing them loses pages.
+	dec := d.DecodeStreamRecovering(s)
+	if dec.Image != "" {
 		return objs, nil
 	}
+	data := dec.Data
 	n := int(intOr(s.Dict.Get("N"), 0))
 	first := int(intOr(s.Dict.Get("First"), 0))
 	if n <= 0 || first <= 0 || first > len(data) {
@@ -242,9 +245,16 @@ func intOr(o Object, def int64) int64 {
 }
 
 // DecodeStream applies a stream's filter chain, resolving any indirect decode
-// parameters against this document.
+// parameters against this document. A chain that cannot be run to the end is
+// an error; [Document.DecodeStreamRecovering] salvages instead.
 func (d *Document) DecodeStream(s *Stream) ([]byte, Name, error) {
 	return Decode(s.Dict, s.Raw, d.Get)
+}
+
+// DecodeStreamRecovering applies a stream's filter chain, salvaging what it can
+// from a chain that cannot be run to the end and saying that it did so.
+func (d *Document) DecodeStreamRecovering(s *Stream) Decoded {
+	return DecodeRecovering(s.Dict, s.Raw, d.Get)
 }
 
 // Catalog returns the document catalogue the trailer's /Root names.

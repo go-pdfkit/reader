@@ -164,11 +164,12 @@ func TestFlateDecode(t *testing.T) {
 	if got, err := flateDecode(padded); err != nil || !bytes.Equal(got, want) {
 		t.Errorf("padded: %q, %v", got, err)
 	}
-	// A stream cut short yields the bytes it did carry.
+	// A stream cut short yields the bytes it did carry, together with the
+	// error that ended it: a prefix is never passed off as a whole stream.
 	full := deflateBytes(t, bytes.Repeat(want, 50))
 	short, err := flateDecode(full[:len(full)/2])
-	if err != nil {
-		t.Errorf("truncated: %v", err)
+	if err == nil {
+		t.Error("truncated: want the error that ended it")
 	}
 	if len(short) == 0 {
 		t.Error("truncated: no data recovered")
