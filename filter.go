@@ -16,9 +16,16 @@ var maxDecodedSize int64 = 1 << 30
 // ImageFilter reports whether a filter yields an encoded image rather than a
 // byte stream. [Decode] stops at one of these and hands the caller the still
 // encoded bytes, because decoding them is an image decoder's job.
+//
+// /CCITTFaxDecode was on this list and is not any more. It does not carry an
+// image with its own idea of how many components it has and how deep they are,
+// the way DCT and JPX do: it produces bilevel samples, one bit a pixel, and the
+// stream dictionary says what they mean. That is a byte stream, so it is a
+// filter — and decoding it here means every caller gets it rather than each
+// writing its own. See ccitt.go.
 func ImageFilter(n Name) bool {
 	switch n {
-	case "DCTDecode", "DCT", "JPXDecode", "CCITTFaxDecode", "CCF", "JBIG2Decode":
+	case "DCTDecode", "DCT", "JPXDecode", "JBIG2Decode":
 		return true
 	}
 	return false
@@ -130,6 +137,8 @@ func applyFilter(f Name, data []byte, parm Dict, r Resolver) ([]byte, error) {
 		return ascii85Decode(data)
 	case "RunLengthDecode", "RL":
 		return runLengthDecode(data)
+	case "CCITTFaxDecode", "CCF":
+		return ccittDecode(data, ccittParamsOf(parm, r))
 	}
 	return nil, fmt.Errorf("reader: unsupported filter /%s", f)
 }

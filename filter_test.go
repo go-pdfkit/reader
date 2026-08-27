@@ -41,13 +41,18 @@ func rawDeflateBytes(t *testing.T, data []byte) []byte {
 }
 
 func TestImageFilter(t *testing.T) {
-	for _, n := range []Name{"DCTDecode", "DCT", "JPXDecode", "CCITTFaxDecode", "CCF", "JBIG2Decode"} {
+	for _, n := range []Name{"DCTDecode", "DCT", "JPXDecode", "JBIG2Decode"} {
 		if !ImageFilter(n) {
 			t.Errorf("ImageFilter(%s) = false", n)
 		}
 	}
-	if ImageFilter("FlateDecode") {
-		t.Error("ImageFilter(FlateDecode) = true")
+	// A fax is not one of them any more: it decodes to bilevel samples, which
+	// is a byte stream, so the filter chain finishes it rather than handing it
+	// back encoded. See ccitt.go.
+	for _, n := range []Name{"FlateDecode", "CCITTFaxDecode", "CCF"} {
+		if ImageFilter(n) {
+			t.Errorf("ImageFilter(%s) = true", n)
+		}
 	}
 }
 
