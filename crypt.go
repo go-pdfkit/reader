@@ -169,6 +169,18 @@ func newDecryptor(enc Dict, id []byte, password string, r Resolver) (*decryptor,
 	}
 
 	dec.perm = Permissions(uint32(perm)) & AllPermissions
+	if dec.streams == cryptNone && dec.strings == cryptNone {
+		// /StmF and /StrF both name the identity crypt filter, so nothing in
+		// the document body is encrypted and no key is needed to read it. A
+		// file like that is opened without validating the password: refusing
+		// it would refuse a document whose every byte is already plain, which
+		// is what every other reader shows. Only /EFF — the embedded files —
+		// would need the key, and this reader does not hand those out.
+		//
+		// Nothing was authenticated, so dec.owner stays false and Protection
+		// reports the method as "none": a caller can see exactly what it got.
+		return dec, nil
+	}
 	if rev >= 5 {
 		key, asOwner, err := deriveKeyR5(enc, password, r)
 		if err != nil {

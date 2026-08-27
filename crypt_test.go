@@ -125,6 +125,38 @@ func TestEncryptDictionaryDefaults(t *testing.T) {
 	}
 }
 
+// A file whose /StmF and /StrF both name the identity crypt filter has nothing
+// encrypted in its body, so it opens with no password at all — including when
+// its /Encrypt dictionary is in no state to derive a key from. /Encrypt is
+// still reported, with the method it really applies to the content: none.
+func TestIdentityCryptFiltersNeedNoPassword(t *testing.T) {
+	for _, enc := range []string{
+		// No /StmF or /StrF: both default to /Identity.
+		"/Encrypt << /Filter /Standard /V 5 /R 6 /U <00> /EFF /StdCF >>",
+		// Named outright.
+		"/Encrypt << /Filter /Standard /V 4 /R 4 /StmF /Identity /StrF /Identity >>",
+		// Naming a crypt filter that /CF does not define comes to the same.
+		"/Encrypt << /Filter /Standard /V 4 /R 4 /StmF /Missing /StrF /Missing >>",
+	} {
+		b := replaceAll(onePage(), "/Root 1 0 R", "/Root 1 0 R "+enc)
+		d, err := Open(b)
+		if err != nil {
+			t.Errorf("%s: %v", enc, err)
+			continue
+		}
+		if !d.Encrypted() {
+			t.Errorf("%s: /Encrypt not reported", enc)
+		}
+		p, ok := d.Protection()
+		if !ok || p.Method != "none" || p.Owner {
+			t.Errorf("%s: protection %+v, %v", enc, p, ok)
+		}
+		if got, err := d.PageContent(1); err != nil || len(got) == 0 {
+			t.Errorf("%s: content %q, %v", enc, got, err)
+		}
+	}
+}
+
 // A /StmF or /StrF that names a crypt filter /CF does not define means no
 // encryption for that class of data: an absent entry is the identity filter,
 // and naming one that is not there comes to the same thing.
