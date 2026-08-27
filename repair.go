@@ -2,6 +2,7 @@ package reader
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"slices"
 )
@@ -193,16 +194,25 @@ func (d *Document) synthesiseCatalogue() {
 // indexObjectStreams adds the objects held inside every object stream the scan
 // found, without overwriting an object written directly in the file.
 func (d *Document) indexObjectStreams() {
-	// The object numbers are sorted before they are walked. Two object streams
-	// in a damaged file may both claim the same object number, and the first
-	// one walked wins; taking them in map order makes the same file read
-	// differently from one run to the next.
+	// Two object streams in a damaged file may both claim the same object
+	// number — a partial rewrite leaves the old one in place beside the new —
+	// and the loop below lets the first stream walked define it. Walking
+	// d.xref in map order therefore made the same file read differently from
+	// one run to the next.
+	//
+	// They are walked latest in the file first, which is the rule the header
+	// scan above already applies to objects written directly: a later
+	// definition wins, an incremental update having appended it.
 	nums := make([]int, 0, len(d.xref))
 	for num := range d.xref {
 		nums = append(nums, num)
 	}
 	slices.Sort(nums)
-	var streams []int
+	type located struct {
+		offset int64
+		num    int
+	}
+	var found []located
 	for _, num := range nums {
 		o, err := d.Get(Ref{Num: num})
 		if err != nil {
@@ -213,8 +223,13 @@ func (d *Document) indexObjectStreams() {
 			continue
 		}
 		if t, ok := ToName(s.Dict.Get("Type")); ok && t == "ObjStm" {
-			streams = append(streams, num)
+			found = append(found, located{d.xref[num].offset, num})
 		}
+	}
+	slices.SortFunc(found, func(a, b located) int { return cmp.Compare(b.offset, a.offset) })
+	streams := make([]int, 0, len(found))
+	for _, f := range found {
+		streams = append(streams, f.num)
 	}
 	for _, num := range streams {
 		// The stream object is already cached by the pass above, so this

@@ -560,8 +560,9 @@ func TestIndexObjectStreamsIsDeterministic(t *testing.T) {
 	b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
 	b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1 1] >>")
 	b.obj(3, "<< /Type /Page /Parent 2 0 R >>")
-	// The higher-numbered stream is written first, so agreeing with the file's
-	// own order would not be enough to pass.
+	// The later stream in the file is the one that must win, so the
+	// higher-numbered one is written first: a rule that went by object number
+	// would pick the other and fail here.
 	b.streamObj(objStm(20, "fromTwenty"))
 	b.streamObj(objStm(10, "fromTen"))
 	// No startxref, so the tables cannot be read and the rebuild runs.
