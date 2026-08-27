@@ -297,3 +297,50 @@ func TestOperandThatIsNotAnObject(t *testing.T) {
 		t.Fatalf("got %+v", ops)
 	}
 }
+
+// TestInlineImageExpandedIsDeterministic pins the one property that matters
+// more than which spelling wins: that the answer is the same every time.
+//
+// safedocs' Inline_Image_Abbreviations fixture carries seven images that each
+// say the same thing twice and disagree — /W 20 beside /Width 10, /CS /RGB
+// beside /ColorSpace /3chanRGB. Expanding in one pass over the map let Go's
+// randomised iteration order pick the winner, so the same page drew a
+// different picture on different runs of the same binary. Two hundred
+// expansions of the same dictionary is enough to catch that: against the one
+// pass this loop sees both answers within the first few.
+func TestInlineImageExpandedIsDeterministic(t *testing.T) {
+	im := &InlineImage{Dict: Dict{
+		"W":          Integer(20),
+		"Width":      Integer(10),
+		"H":          Integer(10),
+		"Height":     Integer(40),
+		"BPC":        Integer(8),
+		"CS":         Name("RGB"),
+		"ColorSpace": Name("3chanRGB"),
+		"I":          Bool(false),
+	}}
+	first := im.Expanded()
+	for i := 0; i < 200; i++ {
+		got := im.Expanded()
+		if len(got) != len(first) {
+			t.Fatalf("expansion %d has %d keys, the first had %d", i, len(got), len(first))
+		}
+		for k, v := range first {
+			if got[k] != v {
+				t.Fatalf("expansion %d gave %s = %v, the first gave %v", i, k, got[k], v)
+			}
+		}
+	}
+	// And the abbreviation is what wins, which is the choice this makes and
+	// the reason it is written down in Expanded's own comment.
+	for k, want := range map[Name]Object{
+		"Width":       Integer(20),
+		"Height":      Integer(10),
+		"ColorSpace":  Name("DeviceRGB"),
+		"Interpolate": Bool(false),
+	} {
+		if first[k] != want {
+			t.Errorf("%s = %v, want %v", k, first[k], want)
+		}
+	}
+}
