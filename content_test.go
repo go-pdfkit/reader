@@ -275,8 +275,13 @@ func TestPageContentUndecodable(t *testing.T) {
 		if !dec.Recovered || dec.Cause == nil || dec.Filter != "FlateDecode" {
 			t.Errorf("%s: got %+v", contents, dec)
 		}
-		if string(dec.Data) != "not deflate data" {
-			t.Errorf("%s: got %q, want the raw bytes", contents, dec.Data)
+		// The bytes come back, but not as content: a scanner must not be
+		// handed a compressed stream to tokenise.
+		if len(dec.Data) != 0 {
+			t.Errorf("%s: undecoded bytes arrived as content: %q", contents, dec.Data)
+		}
+		if string(dec.Undecoded) != "not deflate data" {
+			t.Errorf("%s: got %q, want the raw bytes", contents, dec.Undecoded)
 		}
 	}
 }

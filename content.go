@@ -297,6 +297,10 @@ func (d *Document) contentOf(page Dict) (Decoded, error) {
 			part := d.decodedContent(s)
 			if part.Recovered && !out.Recovered {
 				out.Recovered, out.Cause, out.Filter = true, part.Cause, part.Filter
+				out.Undecoded = part.Undecoded
+			}
+			if len(part.Data) == 0 {
+				continue
 			}
 			if len(out.Data) > 0 {
 				out.Data = append(out.Data, '\n')
@@ -315,6 +319,7 @@ func (d *Document) decodedContent(s *Stream) Decoded {
 	dec := d.DecodeStreamRecovering(s)
 	if dec.Image != "" {
 		return Decoded{
+			Undecoded: dec.Data,
 			Recovered: true,
 			Filter:    dec.Image,
 			Cause:     fmt.Errorf("reader: a content stream is filtered as an image (/%s)", dec.Image),

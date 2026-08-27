@@ -33,18 +33,45 @@ func ImageFilter(n Name) bool {
 
 // A Decoded is the outcome of applying a stream's filter chain, including the
 // outcome of a chain that could not be finished.
+//
+// The point of the type is that a caller can tell the three outcomes apart
+// without having to be careful. Bytes a filter decoded and bytes no filter
+// decoded arrive in different fields, so the second kind cannot be painted as
+// samples or tokenised as content by a caller that forgot to check a flag.
 type Decoded struct {
-	// Data is what the chain produced.
+	// Data is what the chain decoded. A recovered decode leaves fewer bytes
+	// here than the stream meant to carry, but they are bytes of the kind it
+	// meant to carry: Data never holds bytes that no filter has decoded.
+	//
+	// The one case where Data is still encoded is the deliberate one: a chain
+	// that stopped at an image filter, which Image names and Recovered does
+	// not flag, because stopping there is the contract.
 	Data []byte
+
+	// Undecoded holds the bytes the chain could not get past, still in the
+	// encoding Filter names. It is set instead of Data — never beside it —
+	// when the filter that failed produced nothing at all.
+	//
+	// This is where a compressed content stream, a truncated fax, or a filter
+	// nobody implements ends up. A caller that wants the stream as it lies has
+	// to ask for it by a name that says what it is; a caller that reads Data
+	// cannot be handed it by accident. Painting undecoded bytes as a one-bit
+	// image looks like a page with something on it, which is why nothing about
+	// this is left to a flag.
+	Undecoded []byte
+
 	// Image names the image filter the chain stopped at, when it stopped at
-	// one; Data is then still encoded in that filter.
+	// one; Data is then the bytes still encoded in it.
 	Image Name
-	// Recovered says Data is what could be salvaged from a chain that could
-	// not be run to the end, not a clean decode. A caller that must not act on
-	// damaged data stops here — or calls [Decode], which refuses outright.
+
+	// Recovered says the chain could not be run to the end. A caller that must
+	// not act on damaged data stops here — or calls [Decode], which refuses
+	// outright.
 	Recovered bool
-	// Cause says why the chain stopped, and is set only when Recovered is.
+
+	// Cause says why the chain stopped, and is set exactly when Recovered is.
 	Cause error
+
 	// Filter names the filter that could not be applied, when one is to blame:
 	// a chain whose /Filter entry itself is unreadable blames nothing.
 	Filter Name
@@ -59,12 +86,13 @@ type Decoded struct {
 //
 // The salvage is always as far down the chain as the filters got, never the
 // bytes as they arrived: a damaged Flate stream yields the prefix it did
-// inflate, not the compressed bytes. Only a filter that produced nothing at
-// all falls back to what went into it.
+// inflate, in [Decoded.Data]. A filter that produced nothing at all leaves the
+// bytes in [Decoded.Undecoded] instead, still in its encoding, because that is
+// what they are.
 func DecodeRecovering(d Dict, raw []byte, resolve Resolver) Decoded {
 	filters, parms, err := filterChain(d, resolve)
 	if err != nil {
-		return Decoded{Data: raw, Recovered: true, Cause: err}
+		return Decoded{Undecoded: raw, Recovered: true, Cause: err}
 	}
 	data := raw
 	for i, f := range filters {
@@ -74,7 +102,7 @@ func DecodeRecovering(d Dict, raw []byte, resolve Resolver) Decoded {
 		out, err := applyFilter(f, data, parms[i], resolve)
 		if err != nil {
 			if len(out) == 0 {
-				out = data
+				return Decoded{Undecoded: data, Recovered: true, Cause: err, Filter: f}
 			}
 			return Decoded{Data: out, Recovered: true, Cause: err, Filter: f}
 		}
@@ -209,10 +237,12 @@ func applyFilter(f Name, data []byte, parm Dict, r Resolver) ([]byte, error) {
 func cryptFilter(data []byte, parm Dict, r Resolver) ([]byte, error) {
 	o, err := Resolve(parm.Get("Name"), r)
 	if err != nil {
-		return data, fmt.Errorf("reader: /Crypt filter: %w", err)
+		return nil, fmt.Errorf("reader: /Crypt filter: %w", err)
 	}
 	if n, ok := ToName(o); ok && n != "Identity" {
-		return data, fmt.Errorf("reader: /Crypt filter names /%s, which this reader cannot apply", n)
+		// No bytes come back: they are ciphertext, and handing them over as
+		// though the filter had run is how ciphertext gets painted.
+		return nil, fmt.Errorf("reader: /Crypt filter names /%s, which this reader cannot apply", n)
 	}
 	return data, nil
 }

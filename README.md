@@ -36,7 +36,10 @@ the **document structure**:
 - **Filters that fail** — a chain that cannot be run to the end is not the end
   of the stream. `DecodeRecovering` returns what the filters before the failure
   produced — the prefix a damaged Flate stream did inflate, not its compressed
-  bytes — and says so through `Decoded.Recovered` and `Decoded.Cause`.
+  bytes — and says so through `Decoded.Recovered` and `Decoded.Cause`. Bytes no
+  filter decoded arrive in `Decoded.Undecoded`, never in `Decoded.Data`, so a
+  compressed stream cannot be painted as samples or tokenised as content by a
+  caller that forgot to check a flag.
   `Decode` is the strict reading and refuses such a stream outright, so a
   caller that must not act on damaged data says which it wants by which one it
   calls. Page content takes the lenient reading, because a page whose content

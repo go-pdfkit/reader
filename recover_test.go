@@ -29,14 +29,18 @@ func TestDecodeRecoveringImageFilter(t *testing.T) {
 }
 
 // A filter nobody implements ends the chain, and the bytes as they stand come
-// back flagged rather than not at all.
+// back flagged rather than not at all — as Undecoded, since nothing decoded
+// them.
 func TestDecodeRecoveringUnknownFilter(t *testing.T) {
 	dec := DecodeRecovering(Dict{"Filter": Name("BrotliDecode")}, []byte("brotli bytes"), nil)
 	if !dec.Recovered || dec.Cause == nil {
 		t.Fatalf("got %+v", dec)
 	}
-	if dec.Filter != "BrotliDecode" || string(dec.Data) != "brotli bytes" {
+	if dec.Filter != "BrotliDecode" || string(dec.Undecoded) != "brotli bytes" {
 		t.Errorf("got %+v", dec)
+	}
+	if len(dec.Data) != 0 {
+		t.Errorf("undecoded bytes arrived as Data: %q", dec.Data)
 	}
 	// The strict reading refuses the same stream outright.
 	if _, _, err := Decode(Dict{"Filter": Name("BrotliDecode")}, []byte("brotli bytes"), nil); err == nil {
@@ -53,8 +57,13 @@ func TestDecodeRecoveringSalvagesDownTheChain(t *testing.T) {
 	if !dec.Recovered || dec.Filter != "Nope" {
 		t.Fatalf("got %+v", dec)
 	}
-	if string(dec.Data) != "inflated already" {
-		t.Errorf("got %q, want the inflated prefix", dec.Data)
+	// The bytes are inflated, but they are still whatever /Nope encodes, so
+	// they are Undecoded and not content.
+	if string(dec.Undecoded) != "inflated already" {
+		t.Errorf("got %q, want the inflated bytes", dec.Undecoded)
+	}
+	if len(dec.Data) != 0 {
+		t.Errorf("bytes still in a filter's encoding arrived as Data: %q", dec.Data)
 	}
 }
 
@@ -64,8 +73,8 @@ func TestDecodeRecoveringUnreadableFilterEntry(t *testing.T) {
 	if !dec.Recovered || dec.Cause == nil || dec.Filter != "" {
 		t.Fatalf("got %+v", dec)
 	}
-	if string(dec.Data) != "as it lies" {
-		t.Errorf("got %q", dec.Data)
+	if string(dec.Undecoded) != "as it lies" || len(dec.Data) != 0 {
+		t.Errorf("got %+v", dec)
 	}
 }
 
@@ -156,14 +165,14 @@ func TestLZWKeepsItsPrefix(t *testing.T) {
 // The stream helpers agree with the dictionary ones.
 func TestDecodeStreamRecovering(t *testing.T) {
 	s := &Stream{Dict: Dict{"Filter": Name("Nope")}, Raw: []byte("raw")}
-	if dec := DecodeStreamRecovering(s, nil); !dec.Recovered || string(dec.Data) != "raw" {
+	if dec := DecodeStreamRecovering(s, nil); !dec.Recovered || string(dec.Undecoded) != "raw" {
 		t.Errorf("package: got %+v", dec)
 	}
 	d, err := Open(onePage())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec := d.DecodeStreamRecovering(s); !dec.Recovered || string(dec.Data) != "raw" {
+	if dec := d.DecodeStreamRecovering(s); !dec.Recovered || string(dec.Undecoded) != "raw" {
 		t.Errorf("document: got %+v", dec)
 	}
 }
@@ -209,6 +218,44 @@ func TestObjectStreamSalvagesItsPrefix(t *testing.T) {
 	}
 }
 
+// The guarantee the split exists for: bytes no filter decoded never arrive in
+// Data, whatever the filter and whatever the shape of the failure. A stencil
+// path reading Data cannot paint a compressed stream as a one-bit image, and a
+// content scanner reading Data cannot tokenise one.
+func TestUndecodedBytesNeverArriveAsData(t *testing.T) {
+	for _, c := range []struct {
+		what string
+		d    Dict
+		raw  []byte
+	}{
+		{"a filter nobody implements", Dict{"Filter": Name("BrotliDecode")}, []byte("\x1b\x2e\x00")},
+		{"Flate that is not Flate", Dict{"Filter": Name("FlateDecode")}, []byte("not compressed at all")},
+		{"a fax with no columns", Dict{"Filter": Name("CCITTFaxDecode"),
+			"DecodeParms": Dict{"Columns": Integer(0)}}, []byte("\x00\xff\x00\xff")},
+		{"a fax past the pixel limit", Dict{"Filter": Name("CCITTFaxDecode"),
+			"DecodeParms": Dict{"Columns": Integer(1 << 20), "Rows": Integer(1 << 20)}}, []byte("\x26\xa0")},
+		{"an unreadable /Filter", Dict{"Filter": Real(2.5)}, []byte("who knows")},
+		{"a crypt filter that cannot be applied", Dict{"Filter": Name("Crypt"),
+			"DecodeParms": Dict{"Name": Name("StdCF")}}, []byte("ciphertext")},
+	} {
+		dec := DecodeRecovering(c.d, c.raw, nil)
+		if !dec.Recovered || dec.Cause == nil {
+			t.Errorf("%s: not reported as recovered: %+v", c.what, dec)
+			continue
+		}
+		if len(dec.Data) != 0 {
+			t.Errorf("%s: %d undecoded bytes arrived as Data", c.what, len(dec.Data))
+		}
+		if !bytes.Equal(dec.Undecoded, c.raw) {
+			t.Errorf("%s: Undecoded = %q, want the bytes as they lie", c.what, dec.Undecoded)
+		}
+		// And the strict reading gives nothing at all.
+		if got, _, err := Decode(c.d, c.raw, nil); err == nil || got != nil {
+			t.Errorf("%s: Decode returned %q, %v", c.what, got, err)
+		}
+	}
+}
+
 // FuzzDecodeRecovering asserts the contract the salvage rests on: it never
 // panics and never reports a clean decode it did not make.
 func FuzzDecodeRecovering(f *testing.F) {
@@ -226,6 +273,12 @@ func FuzzDecodeRecovering(f *testing.F) {
 		dec := DecodeRecovering(d, raw, nil)
 		if dec.Recovered != (dec.Cause != nil) {
 			t.Fatalf("Recovered and Cause disagree: %+v", dec)
+		}
+		if len(dec.Undecoded) > 0 && len(dec.Data) > 0 {
+			t.Fatalf("Data and Undecoded both set: %+v", dec)
+		}
+		if len(dec.Undecoded) > 0 && !dec.Recovered {
+			t.Fatalf("Undecoded set on a clean decode: %+v", dec)
 		}
 		data, img, err := Decode(d, raw, nil)
 		if (err != nil) != dec.Recovered {
