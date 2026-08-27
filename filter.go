@@ -191,8 +191,62 @@ func applyFilter(f Name, data []byte, parm Dict, r Resolver) ([]byte, error) {
 		return runLengthDecode(data)
 	case "CCITTFaxDecode", "CCF":
 		return ccittDecode(data, ccittParamsOf(parm, r))
+	case "Crypt":
+		return cryptFilter(data, parm, r)
 	}
 	return nil, fmt.Errorf("reader: unsupported filter /%s", f)
+}
+
+// cryptFilter applies the /Crypt filter, which does not transform anything: it
+// names the crypt filter a stream's bytes were encrypted with, and /Identity —
+// which is also what /Crypt with no /Name means — says they were not encrypted
+// at all. Either way the document that owns the stream has already dealt with
+// its encryption by the time the filter chain runs, so there is nothing here
+// left to undo.
+//
+// A /Name this reader cannot account for is reported rather than waved through,
+// because the bytes would then be ciphertext that only looks like data.
+func cryptFilter(data []byte, parm Dict, r Resolver) ([]byte, error) {
+	o, err := Resolve(parm.Get("Name"), r)
+	if err != nil {
+		return data, fmt.Errorf("reader: /Crypt filter: %w", err)
+	}
+	if n, ok := ToName(o); ok && n != "Identity" {
+		return data, fmt.Errorf("reader: /Crypt filter names /%s, which this reader cannot apply", n)
+	}
+	return data, nil
+}
+
+// firstFilter names the first filter of a stream's chain. Only direct values
+// are read: it is consulted while the file key is being established, before
+// following an indirect reference is safe.
+func firstFilter(d Dict) (Name, bool) {
+	switch v := d.Get("Filter").(type) {
+	case Name:
+		return v, true
+	case Array:
+		if len(v) > 0 {
+			n, ok := ToName(v[0])
+			return n, ok
+		}
+	}
+	return "", false
+}
+
+// firstDecodeParms is the parameter dictionary belonging to the first filter,
+// read directly for the same reason.
+func firstDecodeParms(d Dict) Dict {
+	switch v := d.Get("DecodeParms").(type) {
+	case Dict:
+		return v
+	case Array:
+		if len(v) > 0 {
+			if pd, ok := ToDict(v[0]); ok {
+				return pd
+			}
+		}
+	}
+	return nil
 }
 
 // salvage finishes a filter that stopped part-way. The prefix it did produce is

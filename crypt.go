@@ -520,10 +520,26 @@ func (dec *decryptor) walk(num, gen int, o Object) Object {
 			return v
 		}
 		v.Dict, _ = ToDict(dec.walk(num, gen, v.Dict))
+		if streamIsPlain(v.Dict) {
+			return v
+		}
 		v.Raw = dec.decryptBytes(num, gen, dec.streams, v.Raw)
 		return v
 	}
 	return o
+}
+
+// streamIsPlain reports whether a stream's own filter chain says its bytes were
+// left unencrypted: a leading /Crypt filter naming /Identity, which is what
+// /Crypt with no /Name means too. Producers use it for the metadata stream of a
+// file whose /EncryptMetadata is false, and decrypting such a stream turns
+// readable XML into noise.
+func streamIsPlain(d Dict) bool {
+	if first, ok := firstFilter(d); !ok || first != "Crypt" {
+		return false
+	}
+	name, ok := ToName(firstDecodeParms(d).Get("Name"))
+	return !ok || name == "Identity"
 }
 
 // resolved is a helper for reading an /Encrypt entry that may be indirect.
