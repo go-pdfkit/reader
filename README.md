@@ -29,16 +29,39 @@ the **document structure**:
   resolved the way the specification requires.
 - **Filters** — `FlateDecode`, `LZWDecode` (with PDF's `EarlyChange`, which the
   standard library's LZW does not implement), `ASCIIHexDecode`,
-  `ASCII85Decode`, `RunLengthDecode`, plus the PNG and TIFF predictors.
-  Image filters (`DCTDecode`, `JPXDecode`, `CCITTFaxDecode`, `JBIG2Decode`) are
-  reported rather than applied, so an image consumer gets the encoded bytes.
+  `ASCII85Decode`, `RunLengthDecode`, `Crypt`, plus the PNG and TIFF
+  predictors. Image filters (`DCTDecode`, `JPXDecode`, `CCITTFaxDecode`,
+  `JBIG2Decode`) are reported rather than applied, so an image consumer gets
+  the encoded bytes.
+- **Filters that fail** — a chain that cannot be run to the end is not the end
+  of the stream. `DecodeRecovering` returns what the filters before the failure
+  produced — the prefix a damaged Flate stream did inflate, not its compressed
+  bytes — and says so through `Decoded.Recovered` and `Decoded.Cause`. Bytes no
+  filter decoded arrive in `Decoded.Undecoded`, never in `Decoded.Data`, so a
+  compressed stream cannot be painted as samples or tokenised as content by a
+  caller that forgot to check a flag.
+  `Decode` is the strict reading and refuses such a stream outright, so a
+  caller that must not act on damaged data says which it wants by which one it
+  calls. Page content takes the lenient reading, because a page whose content
+  will not decode is still a page; `PageContentDecoded` reports whether any
+  salvaging happened. Cross-reference streams take the strict one: a table that
+  has to be guessed at is worse than no table, and the repair below is the
+  answer to one.
 - **Cross-references** — classic tables, cross-reference **streams**, **object
   streams**, `/Prev` chains, and the `/XRefStm` of a hybrid file, newest
   definition winning.
 - **Repair** — a file whose tables are missing, truncated or simply wrong is
   rebuilt by scanning it for object headers, trailers and, failing those, for
   a catalogue; a file that kept its pages but lost its catalogue gets one.
-  This is not an exceptional path: it is what makes a reader usable.
+  This is not an exceptional path: it is what makes a reader usable. The
+  rebuild establishes the file key before it reads object streams, so a file
+  whose catalogue lives in an encrypted one can be rebuilt at all; it takes
+  `/Encrypt` from a cross-reference stream's dictionary when the file has no
+  trailer keyword to name it in. Where two object streams claim the same
+  object, the later one in the file wins, the same rule the header scan
+  applies to objects written directly — so the same damaged file reads the
+  same way twice. When a rebuild fails, the error says what the rebuild found
+  and not merely that the tables could not be read.
 - **Documents** — `Open`, object resolution with cycle and recursion guards,
   the trailer, the catalogue, and the page tree with the four attributes a
   page inherits from its ancestors.

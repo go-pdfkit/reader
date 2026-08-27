@@ -55,7 +55,8 @@ func lzwDecode(data []byte, early bool) ([]byte, error) {
 			// The encoder may name the entry it is about to define.
 			entry = append(append([]byte{}, prev...), prev[0])
 		default:
-			return nil, fmt.Errorf("reader: LZWDecode: code %d is not in the table", code)
+			// What the stream did say is kept, with the reason it stopped.
+			return out, fmt.Errorf("reader: LZWDecode: code %d is not in the table", code)
 		}
 		out = append(out, entry...)
 

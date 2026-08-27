@@ -2,6 +2,7 @@ package reader
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"slices"
 )
@@ -26,6 +27,15 @@ func (d *Document) repair() error {
 	if len(d.xref) == 0 {
 		return fmt.Errorf("reader: the file holds no indirect objects")
 	}
+	// A rebuild reads object streams, and in an encrypted file it cannot read
+	// one until the file key is known. The trailers a scan can see are where
+	// /Encrypt is named, so the key is established before the streams are
+	// indexed rather than after: otherwise a file whose catalogue lives in an
+	// encrypted object stream is rebuilt from bytes nobody can read, and the
+	// rebuild fails for a reason that has nothing to do with the file.
+	if err := d.establishDecryption(); err != nil {
+		return err
+	}
 	// Objects held in object streams are invisible to a header scan; take them
 	// from every object stream the scan did find.
 	d.indexObjectStreams()
@@ -34,6 +44,70 @@ func (d *Document) repair() error {
 		return fmt.Errorf("reader: no document catalogue found")
 	}
 	return nil
+}
+
+// establishDecryption derives the file key from a trailer the scan can see, for
+// a rebuild that runs before the cross-reference tables could name /Encrypt.
+// A file that is not encrypted, or whose key is already known, needs nothing.
+func (d *Document) establishDecryption() error {
+	if d.decrypt != nil || !bytes.Contains(d.buf, []byte("/Encrypt")) {
+		// /Encrypt can only be named by a trailer, and no trailer is
+		// compressed, so a file that does not hold those bytes anywhere is not
+		// encrypted. Saying so cheaply keeps the scan below off the common path.
+		return nil
+	}
+	previous := d.trailer
+	for _, tr := range d.trailerCandidates() {
+		if tr == nil || tr.Get("Encrypt").Kind() == KindNull {
+			continue
+		}
+		d.trailer = tr
+		err := d.setUpDecryption(d.password)
+		d.trailer = previous
+		if err != nil {
+			return err
+		}
+		// Whatever was read while the key was unknown was read wrong.
+		d.cache = map[int]Object{}
+		return nil
+	}
+	return nil
+}
+
+// trailerCandidates lists every dictionary that could carry trailer entries:
+// what the tables managed to read, then the file's trailer keywords, then the
+// dictionary of each cross-reference stream.
+//
+// The last of those is not optional. A file written with cross-reference
+// streams has no trailer keyword anywhere in it, and /Encrypt then exists only
+// in a /Type /XRef stream's dictionary — which is the one stream a PDF never
+// encrypts, precisely so that it can be read before the key is known.
+//
+// The cross-reference streams come highest object number first, an incremental
+// update having appended both its new objects and its new table to the file.
+func (d *Document) trailerCandidates() []Dict {
+	out := append([]Dict{d.trailer}, scanTrailers(d.buf)...)
+
+	nums := make([]int, 0, len(d.xref))
+	for num := range d.xref {
+		nums = append(nums, num)
+	}
+	slices.Sort(nums)
+	var streams []Dict
+	for _, num := range nums {
+		// An error here leaves a nil object, which is not a stream; the
+		// rebuild has already been told about anything unreadable.
+		o, _ := d.Get(Ref{Num: num})
+		s, ok := ToStream(o)
+		if !ok {
+			continue
+		}
+		if t, ok := ToName(s.Dict.Get("Type")); ok && t == "XRef" {
+			streams = append(streams, s.Dict)
+		}
+	}
+	slices.Reverse(streams)
+	return append(out, streams...)
 }
 
 // loadRepairedTrailer finds a trailer that leads to a catalogue: the file's own
@@ -120,8 +194,26 @@ func (d *Document) synthesiseCatalogue() {
 // indexObjectStreams adds the objects held inside every object stream the scan
 // found, without overwriting an object written directly in the file.
 func (d *Document) indexObjectStreams() {
-	var streams []int
+	// Two object streams in a damaged file may both claim the same object
+	// number — a partial rewrite leaves the old one in place beside the new —
+	// and the loop below lets the first stream walked define it. Walking
+	// d.xref in map order therefore made the same file read differently from
+	// one run to the next.
+	//
+	// They are walked latest in the file first, which is the rule the header
+	// scan above already applies to objects written directly: a later
+	// definition wins, an incremental update having appended it.
+	nums := make([]int, 0, len(d.xref))
 	for num := range d.xref {
+		nums = append(nums, num)
+	}
+	slices.Sort(nums)
+	type located struct {
+		offset int64
+		num    int
+	}
+	var found []located
+	for _, num := range nums {
 		o, err := d.Get(Ref{Num: num})
 		if err != nil {
 			continue
@@ -131,8 +223,13 @@ func (d *Document) indexObjectStreams() {
 			continue
 		}
 		if t, ok := ToName(s.Dict.Get("Type")); ok && t == "ObjStm" {
-			streams = append(streams, num)
+			found = append(found, located{d.xref[num].offset, num})
 		}
+	}
+	slices.SortFunc(found, func(a, b located) int { return cmp.Compare(b.offset, a.offset) })
+	streams := make([]int, 0, len(found))
+	for _, f := range found {
+		streams = append(streams, f.num)
 	}
 	for _, num := range streams {
 		// The stream object is already cached by the pass above, so this

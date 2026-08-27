@@ -22,6 +22,7 @@ type Document struct {
 	loading      map[int]bool
 	objStms      map[int]map[int]Object
 	pages        []Ref
+	password     string
 	decrypt      *decryptor
 	encryptNum   int
 	encryptKnown bool
@@ -39,11 +40,12 @@ func Open(b []byte) (*Document, error) { return OpenWithPassword(b, "") }
 // as the user password and as the owner password, the empty one as well.
 func OpenWithPassword(b []byte, password string) (*Document, error) {
 	d := &Document{
-		buf:     b,
-		xref:    map[int]xrefEntry{},
-		cache:   map[int]Object{},
-		loading: map[int]bool{},
-		objStms: map[int]map[int]Object{},
+		buf:      b,
+		xref:     map[int]xrefEntry{},
+		cache:    map[int]Object{},
+		loading:  map[int]bool{},
+		objStms:  map[int]map[int]Object{},
+		password: password,
 	}
 	err := d.loadXref()
 	if err == nil {
@@ -51,24 +53,27 @@ func OpenWithPassword(b []byte, password string) (*Document, error) {
 			return nil, derr
 		}
 		d.cache = map[int]Object{}
-		if _, cerr := d.Catalog(); cerr == nil {
+		cerr := error(nil)
+		if _, cerr = d.Catalog(); cerr == nil {
 			return d, nil
 		}
 		// Tables that parse but lead nowhere are worse than none: rebuild.
-		err = fmt.Errorf("reader: the trailer does not lead to a catalog")
+		// What the catalogue lookup actually said is kept: "no page tree" and
+		// "/Root is a null" send a reader to different places.
+		err = fmt.Errorf("reader: the cross-reference tables do not lead to a catalogue: %w", cerr)
 	}
 	if rerr := d.repair(); rerr != nil {
-		return nil, err
+		// Both diagnoses matter, and the rebuild's is the one about the file
+		// as it really is: it has read every object header in it, where the
+		// tables only failed to be read. Returning the tables' error alone
+		// reported "no startxref" for a file that turned out to hold no
+		// objects at all, or an encrypted one whose catalogue could not be
+		// reached — a different problem with a different answer.
+		return nil, fmt.Errorf("%w (the cross-reference information was unusable too: %v)", rerr, err)
 	}
-	if d.decrypt == nil {
-		if derr := d.setUpDecryption(password); derr != nil {
-			return nil, derr
-		}
-		// Whatever was read while the key was still unknown must be read again.
-		d.cache = map[int]Object{}
-		d.objStms = map[int]map[int]Object{}
-		d.pages = nil
-	}
+	// Setting the key up again here used to be necessary, because the rebuild
+	// ran before anything knew the file was encrypted. repair() establishes it
+	// itself now, so by this point it is either known or not needed.
 	return d, nil
 }
 
@@ -200,10 +205,13 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 	if !ok {
 		return objs, nil
 	}
-	data, img, err := d.DecodeStream(s)
-	if err != nil || img != "" {
+	// An object stream that stops in the middle still holds whole objects in
+	// the part that did decode, and losing them loses pages.
+	dec := d.DecodeStreamRecovering(s)
+	if dec.Image != "" {
 		return objs, nil
 	}
+	data := dec.Data
 	n := int(intOr(s.Dict.Get("N"), 0))
 	first := int(intOr(s.Dict.Get("First"), 0))
 	if n <= 0 || first <= 0 || first > len(data) {
@@ -242,9 +250,16 @@ func intOr(o Object, def int64) int64 {
 }
 
 // DecodeStream applies a stream's filter chain, resolving any indirect decode
-// parameters against this document.
+// parameters against this document. A chain that cannot be run to the end is
+// an error; [Document.DecodeStreamRecovering] salvages instead.
 func (d *Document) DecodeStream(s *Stream) ([]byte, Name, error) {
 	return Decode(s.Dict, s.Raw, d.Get)
+}
+
+// DecodeStreamRecovering applies a stream's filter chain, salvaging what it can
+// from a chain that cannot be run to the end and saying that it did so.
+func (d *Document) DecodeStreamRecovering(s *Stream) Decoded {
+	return DecodeRecovering(s.Dict, s.Raw, d.Get)
 }
 
 // Catalog returns the document catalogue the trailer's /Root names.

@@ -242,8 +242,16 @@ func TestPageContentImageFilterIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PageContent(1); err == nil {
-		t.Error("want an error")
+	dec, err := d.PageContentDecoded(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dec.Recovered || dec.Cause == nil || dec.Filter != "DCTDecode" {
+		t.Errorf("got %+v", dec)
+	}
+	// Bytes an image filter holds are not content, so none are handed over.
+	if len(dec.Data) != 0 {
+		t.Errorf("got %q, want no content", dec.Data)
 	}
 }
 
@@ -258,8 +266,22 @@ func TestPageContentUndecodable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := d.PageContent(1); err == nil {
-			t.Errorf("%s: want an error", contents)
+		// A page whose only content stream will not decode is still a page:
+		// the raw bytes come back flagged, not as a failure.
+		dec, err := d.PageContentDecoded(1)
+		if err != nil {
+			t.Fatalf("%s: %v", contents, err)
+		}
+		if !dec.Recovered || dec.Cause == nil || dec.Filter != "FlateDecode" {
+			t.Errorf("%s: got %+v", contents, dec)
+		}
+		// The bytes come back, but not as content: a scanner must not be
+		// handed a compressed stream to tokenise.
+		if len(dec.Data) != 0 {
+			t.Errorf("%s: undecoded bytes arrived as content: %q", contents, dec.Data)
+		}
+		if string(dec.Undecoded) != "not deflate data" {
+			t.Errorf("%s: got %q, want the raw bytes", contents, dec.Undecoded)
 		}
 	}
 }
