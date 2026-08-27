@@ -120,8 +120,17 @@ func (d *Document) synthesiseCatalogue() {
 // indexObjectStreams adds the objects held inside every object stream the scan
 // found, without overwriting an object written directly in the file.
 func (d *Document) indexObjectStreams() {
-	var streams []int
+	// The object numbers are sorted before they are walked. Two object streams
+	// in a damaged file may both claim the same object number, and the first
+	// one walked wins; taking them in map order makes the same file read
+	// differently from one run to the next.
+	nums := make([]int, 0, len(d.xref))
 	for num := range d.xref {
+		nums = append(nums, num)
+	}
+	slices.Sort(nums)
+	var streams []int
+	for _, num := range nums {
 		o, err := d.Get(Ref{Num: num})
 		if err != nil {
 			continue

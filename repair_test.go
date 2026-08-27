@@ -546,3 +546,45 @@ func TestObjectsAreListedInOrderHoweverSparseTheNumbersAre(t *testing.T) {
 		}
 	}
 }
+
+// Two object streams in a damaged file may both claim the same object number.
+// Which one wins has to be a property of the file, not of the map iteration
+// order the run happened to get.
+func TestIndexObjectStreamsIsDeterministic(t *testing.T) {
+	objStm := func(num int, marker string) (int, string, []byte) {
+		index := "5 0 "
+		return num, fmt.Sprintf("/Type /ObjStm /N 1 /First %d", len(index)),
+			[]byte(index + fmt.Sprintf("<< /Marker /%s >>", marker))
+	}
+	b := newBuilder()
+	b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1 1] >>")
+	b.obj(3, "<< /Type /Page /Parent 2 0 R >>")
+	// The higher-numbered stream is written first, so agreeing with the file's
+	// own order would not be enough to pass.
+	b.streamObj(objStm(20, "fromTwenty"))
+	b.streamObj(objStm(10, "fromTen"))
+	// No startxref, so the tables cannot be read and the rebuild runs.
+	raw := append(b.bytesOf(), []byte("trailer\n<< /Root 1 0 R >>\n%%EOF\n")...)
+
+	for i := 0; i < 200; i++ {
+		d, err := Open(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.Repaired() {
+			t.Fatal("the file was not rebuilt")
+		}
+		o, err := d.Get(Ref{Num: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dict, ok := ToDict(o)
+		if !ok {
+			t.Fatalf("run %d: object 5 is a %s", i, o.Kind())
+		}
+		if got, _ := ToName(dict.Get("Marker")); got != "fromTen" {
+			t.Fatalf("run %d: object 5 came from the wrong stream: /%s", i, got)
+		}
+	}
+}
