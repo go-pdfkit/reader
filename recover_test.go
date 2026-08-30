@@ -105,8 +105,25 @@ func TestDecodeRecoveringDamagedFlateKeepsPredictor(t *testing.T) {
 	if len(dec.Data) < 4*columns {
 		t.Fatalf("recovered only %d bytes", len(dec.Data))
 	}
-	if !bytes.HasPrefix(want, dec.Data) {
-		t.Errorf("predictor not undone over the prefix: got %v, want a prefix of %v", dec.Data[:8], want[:8])
+	// Every row but the last is true. The last one may not be: the stream can
+	// end mid-row, and pngPredictor deliberately pads the remainder with zeroes
+	// and emits the row rather than dropping it -- TestPNGPredictorTruncatedRow
+	// pins that. So the row the damage landed in is excluded here.
+	//
+	// Asserting over the whole of dec.Data only ever passed because the
+	// truncation happened to fall on a row boundary. Go 1.27's deflater picks
+	// different block types for this data than 1.26's, the halfway cut moved,
+	// and the assertion failed on a library that had not changed.
+	whole := len(dec.Data) - columns
+	if whole < 0 {
+		whole = 0
+	}
+	if !bytes.HasPrefix(want, dec.Data[:whole]) {
+		n := whole
+		if n > 8 {
+			n = 8
+		}
+		t.Errorf("predictor not undone over the whole rows: got %v, want a prefix of %v", dec.Data[:n], want[:n])
 	}
 }
 

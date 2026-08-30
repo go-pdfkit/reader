@@ -311,3 +311,45 @@ func TestDecodeFlateFailure(t *testing.T) {
 		t.Error("want an error")
 	}
 }
+
+// A bare deflate stream whose first block is STORED begins with a NUL, and NUL
+// is one of the six bytes the specification calls white-space. Skipping it eats
+// a real byte and the stream dies one byte in.
+//
+// The stream is built by hand rather than by a deflater, because which block
+// type a deflater picks is its own business and changes between releases: Go
+// 1.26 compressed this test's data, Go 1.27 stored it, and that is how this was
+// found.
+func TestFlateDecodeStoredBlockStartingWithNUL(t *testing.T) {
+	want := []byte("abc")
+
+	var raw []byte
+	// Non-final stored block: BFINAL=0, BTYPE=00, then LEN and ^LEN, little-endian.
+	raw = append(raw, 0x00, byte(len(want)), 0x00, ^byte(len(want)), 0xff)
+	raw = append(raw, want...)
+	// Final empty stored block.
+	raw = append(raw, 0x01, 0x00, 0x00, 0xff, 0xff)
+
+	if raw[0] != 0x00 {
+		t.Fatalf("test is not exercising what it claims: first byte %#x, want NUL", raw[0])
+	}
+	if !isSpace(raw[0]) {
+		t.Fatal("test is not exercising what it claims: NUL is not treated as white-space")
+	}
+
+	got, err := flateDecode(raw)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Errorf("stored block: got %q, %v; want %q", got, err, want)
+	}
+}
+
+// A bare deflate stream preceded by the stream's EOL: here the white-space skip
+// is the thing that makes it readable, which is why it is there.
+func TestFlateDecodeRawAfterLeadingEOL(t *testing.T) {
+	want := []byte("some data worth compressing, twice over")
+	padded := append([]byte("\r\n"), rawDeflateBytes(t, want)...)
+	got, err := flateDecode(padded)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Errorf("raw deflate after EOL: got %q, %v", got, err)
+	}
+}
