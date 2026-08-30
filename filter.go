@@ -315,25 +315,69 @@ func intParm(parm Dict, key Name, def int, r Resolver) int {
 // a prefix comes back with the error that ended it, never dressed up as a whole
 // stream, so the caller can tell the difference.
 func flateDecode(data []byte) ([]byte, error) {
-	i := 0
-	for i < len(data) && isSpace(data[i]) {
-		i++
+	// Where the stream really starts is ambiguous, and the ambiguity has to be
+	// resolved by reading rather than by guessing.
+	//
+	// Producers put the stream's EOL before the data, so leading white-space is
+	// skipped. But NUL is one of the six bytes the specification calls
+	// white-space, and a bare deflate stream whose first block is STORED begins
+	// with a NUL. Skip that and the stream does not merely fail: 00 03 00 fc ff
+	// "abc" reads, once its NUL is gone, as a fixed-Huffman final block that
+	// ends at once, so it inflates to NOTHING with no error. Silence, not a
+	// diagnostic.
+	//
+	// Stored blocks are ordinary -- they are what a deflater emits for data
+	// that will not compress, which in a PDF is every image that arrived
+	// already compressed -- and "\r\n" followed by such a block needs exactly
+	// two bytes skipped, not three. So every split point inside the leading
+	// white-space run is tried, and the read that actually yields bytes wins.
+	ws := 0
+	for ws < len(data) && isSpace(data[ws]) {
+		ws++
 	}
-	data = data[i:]
-	if zr, err := zlib.NewReader(bytes.NewReader(data)); err == nil {
-		out, err := readAllCapped(zr)
-		if err == nil {
-			return out, nil
+
+	var best []byte
+	var bestErr error
+	have := false
+
+	try := func(b []byte, wrapped bool) bool {
+		var out []byte
+		var err error
+		if wrapped {
+			zr, zerr := zlib.NewReader(bytes.NewReader(b))
+			if zerr != nil {
+				return false
+			}
+			out, err = readAllCapped(zr)
+		} else {
+			out, err = readAllCapped(flate.NewReader(bytes.NewReader(b)))
 		}
-		if len(out) > 0 {
-			return out, fmt.Errorf("reader: FlateDecode: %w", err)
+		if err == nil && len(out) > 0 {
+			best, bestErr, have = out, nil, true
+			return true
+		}
+		if !have || len(out) > len(best) {
+			best, bestErr, have = out, err, true
+		}
+		return false
+	}
+
+	// zlib is tried only past the white-space, because a valid zlib stream
+	// cannot begin inside it: RFC 1950 fixes CM to 8, so the low nibble of the
+	// first byte is 8, and none of 00, 09, 0a, 0c, 0d, 20 has a low nibble of 8.
+	if try(data[ws:], true) {
+		return best, nil
+	}
+	// Bare deflate, from the far end of the white-space run back to the start.
+	for i := ws; i >= 0; i-- {
+		if try(data[i:], false) {
+			return best, nil
 		}
 	}
-	out, err := readAllCapped(flate.NewReader(bytes.NewReader(data)))
-	if err != nil {
-		return out, fmt.Errorf("reader: FlateDecode: %w", err)
+	if bestErr != nil {
+		return best, fmt.Errorf("reader: FlateDecode: %w", bestErr)
 	}
-	return out, nil
+	return best, nil
 }
 
 // readAllCapped reads r, refusing to grow past maxDecodedSize.
