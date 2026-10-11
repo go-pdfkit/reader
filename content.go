@@ -13,6 +13,19 @@ type Operation struct {
 	Operator string
 	Operands []Object
 	Image    *InlineImage
+
+	// Start and End are the operation's byte range in the stream it was
+	// scanned from: Start is the first byte of its first operand, or of the
+	// operator itself when it has none, and End is just past the operator.
+	//
+	// ⛔ They are here so that a content stream can be edited IN PLACE. A tool
+	// that wants to put something before every BT has only two honest ways to
+	// find one: re-serialise the whole stream, which risks changing what an
+	// inline image's bytes mean, or know where the operator was — and this
+	// scanner is the only thing that does know, because a "BT" inside a
+	// string or inside an inline image's data is not an operator and a byte
+	// search cannot tell.
+	Start, End int
 }
 
 // An InlineImage is the dictionary and the still-encoded bytes of a BI … ID …
@@ -108,12 +121,16 @@ func expandColourSpace(k Name, v Object) Object {
 type ContentScanner struct {
 	lex     lexer
 	pending []Object
-	err     error
+	// at is where the operands waiting for an operator began, so that an
+	// operation can say which bytes of the stream it is. -1 means none are
+	// waiting and the operator's own position is the start.
+	at  int
+	err error
 }
 
 // NewContentScanner reads operations from a decoded content stream.
 func NewContentScanner(data []byte) *ContentScanner {
-	return &ContentScanner{lex: lexer{buf: data}}
+	return &ContentScanner{lex: lexer{buf: data}, at: -1}
 }
 
 // Err reports the first malformed token the scan stepped over, if any.
@@ -141,12 +158,15 @@ func (s *ContentScanner) Next() (Operation, bool) {
 		}
 		switch string(t.text) {
 		case "true":
+			s.mark(t.pos)
 			s.pending = append(s.pending, Bool(true))
 			continue
 		case "false":
+			s.mark(t.pos)
 			s.pending = append(s.pending, Bool(false))
 			continue
 		case "null":
+			s.mark(t.pos)
 			s.pending = append(s.pending, Null{})
 			continue
 		case "BI":
@@ -155,14 +175,23 @@ func (s *ContentScanner) Next() (Operation, bool) {
 				s.note(err)
 				return Operation{}, false
 			}
-			return s.emit("BI", img), true
+			return s.emit("BI", img, t.pos), true
 		}
-		return s.emit(string(t.text), nil), true
+		return s.emit(string(t.text), nil, t.pos), true
+	}
+}
+
+// mark remembers where the operands waiting for an operator began. Only the
+// FIRST matters: an operation's start is the start of its first operand.
+func (s *ContentScanner) mark(pos int) {
+	if s.at < 0 {
+		s.at = pos
 	}
 }
 
 // operand parses one operand, an already-read token starting it.
 func (s *ContentScanner) operand(t token) {
+	s.mark(t.pos)
 	p := &parser{lex: s.lex}
 	o, err := p.parseFrom(t)
 	s.lex = p.lex
@@ -176,10 +205,23 @@ func (s *ContentScanner) operand(t token) {
 	s.pending = append(s.pending, o)
 }
 
-// emit finishes an operation and clears the operands waiting for it.
-func (s *ContentScanner) emit(op string, img *InlineImage) Operation {
-	out := Operation{Operator: op, Operands: s.pending, Image: img}
-	s.pending = nil
+// emit finishes an operation and clears the operands waiting for it. opPos is
+// where the operator's own token began, which is the operation's start when no
+// operands preceded it.
+func (s *ContentScanner) emit(op string, img *InlineImage, opPos int) Operation {
+	start := s.at
+	if start < 0 {
+		start = opPos
+	}
+	out := Operation{
+		Operator: op, Operands: s.pending, Image: img,
+		// ⛔ End is the lexer's position and not opPos plus the operator's
+		// length: an inline image's operator token is "BI" and its operation
+		// runs to the EI three keywords later, so measuring from the operator
+		// would put the end in the middle of the image's data.
+		Start: start, End: s.lex.pos,
+	}
+	s.pending, s.at = nil, -1
 	return out
 }
 
