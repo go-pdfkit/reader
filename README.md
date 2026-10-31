@@ -109,6 +109,39 @@ compared on page count, media boxes and the bytes of every content stream.
 and **all 118 833 match again** when the packed writer is used instead, which
 brings the output down to **94.6%** of the input.
 
+### Linearization (Fast Web View)
+
+`Linearized(b)` reads the linearization parameter dictionary at the front of a
+file (ISO 32000-1 Annex F, Table F.1) and checks it against the file. A
+linearized PDF is ordinary PDF rearranged so a reader with a byte-range
+transport can show the first page before the rest has arrived.
+
+⛔ **It is not a yes/no.** Table F.1 says a file-length mismatch "indicates
+that the file is not linearized and shall be treated as ordinary PDF", and
+F.3.6 says any incremental update invalidates the hint tables — which is the
+ordinary fate of these files. So the three errors mean different things:
+`ErrNotLinearized` (never was), `ErrLinearizationMalformed` (breaks a rule of
+Table F.1), `ErrLinearizationStale` (was, and the file changed underneath it).
+
+Checked: the dictionary is the **first** object of the body — not "one found
+somewhere near the front", because searching would turn up a dictionary left
+by an earlier write and call the file linearized when what a reader looks at
+first is something else; that it lies entirely within the **first 1024 bytes**,
+the rule that makes the format worth having; that every value is **direct**, so
+no cross-reference table is needed to read it; the required entries and their
+types; and `/L` against the real file length.
+
+Not checked: the hint tables themselves (F.4) — a file can pass this and still
+send a reader to the wrong offset.
+
+The positives are **qpdf's** output, not fixtures written to agree with this
+reading of Annex F. On five real library scans linearized by qpdf and judged by
+`qpdf --check` alongside: **5 agree, 0 disagree**, including a 68-page, 13 MB
+document.
+
+⛔ **Reading is all it does — there is no linearizing writer yet.** The checker
+came first on purpose: a writer cannot be trusted without one.
+
 Next wave: the operations built on all of this.
 
 ## Install
