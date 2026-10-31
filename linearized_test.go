@@ -26,6 +26,48 @@ import (
 // skipped test that looks like a pass is how a checker comes to be believed
 // without ever having been checked.
 
+// TestLinearizedReadsTheCommittedFixture is the one positive that needs
+// nothing installed.
+//
+// ⛔ IT EXISTS BECAUSE CI CAUGHT ME OUT. Every other positive here is built by
+// running qpdf, and the runner has no qpdf — so they all skipped, the exact
+// "a skipped test that looks like a pass" this file's own header warns about,
+// and the coverage gate reported Linearized at 96.0% while it was 100% on my
+// machine. testdata/linearized.pdf is a two-page document this package wrote
+// and qpdf linearized, committed at 1 367 bytes: still an independent
+// implementation's output, now also a deterministic one.
+func TestLinearizedReadsTheCommittedFixture(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lin, err := Linearized(b)
+	if err != nil {
+		t.Fatalf("the committed fixture was refused: %v", err)
+	}
+	if lin.FileLength != len(b) {
+		t.Errorf("/L %d, file %d", lin.FileLength, len(b))
+	}
+	if lin.PageCount != 2 {
+		t.Errorf("/N %d, want 2", lin.PageCount)
+	}
+	if lin.Version <= 0 || lin.HintOffset <= 0 || lin.HintLength <= 0 ||
+		lin.MainXrefOffset <= 0 || lin.FirstPageEnd <= 0 {
+		t.Errorf("an entry came back unset: %+v", lin)
+	}
+	d, err := Open(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, ok := d.PageRef(1)
+	if !ok {
+		t.Fatal("no first page")
+	}
+	if ref.Num != lin.FirstPageObject {
+		t.Errorf("/O is %d, the first page is object %d", lin.FirstPageObject, ref.Num)
+	}
+}
+
 func qpdfOrSkip(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("qpdf")
@@ -153,12 +195,19 @@ func TestLinearizedRejectsAFileChangedAfterwards(t *testing.T) {
 	// ordinary PDF", and F.3.6 says any incremental update invalidates the
 	// hint tables. Appending anything at all is enough, and that is the
 	// ordinary fate of these files — so this must be reported, not ignored.
-	_, linear := linearizedFixture(t, 2)
+	// ⛔ The COMMITTED fixture, not a freshly qpdf'd one: this is the only
+	// test of the staleness path, and on a runner without qpdf a generated
+	// fixture would skip it — which is how `Linearized` sat at 96.0% in CI
+	// while reading 100% here.
+	linear, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Linearized(linear); err != nil {
 		t.Fatalf("the fixture is not linearized to begin with: %v", err)
 	}
 	appended := append(append([]byte{}, linear...), []byte("\n% an incremental update would go here\n")...)
-	_, err := Linearized(appended)
+	_, err = Linearized(appended)
 	if !errors.Is(err, ErrLinearizationStale) {
 		t.Errorf("a file with bytes appended: got %v, want ErrLinearizationStale", err)
 	}

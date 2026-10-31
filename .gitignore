@@ -1,3 +1,13 @@
 cov.out
 coverage.out
 *.pdf
+# ⛔ except a fixture, deliberately. The rule above keeps stray PDFs and corpus
+# files out of the repository, and every test here builds the documents it
+# needs in code — which is the better habit and stays the default.
+#
+# testdata/ is the one exception, for a document this package CANNOT build: a
+# linearized one. Producing it is precisely what reader does not do yet, so the
+# fixture comes from qpdf — and it has to be committed because CI has no qpdf,
+# without which the checker's positive tests skip there and the coverage gate
+# fails while reading 100% locally.
+!testdata/*.pdf
