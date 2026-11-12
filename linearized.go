@@ -294,7 +294,14 @@ func checkHintStream(b []byte, lin *Linearization) error {
 		return fmt.Errorf("%w: /H starts at %d and the file is %d bytes",
 			ErrLinearizationStale, lin.HintOffset, len(b))
 	}
-	if lin.HintLength <= 0 || lin.HintOffset+lin.HintLength > len(b) {
+	// ⛔⛔ SUBTRACTION, NOT ADDITION, AND THAT IS A 32-BIT DEFECT RATHER THAN A
+	// STYLE. Both values come straight out of the file, so an attacker chooses
+	// them. Written `lin.HintOffset+lin.HintLength > len(b)`, a /H length near
+	// MaxInt32 OVERFLOWS to a negative number on a 32-bit build, the comparison
+	// is false, and the check lets through exactly the file it exists to
+	// refuse. The offset is already known to be inside the file, so
+	// len(b)-lin.HintOffset is positive and the subtraction cannot wrap.
+	if lin.HintLength <= 0 || lin.HintLength > len(b)-lin.HintOffset {
 		return fmt.Errorf("%w: /H is %d bytes from %d and the file is %d",
 			ErrLinearizationStale, lin.HintLength, lin.HintOffset, len(b))
 	}

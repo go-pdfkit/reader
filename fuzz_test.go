@@ -171,3 +171,63 @@ func FuzzDecode(f *testing.F) {
 		})
 	})
 }
+
+// FuzzCheckLinearized drives the deep linearization check.
+//
+// ⛔ IT IS A PARSER OF NUMBERS AN ATTACKER CHOSE. /H, /O, /E, /T and /N come
+// out of the first object of the file and are used as OFFSETS and LENGTHS into
+// it. The cheap [reader.Linearized] only type-checks them; this one slices the
+// file at them, which is where a bad bound stops being a wrong answer and
+// starts being a read past the end.
+//
+// The seeds are the two committed fixtures — byte substitutions in them keep
+// the length, so /L still matches and the mutator reaches the deep checks
+// rather than stopping at the front — plus fronts whose integers are absurd on
+// purpose.
+func FuzzCheckLinearized(f *testing.F) {
+	for _, name := range []string{"linearized.pdf", "linearized-objstm.pdf"} {
+		if b, err := os.ReadFile(filepath.Join("testdata", name)); err == nil {
+			f.Add(b)
+		}
+	}
+	// ⛔ MaxInt32 in both halves of /H. Written as an addition, the bound check
+	// overflows to a negative number on a 32-bit build and admits the file;
+	// this seed is the regression for that, and it is the shape a hostile file
+	// takes rather than one a generator would invent.
+	for _, s := range []string{
+		"<< /Linearized 1 /L 1 /H [ 2147483647 2147483647 ] /O 1 /E 1 /N 1 /T 1 >>",
+		"<< /Linearized 1 /L 1 /H [ -1 -1 ] /O -1 /E -1 /N -1 /T -1 >>",
+		"<< /Linearized 1 /L 1 /H [ 0 0 ] /O 0 /E 0 /N 0 /T 0 >>",
+	} {
+		f.Add([]byte("%PDF-1.7\n1 0 obj\n" + s + "\nendobj\n"))
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		budget(t, 2*time.Second, len(b), "CheckLinearized", func() {
+			lin, err := reader.CheckLinearized(b)
+			if err != nil {
+				return
+			}
+			// ⛔ THE INVARIANT, not merely "it did not panic". The deep check
+			// is strictly stronger than the cheap one, so anything it accepts
+			// the cheap one must accept too. A disagreement would mean one of
+			// them reads the front of a file differently from the other, which
+			// is how a reader and a writer come to disagree about the same
+			// bytes.
+			if _, err := reader.Linearized(b); err != nil {
+				t.Fatalf("CheckLinearized accepted a file Linearized refuses: %v", err)
+			}
+			// And every offset it accepted is inside the file it accepted.
+			if lin.HintOffset < 0 || lin.HintOffset > len(b) ||
+				lin.HintLength < 0 || lin.HintLength > len(b)-lin.HintOffset {
+				t.Fatalf("/H [%d %d] accepted for a file of %d bytes",
+					lin.HintOffset, lin.HintLength, len(b))
+			}
+			if lin.MainXrefOffset < 0 || lin.MainXrefOffset > len(b) {
+				t.Fatalf("/T %d accepted for a file of %d bytes", lin.MainXrefOffset, len(b))
+			}
+			if lin.FirstPageEnd < 0 || lin.FirstPageEnd > len(b) {
+				t.Fatalf("/E %d accepted for a file of %d bytes", lin.FirstPageEnd, len(b))
+			}
+		})
+	})
+}
