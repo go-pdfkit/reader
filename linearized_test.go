@@ -68,6 +68,121 @@ func TestLinearizedReadsTheCommittedFixture(t *testing.T) {
 	}
 }
 
+// ⛔⛔ THE PAIR THAT MAKES CheckLinearized WORTH HAVING. Each case below is a
+// file that [Linearized] ACCEPTS and [CheckLinearized] refuses: the dictionary
+// is well formed, within the window, and /L still equals the byte count,
+// because every edit replaces an integer with one of THE SAME WIDTH. Nothing
+// in the front of the file is wrong — what is wrong is that it describes a
+// different document.
+//
+// That is the shape a first linearizer emits, and it is why a writer must not
+// be developed against the cheap check alone: it would pass while linearizing
+// nothing.
+func TestAParameterTheDocumentContradictsIsCaughtOnlyByTheDeepCheck(t *testing.T) {
+	for _, c := range []struct {
+		name, from, to, says string
+	}{
+		{"a page count the document contradicts", "/N 2", "/N 3", "/N says 3 page(s)"},
+		{"a first page that is not the first page", "/O 7", "/O 6", "/O says object 6"},
+		{"a hint stream that starts one byte late", "/H [ 550 127 ]", "/H [ 551 127 ]", "/H points at byte 551"},
+		{"a main cross-reference that is not there", "/T 1169", "/T 1160", "/T is 1160"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := editedFixture(t, c.from, c.to)
+
+			// The cheap check still passes, which is the whole point.
+			if _, err := Linearized(b); err != nil {
+				t.Fatalf("Linearized refused it, so this case proves nothing "+
+					"about the deep check: %v", err)
+			}
+			_, err := CheckLinearized(b)
+			if err == nil {
+				t.Fatal("CheckLinearized accepted a file that describes another document")
+			}
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Errorf("error is %v, want it to wrap ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), c.says) {
+				t.Errorf("it does not name the claim that failed: %v", err)
+			}
+		})
+	}
+}
+
+// editedFixture rewrites one entry of the committed fixture's parameter
+// dictionary, keeping the byte count identical.
+//
+// ⛔ THE WIDTH IS ASSERTED, NOT ASSUMED. A replacement one byte longer changes
+// the file's length, so /L would no longer match and [Linearized] would refuse
+// the file for THAT reason — the deep check would never run, and the test
+// would pass while measuring nothing.
+func editedFixture(t *testing.T, from, to string) []byte {
+	t.Helper()
+	if len(from) != len(to) {
+		t.Fatalf("the edit %q -> %q changes the file's length, which breaks /L "+
+			"and makes this test measure the wrong refusal", from, to)
+	}
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if strings.Count(s, from) != 1 {
+		t.Fatalf("%q appears %d times in the fixture, so this edit is not the one "+
+			"it is named for", from, strings.Count(s, from))
+	}
+	return []byte(strings.Replace(s, from, to, 1))
+}
+
+// And the fixture itself passes the deep check, so the refusals above are
+// about the edits and not about the checker disliking qpdf's output.
+func TestCheckLinearizedAcceptsTheCommittedFixture(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lin, err := CheckLinearized(b)
+	if err != nil {
+		t.Fatalf("qpdf's own linearized file was refused: %v", err)
+	}
+	if lin.PageCount != 2 {
+		t.Errorf("/N %d, want 2", lin.PageCount)
+	}
+}
+
+// ⛔ THE NEGATIVE CONTROL, and it is the first thing this file needed. An
+// ordinary document written by this package is NOT linearized, and both checks
+// must say so — a suite in which every input passes measures nothing.
+func TestAnOrdinaryFileIsRefusedByBothChecks(t *testing.T) {
+	b := buildPages(t, 2)
+	if _, err := Linearized(b); !errors.Is(err, ErrNotLinearized) {
+		t.Errorf("Linearized said %v, want ErrNotLinearized", err)
+	}
+	if _, err := CheckLinearized(b); !errors.Is(err, ErrNotLinearized) {
+		t.Errorf("CheckLinearized said %v, want ErrNotLinearized", err)
+	}
+}
+
+// qpdf's output passes the deep check at several page counts, not only at the
+// one the committed fixture happens to have.
+func TestCheckLinearizedAgreesWithQpdfAcrossPageCounts(t *testing.T) {
+	for _, pages := range []int{1, 2, 5} {
+		t.Run(strconv.Itoa(pages)+" pages", func(t *testing.T) {
+			plain, linear := linearizedFixture(t, pages)
+			if _, err := CheckLinearized(plain); !errors.Is(err, ErrNotLinearized) {
+				t.Errorf("the plain file was not refused: %v", err)
+			}
+			lin, err := CheckLinearized(linear)
+			if err != nil {
+				t.Fatalf("qpdf linearized it and this refused it: %v", err)
+			}
+			if lin.PageCount != pages {
+				t.Errorf("/N %d, want %d", lin.PageCount, pages)
+			}
+		})
+	}
+}
+
 func qpdfOrSkip(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("qpdf")

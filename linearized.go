@@ -186,6 +186,181 @@ func Linearized(b []byte) (*Linearization, error) {
 	return lin, nil
 }
 
+// CheckLinearized reads the parameter dictionary and then checks what it says
+// against the document it describes.
+//
+// ⛔⛔ [Linearized] ON ITS OWN IS A WEAKER TEST THAN IT LOOKS, AND A WRITER
+// DEVELOPED AGAINST IT WOULD PASS WITHOUT LINEARIZING ANYTHING. Of Table F.1's
+// claims it checks exactly one against the file — /L against the byte count —
+// because it is deliberately cheap: a reader deciding whether to stream a file
+// has fetched 1024 bytes and has no cross-reference table to resolve anything
+// with. /O, /E, /N and /T are read for type and never consulted. So a file
+// carrying a correct /L and four invented integers is accepted, which is
+// precisely what a first linearizer would emit.
+//
+// This is the other question, for the other caller: not "may a reader trust
+// the front of this file" but "is this file actually what the front says".
+// It opens the document, so it costs what opening costs, and it is the
+// judgement a writer needs on bytes it has just produced.
+//
+// ⛔ It still does NOT validate the hint tables (F.4), which is a larger job
+// again. What it establishes is that every parameter POINTS AT WHAT IT CLAIMS
+// TO: the page count is the real one, /O is the real first page, /H begins at
+// a real stream object, /T reaches the main cross-reference. A file can pass
+// this and still send a reader to the wrong offset inside a hint table — so
+// the error says which claim failed, and a caller that needs more must read
+// F.4. qpdf's `--check` remains the foreign judge the tests print by.
+//
+// The error wraps the same sentinels [Linearized] uses: a dictionary that
+// disagrees with the document around it is [ErrLinearizationStale], which is
+// what Table F.1 says such a file is — ordinary PDF.
+func CheckLinearized(b []byte) (*Linearization, error) {
+	lin, err := Linearized(b)
+	if err != nil {
+		return nil, err
+	}
+	d, err := Open(b)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the file carries linearization parameters and does not open: %v",
+			ErrLinearizationStale, err)
+	}
+	if n := d.PageCount(); n != lin.PageCount {
+		return nil, fmt.Errorf("%w: /N says %d page(s) and the document has %d",
+			ErrLinearizationStale, lin.PageCount, n)
+	}
+	if err := checkFirstPage(d, lin); err != nil {
+		return nil, err
+	}
+	if err := checkHintStream(b, lin); err != nil {
+		return nil, err
+	}
+	if err := checkMainXref(b, lin); err != nil {
+		return nil, err
+	}
+	// Table F.1: /E is "the offset of the end of the first page". Nothing here
+	// knows which objects the first page owns — that is the hint tables' job —
+	// so what is checked is the one thing that is checkable without them: an
+	// offset past the end of the file sends a reader nowhere.
+	if lin.FirstPageEnd <= 0 || lin.FirstPageEnd > len(b) {
+		return nil, fmt.Errorf("%w: /E is %d and the file is %d bytes",
+			ErrLinearizationStale, lin.FirstPageEnd, len(b))
+	}
+	return lin, nil
+}
+
+// checkFirstPage checks /O against the document's real first page.
+//
+// ⛔ PageRef IS 1-BASED HERE. Asking for page 0 returns nothing and would make
+// every file look stale, which is the kind of off-by-one a checker reports as
+// the subject's defect rather than its own.
+func checkFirstPage(d *Document, lin *Linearization) error {
+	ref, ok := d.PageRef(1)
+	if !ok {
+		return fmt.Errorf("%w: /O names object %d and the document has no first page",
+			ErrLinearizationStale, lin.FirstPageObject)
+	}
+	if ref.Num != lin.FirstPageObject {
+		return fmt.Errorf("%w: /O says object %d and the first page is object %d",
+			ErrLinearizationStale, lin.FirstPageObject, ref.Num)
+	}
+	// And it is a page. A /O that happens to equal the right number while the
+	// object is something else is a file whose page tree was rebuilt under it.
+	obj, err := d.Get(Ref{Num: lin.FirstPageObject})
+	if err != nil {
+		return fmt.Errorf("%w: /O names object %d, which does not read: %v",
+			ErrLinearizationStale, lin.FirstPageObject, err)
+	}
+	dict, ok := obj.(Dict)
+	if !ok {
+		return fmt.Errorf("%w: /O names object %d, which is %T and not a page",
+			ErrLinearizationStale, lin.FirstPageObject, obj)
+	}
+	if t, _ := dict["Type"].(Name); t != "Page" {
+		return fmt.Errorf("%w: /O names object %d, whose /Type is %q and not /Page",
+			ErrLinearizationStale, lin.FirstPageObject, string(t))
+	}
+	return nil
+}
+
+// checkHintStream checks the first pair of /H.
+//
+// Table F.1 is explicit that the offset is "the beginning of the stream
+// object, not the beginning of the stream data", so what must be at it is an
+// indirect object, and that object must be a stream — the hint tables live in
+// its data.
+func checkHintStream(b []byte, lin *Linearization) error {
+	if lin.HintOffset <= 0 || lin.HintOffset >= len(b) {
+		return fmt.Errorf("%w: /H starts at %d and the file is %d bytes",
+			ErrLinearizationStale, lin.HintOffset, len(b))
+	}
+	if lin.HintLength <= 0 || lin.HintOffset+lin.HintLength > len(b) {
+		return fmt.Errorf("%w: /H is %d bytes from %d and the file is %d",
+			ErrLinearizationStale, lin.HintLength, lin.HintOffset, len(b))
+	}
+	// ⛔ No resolver, deliberately: a hint stream whose /Length is an indirect
+	// reference cannot be read by a reader that has only fetched the front of
+	// the file, which is the reader this format exists for.
+	_, obj, _, err := ParseIndirectObject(b[lin.HintOffset:], nil)
+	if err != nil {
+		return fmt.Errorf("%w: /H points at byte %d, where no indirect object parses: %v",
+			ErrLinearizationStale, lin.HintOffset, err)
+	}
+	if _, ok := obj.(*Stream); !ok {
+		return fmt.Errorf("%w: /H points at byte %d, where the object is %T and not a stream",
+			ErrLinearizationStale, lin.HintOffset, obj)
+	}
+	return nil
+}
+
+// checkMainXref checks /T.
+//
+// ⛔ TABLE F.1 GIVES IT TWO MEANINGS AND BOTH ARE REAL. For a file with a
+// traditional cross-reference table it is "the offset of the white-space
+// character preceding the first entry of the main cross-reference table (the
+// entry for object number 0)"; for a file using cross-reference streams it is
+// "the offset of the main cross-reference stream object". Accepting only one
+// would call every file of the other kind stale, so both are tried and the
+// failure names both.
+func checkMainXref(b []byte, lin *Linearization) error {
+	if lin.MainXrefOffset <= 0 || lin.MainXrefOffset >= len(b) {
+		return fmt.Errorf("%w: /T is %d and the file is %d bytes",
+			ErrLinearizationStale, lin.MainXrefOffset, len(b))
+	}
+	rest := b[lin.MainXrefOffset:]
+	if freeEntryFollows(rest) {
+		return nil
+	}
+	if _, obj, _, err := ParseIndirectObject(rest, nil); err == nil {
+		if s, ok := obj.(*Stream); ok {
+			if t, _ := s.Dict["Type"].(Name); t == "XRef" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%w: /T is %d, where there is neither the free entry of a "+
+		"cross-reference table nor a cross-reference stream", ErrLinearizationStale,
+		lin.MainXrefOffset)
+}
+
+// freeEntryFollows says whether the bytes begin with the whitespace and then
+// the object-zero entry of a traditional cross-reference table: ten digits, a
+// space, 65535, a space and `f`.
+func freeEntryFollows(b []byte) bool {
+	i := 0
+	for i < len(b) && isSpace(b[i]) {
+		i++
+	}
+	if i+18 > len(b) {
+		return false
+	}
+	for j := i; j < i+10; j++ {
+		if b[j] < '0' || b[j] > '9' {
+			return false
+		}
+	}
+	return string(b[i+10:i+18]) == " 65535 f"
+}
+
 // firstBodyDict parses the first indirect object of the body and returns its
 // dictionary with the offset one past its end.
 //
