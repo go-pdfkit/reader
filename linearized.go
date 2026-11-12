@@ -224,10 +224,6 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 		return nil, fmt.Errorf("%w: the file carries linearization parameters and does not open: %v",
 			ErrLinearizationStale, err)
 	}
-	if n := d.PageCount(); n != lin.PageCount {
-		return nil, fmt.Errorf("%w: /N says %d page(s) and the document has %d",
-			ErrLinearizationStale, lin.PageCount, n)
-	}
 	if err := checkFirstPage(d, lin); err != nil {
 		return nil, err
 	}
@@ -248,36 +244,41 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	return lin, nil
 }
 
-// checkFirstPage checks /O against the document's real first page.
+// checkFirstPage checks /N and /O against the document's own page tree.
 //
-// ⛔ PageRef IS 1-BASED HERE. Asking for page 0 returns nothing and would make
-// every file look stale, which is the kind of off-by-one a checker reports as
-// the subject's defect rather than its own.
+// ⛔⛔ THERE IS NO "AND IS IT REALLY A PAGE?" CHECK, AND ITS ABSENCE IS THE
+// POINT. A first version asked d.Get for the object /O names and refused it
+// unless its /Type was /Page. But [Document.PageRef] is what the document
+// layer calls the first page, and it does not require /Type: walkPages treats
+// any resolvable dictionary with no /Kids as a leaf. A stricter definition
+// here would make this checker disagree with the reader that will actually
+// open the file — a judge and a subject that do not count alike — and would
+// report the reader's notion of the page tree as the file's defect. What /O
+// has to equal is what a reader will treat as page one.
+//
+// The coverage gate said so first: those branches could not be reached from
+// any file, which is what dead code dressed as thoroughness looks like.
 func checkFirstPage(d *Document, lin *Linearization) error {
-	ref, ok := d.PageRef(1)
-	if !ok {
-		return fmt.Errorf("%w: /O names object %d and the document has no first page",
-			ErrLinearizationStale, lin.FirstPageObject)
+	// ⛔ BEFORE THE COMPARISON, or a /N of 0 is reported as a disagreement
+	// with whatever the document really holds, which sends the reader looking
+	// for a page tree that is not the problem. Table F.1 calls /N "the number
+	// of pages in the document"; a linearized document with none is not a
+	// document this format describes.
+	if lin.PageCount < 1 {
+		return fmt.Errorf("%w: /N says %d page(s), and a linearized document has at least one",
+			ErrLinearizationStale, lin.PageCount)
 	}
+	if n := d.PageCount(); n != lin.PageCount {
+		return fmt.Errorf("%w: /N says %d page(s) and the document has %d",
+			ErrLinearizationStale, lin.PageCount, n)
+	}
+	// PageRef counts from one, and the page count has just been established
+	// as lin.PageCount, which is at least one — so this cannot fail, and a
+	// branch for it would be one no file could reach.
+	ref, _ := d.PageRef(1)
 	if ref.Num != lin.FirstPageObject {
 		return fmt.Errorf("%w: /O says object %d and the first page is object %d",
 			ErrLinearizationStale, lin.FirstPageObject, ref.Num)
-	}
-	// And it is a page. A /O that happens to equal the right number while the
-	// object is something else is a file whose page tree was rebuilt under it.
-	obj, err := d.Get(Ref{Num: lin.FirstPageObject})
-	if err != nil {
-		return fmt.Errorf("%w: /O names object %d, which does not read: %v",
-			ErrLinearizationStale, lin.FirstPageObject, err)
-	}
-	dict, ok := obj.(Dict)
-	if !ok {
-		return fmt.Errorf("%w: /O names object %d, which is %T and not a page",
-			ErrLinearizationStale, lin.FirstPageObject, obj)
-	}
-	if t, _ := dict["Type"].(Name); t != "Page" {
-		return fmt.Errorf("%w: /O names object %d, whose /Type is %q and not /Page",
-			ErrLinearizationStale, lin.FirstPageObject, string(t))
 	}
 	return nil
 }

@@ -6,6 +6,7 @@
 package reader
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -83,9 +84,19 @@ func TestAParameterTheDocumentContradictsIsCaughtOnlyByTheDeepCheck(t *testing.T
 		name, from, to, says string
 	}{
 		{"a page count the document contradicts", "/N 2", "/N 3", "/N says 3 page(s)"},
+		{"a document with no pages at all", "/N 2", "/N 0", "a linearized document has at least one"},
 		{"a first page that is not the first page", "/O 7", "/O 6", "/O says object 6"},
 		{"a hint stream that starts one byte late", "/H [ 550 127 ]", "/H [ 551 127 ]", "/H points at byte 551"},
+		{"a hint stream at no offset at all", "/H [ 550 127 ]", "/H [ 000 127 ]", "/H starts at 0"},
+		{"a hint stream running off the end", "/H [ 550 127 ]", "/H [ 550 999 ]", "/H is 999 bytes from 550"},
+		{"a hint offset pointing at something that is not a stream",
+			"/H [ 550 127 ]", "/H [ 501 127 ]", "not a stream"},
+		{"a first page that ends nowhere", "/E 902", "/E 000", "/E is 0"},
 		{"a main cross-reference that is not there", "/T 1169", "/T 1160", "/T is 1160"},
+		{"a main cross-reference at no offset at all", "/T 1169", "/T 0000", "/T is 0"},
+		// ⛔ One byte from the end: the free-entry test has to notice that the
+		// buffer is shorter than an entry rather than read past it.
+		{"a main cross-reference one byte from the end", "/T 1169", "/T 1366", "/T is 1366"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			b := editedFixture(t, c.from, c.to)
@@ -132,6 +143,66 @@ func editedFixture(t *testing.T, from, to string) []byte {
 			"it is named for", from, strings.Count(s, from))
 	}
 	return []byte(strings.Replace(s, from, to, 1))
+}
+
+// ⛔⛔ TABLE F.1 GIVES /T TWO MEANINGS AND THE FIRST FIXTURE ONLY HAS ONE OF
+// THEM. testdata/linearized.pdf uses a traditional cross-reference table, so
+// every test above exercises the free-entry arm and the cross-reference STREAM
+// arm had never run — the coverage gate is what said so, and until it did, the
+// claim that both shapes are handled was a comment and nothing more.
+//
+// testdata/linearized-objstm.pdf is the same document through
+// `qpdf --linearize --object-streams=generate`: still an independent
+// implementation's output, and its /T is the offset of an /XRef stream object.
+func TestCheckLinearizedAcceptsACrossReferenceStreamFile(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-objstm.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lin, err := CheckLinearized(b)
+	if err != nil {
+		t.Fatalf("a file whose /T names a cross-reference stream was refused: %v", err)
+	}
+	if lin.PageCount != 2 {
+		t.Errorf("/N %d, want 2", lin.PageCount)
+	}
+}
+
+// ⛔ A FRONT THAT STILL SAYS "LINEARIZED" OVER A BODY THAT IS GONE. The first
+// 1024 bytes are untouched and /L still equals the file length, so the cheap
+// check passes; everything after the parameter dictionary is blanked, so there
+// is no cross-reference table to open the document with.
+//
+// This is what a truncated download padded back to length looks like, and it
+// is the one case where the deep check's answer is about the DOCUMENT rather
+// than about a parameter.
+func TestAFrontThatSaysLinearizedOverABodyThatIsGone(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := bytes.Index(b, []byte("endobj"))
+	if end < 0 {
+		t.Fatal("the fixture has no first object to keep")
+	}
+	end += len("endobj")
+	gutted := make([]byte, 0, len(b))
+	gutted = append(gutted, b[:end]...)
+	gutted = append(gutted, bytes.Repeat([]byte(" "), len(b)-end)...)
+	if len(gutted) != len(b) {
+		t.Fatalf("the blanking changed the length, so /L would be the refusal: %d vs %d",
+			len(gutted), len(b))
+	}
+	if _, err := Linearized(gutted); err != nil {
+		t.Fatalf("the cheap check refused it, so this proves nothing about the deep one: %v", err)
+	}
+	_, err = CheckLinearized(gutted)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want it to wrap ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "does not open") {
+		t.Errorf("it does not say the document would not open: %v", err)
+	}
 }
 
 // And the fixture itself passes the deep check, so the refusals above are
