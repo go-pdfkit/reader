@@ -152,7 +152,7 @@ every parameter **points at what it claims to** — `/N` is the real page count,
 object, `/T` reaches the main cross-reference (either shape: Table F.1 gives
 it two meanings and both are real), `/E` is inside the file.
 
-The four cases that gate it are files `Linearized` **accepts** and
+What gates it are files `Linearized` **accepts** and
 `CheckLinearized` refuses: the committed qpdf fixture with one integer
 replaced by one of **the same width**, so `/L` still matches and nothing at
 the front of the file is wrong — what is wrong is that it describes a
@@ -167,6 +167,25 @@ and refuses a wrong value. This only bounds `/E` between 1 and the file
 length, so a writer that miscomputes it passes here and fails qpdf. Computing
 it needs the first-page object set, which is the same partition the hint
 tables describe, so it waits for that work rather than being approximated now.
+
+⛔⛔ **A value this build cannot address is refused, not truncated**, and the
+same bytes therefore get the same answer on a 32-bit build as on a 64-bit one.
+`int(Integer)` discards the high half where `int` is 32 bits, so a `/H` length
+of 2³²+127 reads as **127** — not a wild value some bound would catch, but the
+committed fixture's own hint length, which every later check then accepts. A
+file would be judged sound on one machine and refused on another, with nothing
+to say which had happened. Every integer the dictionary offers now goes through
+one conversion that refuses what it cannot represent, `/P` included: it is
+never used as an offset, but it is a public field, and a caller handed `0` for
+2³² has no way to know. The refusal is `ErrLinearizationMalformed`.
+
+This was found twice over, which is worth saying because the two findings were
+not the same size. CI's 386 and arm lanes went red first, on values that become
+`-1` and happen to land where a bound objects — the small half. Review named
+the hazard that has no symptom: the truncation that lands on a *plausible*
+value. On a 64-bit build the refusal is unreachable from any file, so the limit
+is a variable the tests shrink; otherwise the branch is exercised only by CI,
+which is to say only after pushing.
 
 ⛔ **The `/H` length is compared with the object exactly**, not within a
 window. A first version allowed the declared length to exceed the parsed
