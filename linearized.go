@@ -163,7 +163,15 @@ func Linearized(b []byte) (*Linearization, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: /P is %T, want an integer", ErrLinearizationMalformed, v)
 		}
-		lin.FirstPageNumber = int(n)
+		// ⛔ /P is never used as an offset, which is exactly why it was the one
+		// entry left converting directly — and not a reason to leave it. It is
+		// a public field, so a 32-bit build would hand a caller 0 for 2^32 from
+		// the same bytes a 64-bit build reads correctly.
+		got, err := addressable(int64(n), "P")
+		if err != nil {
+			return nil, err
+		}
+		lin.FirstPageNumber = got
 	}
 	if err := readHintArray(dict, lin); err != nil {
 		return nil, err

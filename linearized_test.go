@@ -502,6 +502,101 @@ func TestAHintLengthThatWrapsOnA32BitBuildIsRefused(t *testing.T) {
 	}
 }
 
+// ⛔⛔ THE OVERFLOW PAIR'S LENGTH BOUND WAS HELD BY NOTHING, which review
+// measured rather than read: rewriting it in the addition form `off+len >
+// len(b)` left the whole suite GREEN, because `spans` refuses the file one
+// step later for a different reason. A bound subsumed by a later check is a
+// bound no test is holding — the same vacuity the primary pair had in round 2,
+// surviving in the half nobody had copied the fix into.
+func TestAnOverflowHintLengthNearTheIntegerLimitIsRefusedByItsOwnBound(t *testing.T) {
+	// The smallest length that makes `550 + len` overflow int64, so the
+	// addition form walks straight past the bound instead of refusing.
+	const huge = "9223372036854775807"
+	b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 127 550 " + huge + " ]"})
+
+	cheap := func() error { _, e := Linearized(b); return e }()
+	if strconv.IntSize == 32 {
+		// As for the primary pair: the conversion refuses before any bound is
+		// consulted, and that is the correct answer on this build.
+		if !errors.Is(cheap, ErrLinearizationMalformed) {
+			t.Fatalf("a value this build cannot address was read anyway: %v", cheap)
+		}
+		return
+	}
+	if cheap != nil {
+		t.Fatalf("the cheap check refused it: %v", cheap)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want it to wrap ErrLinearizationStale", err)
+	}
+	// ⛔ THE MESSAGE IS THE ASSERTION, not merely that something was refused.
+	// Under the addition form this file is still refused — by spans, naming a
+	// different reason — so a test asserting only "an error" passes either way,
+	// which is exactly how that mutation survived.
+	want := "the overflow /H is " + huge + " bytes from 550"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("it was refused, but not by the length bound this test is about: %v", err)
+	}
+}
+
+// ⛔⛔ addressable WAS REACHED ONLY THROUGH /H, so every other entry's refusal
+// was untested: review measured `int(int32(n))` in directInteger — /L, /O, /E,
+// /N and /T — leaving the suite green. /H is where a hostile value is most
+// likely to arrive, which is why it was written first; it is not where a
+// truncation is least harmful.
+func TestAnEntryThatWrapsOnA32BitBuildIsRefusedForEveryKeyNotOnlyH(t *testing.T) {
+	old := intMax
+	t.Cleanup(func() { intMax = old })
+	intMax = 1<<31 - 1
+
+	b := editedFixturePadded(t, [2]string{"/E 902", "/E 4294967296"})
+	_, err := Linearized(b)
+	if !errors.Is(err, ErrLinearizationMalformed) {
+		t.Fatalf("2^32 was read as /E on a 32-bit build: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/E is 4294967296") {
+		t.Errorf("it does not name the entry it refused: %v", err)
+	}
+}
+
+// ⛔ THE LOWER HALF OF THE SAME REFUSAL, which no file had ever reached. A
+// negative past -intMax-1 truncates exactly as a positive past intMax does,
+// and `v < -intMax-1` was written from symmetry rather than from a test.
+func TestAValueBelowTheSmallestIntThisBuildHasIsRefused(t *testing.T) {
+	old := intMax
+	t.Cleanup(func() { intMax = old })
+	intMax = 1<<31 - 1
+
+	b := editedFixturePadded(t, [2]string{"/E 902", "/E -4294967296"})
+	_, err := Linearized(b)
+	if !errors.Is(err, ErrLinearizationMalformed) {
+		t.Fatalf("-2^32 was read as /E on a 32-bit build: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot address") {
+		t.Errorf("it does not say why: %v", err)
+	}
+}
+
+// ⛔ /P IS NEVER USED AS AN OFFSET, WHICH IS WHY IT WAS MISSED AND NOT A
+// REASON TO LEAVE IT. It is a public field: a 32-bit build would hand a caller
+// 0 for 2^32 from the same bytes a 64-bit build reads correctly, and the
+// caller has no way to know which it got.
+func TestAFirstPageNumberThatWrapsOnA32BitBuildIsRefused(t *testing.T) {
+	old := intMax
+	t.Cleanup(func() { intMax = old })
+	intMax = 1<<31 - 1
+
+	b := editedFixturePadded(t, [2]string{"/E 902", "/E 902 /P 4294967296"})
+	_, err := Linearized(b)
+	if !errors.Is(err, ErrLinearizationMalformed) {
+		t.Fatalf("2^32 was read as /P on a 32-bit build: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/P is 4294967296") {
+		t.Errorf("it does not name the entry it refused: %v", err)
+	}
+}
+
 // /E past the end of the file, which needed more digits than the fixture's
 // own value has.
 func TestAFirstPageEndingPastTheFileIsRefused(t *testing.T) {
