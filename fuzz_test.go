@@ -1,6 +1,7 @@
 package reader_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -194,12 +195,21 @@ func FuzzCheckLinearized(f *testing.F) {
 	// overflows to a negative number on a 32-bit build and admits the file;
 	// this seed is the regression for that, and it is the shape a hostile file
 	// takes rather than one a generator would invent.
+	//
+	// ⛔⛔ THE SEED'S /L MUST BE THE SEED'S OWN LENGTH, which review found it
+	// was not: every one of them said `/L 1` for a file hundreds of bytes
+	// long, so [reader.Linearized] refused them on the length and the deep
+	// checks — the ones these seeds were written for — never ran at all. The
+	// placeholder is TEN DIGITS so that filling it in cannot change the
+	// length it is measuring.
 	for _, s := range []string{
-		"<< /Linearized 1 /L 1 /H [ 2147483647 2147483647 ] /O 1 /E 1 /N 1 /T 1 >>",
-		"<< /Linearized 1 /L 1 /H [ -1 -1 ] /O -1 /E -1 /N -1 /T -1 >>",
-		"<< /Linearized 1 /L 1 /H [ 0 0 ] /O 0 /E 0 /N 0 /T 0 >>",
+		"<< /Linearized 1 /L %010d /H [ 2147483647 2147483647 ] /O 1 /E 1 /N 1 /T 1 >>",
+		"<< /Linearized 1 /L %010d /H [ -1 -1 ] /O -1 /E -1 /N -1 /T -1 >>",
+		"<< /Linearized 1 /L %010d /H [ 0 0 ] /O 0 /E 0 /N 0 /T 0 >>",
+		"<< /Linearized 1 /L %010d /H [ 40 20 ] /O 1 /E 60 /N 1 /T 50 >>",
 	} {
-		f.Add([]byte("%PDF-1.7\n1 0 obj\n" + s + "\nendobj\n"))
+		body := "%PDF-1.7\n1 0 obj\n" + s + "\nendobj\n"
+		f.Add([]byte(fmt.Sprintf(body, len(fmt.Sprintf(body, 0)))))
 	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		budget(t, 2*time.Second, len(b), "CheckLinearized", func() {
@@ -207,16 +217,19 @@ func FuzzCheckLinearized(f *testing.F) {
 			if err != nil {
 				return
 			}
-			// ⛔ THE INVARIANT, not merely "it did not panic". The deep check
-			// is strictly stronger than the cheap one, so anything it accepts
-			// the cheap one must accept too. A disagreement would mean one of
-			// them reads the front of a file differently from the other, which
-			// is how a reader and a writer come to disagree about the same
-			// bytes.
-			if _, err := reader.Linearized(b); err != nil {
-				t.Fatalf("CheckLinearized accepted a file Linearized refuses: %v", err)
-			}
-			// And every offset it accepted is inside the file it accepted.
+			// ⛔ A TAUTOLOGY WAS REMOVED FROM HERE. It asserted that anything
+			// CheckLinearized accepts, Linearized accepts too — which cannot
+			// fail, because CheckLinearized calls Linearized first and returns
+			// its error. Review named it; an invariant that cannot fail is a
+			// line that looks like a gate and is not one.
+			//
+			// ⛔ WHAT FOLLOWS IS NOT A RESTATEMENT OF THE CHECKS. The checks
+			// bound each value as they read it; this re-derives the same
+			// property at the API boundary, from len(b) alone, AFTER the
+			// function has committed to an answer. That difference is what
+			// catches an arithmetic fault rather than a missing branch: with
+			// the old `HintOffset+HintLength > len(b)` form, a length near
+			// MaxInt passes the check and fails here.
 			if lin.HintOffset < 0 || lin.HintOffset > len(b) ||
 				lin.HintLength < 0 || lin.HintLength > len(b)-lin.HintOffset {
 				t.Fatalf("/H [%d %d] accepted for a file of %d bytes",

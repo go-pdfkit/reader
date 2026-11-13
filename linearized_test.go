@@ -83,6 +83,10 @@ func TestAParameterTheDocumentContradictsIsCaughtOnlyByTheDeepCheck(t *testing.T
 	for _, c := range []struct {
 		name, from, to, says string
 	}{
+		{"a hint length shorter than the object it describes", "/H [ 550 127 ]", "/H [ 550 125 ]",
+			"/H says the hint stream is 125 bytes"},
+		{"a hint length of nothing at all", "/H [ 550 127 ]", "/H [ 550 000 ]", "/H is 0 bytes"},
+		{"a main cross-reference at the very end", "/T 1169", "/T 1367", "/T is 1367"},
 		{"a page count the document contradicts", "/N 2", "/N 3", "/N says 3 page(s)"},
 		{"a document with no pages at all", "/N 2", "/N 0", "a linearized document has at least one"},
 		{"a first page that is not the first page", "/O 7", "/O 6", "/O says object 6"},
@@ -205,6 +209,197 @@ func TestAFrontThatSaysLinearizedOverABodyThatIsGone(t *testing.T) {
 	}
 }
 
+// editedFixturePadded applies several edits whose lengths need NOT match, and
+// pays the difference out of the run of spaces qpdf leaves between the
+// linearization dictionary and the first-page cross-reference section.
+//
+// ⛔ THE PADDING IS WHERE IT IS FOR A REASON. Everything from `xref` onwards
+// keeps its byte offset, so the file still opens and `/L` still equals the
+// length — which is what lets these cases reach the deep check at all. A
+// naive edit that grew the file would move every object and be refused for
+// its cross-reference table instead, measuring the wrong thing.
+func editedFixturePadded(t *testing.T, edits ...[2]string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, e := range edits {
+		if strings.Count(s, e[0]) != 1 {
+			t.Fatalf("%q appears %d times, so this edit is not the one it is named for",
+				e[0], strings.Count(s, e[0]))
+		}
+		s = strings.Replace(s, e[0], e[1], 1)
+	}
+	grew := len(s) - len(b)
+	i := strings.Index(s, "endobj")
+	if i < 0 {
+		t.Fatal("the fixture has no first object")
+	}
+	j := i + len("endobj")
+	for j < len(s) && (s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+	k := j
+	for k < len(s) && s[k] == ' ' {
+		k++
+	}
+	switch {
+	case grew > 0:
+		if k-j < grew {
+			t.Fatalf("the edits need %d bytes of padding and the fixture has %d", grew, k-j)
+		}
+		s = s[:j] + s[j+grew:]
+	case grew < 0:
+		s = s[:j] + strings.Repeat(" ", -grew) + s[j:]
+	}
+	if len(s) != len(b) {
+		t.Fatalf("compensation failed: %d vs %d", len(s), len(b))
+	}
+	return []byte(s)
+}
+
+// ⛔⛔ THE VERSION IS CHECKED, AND IT WAS NOT — a disagreement with qpdf that
+// review measured and that would have shipped. A file whose first object says
+// `/Linearized 9` was accepted here while `qpdf --check` reported "File is
+// not linearized".
+//
+// ⛔ The refusal belongs in the CHEAP check, not the deep one: /Linearized is
+// the entry that says which format the rest of the dictionary is written in,
+// so a version this code has never seen makes every other entry a guess —
+// and a reader deciding whether to stream the file consults exactly this.
+// That makes it MALFORMED rather than stale.
+func TestAVersionThisDoesNotReadIsRefusedByBothChecks(t *testing.T) {
+	b := editedFixture(t, "/Linearized 1", "/Linearized 9")
+	for _, c := range []struct {
+		name string
+		fn   func([]byte) (*Linearization, error)
+	}{{"Linearized", Linearized}, {"CheckLinearized", CheckLinearized}} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := c.fn(b)
+			if !errors.Is(err, ErrLinearizationMalformed) {
+				t.Fatalf("error is %v, want ErrLinearizationMalformed", err)
+			}
+			if !strings.Contains(err.Error(), "the only version this reads is 1") {
+				t.Errorf("it does not say what is wrong: %v", err)
+			}
+		})
+	}
+}
+
+// And the spelling the specification's own example uses is still accepted.
+func TestTheRealSpellingOfTheVersionIsAccepted(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/Linearized 1 ", "/Linearized 1.0 "})
+	if _, err := CheckLinearized(b); err != nil {
+		t.Fatalf("/Linearized 1.0 was refused: %v", err)
+	}
+}
+
+// ⛔⛔ /O NAMING SOMETHING THAT IS NOT A DICTIONARY, which review found
+// accepted. The page tree's first kid is pointed at object 6 — the HINT
+// STREAM — and /O follows it. `walkPages` treats any resolvable object with
+// no /Kids as a leaf, so the document layer calls that stream "page 1"; qpdf
+// reports a page tree containing a non-dictionary object.
+//
+// This is not the deleted /Type check returning. Requiring /Type /Page would
+// impose a stricter notion of a page than the reader; requiring a DICTIONARY
+// imposes nothing, because 7.7.3.3 says a page object is one.
+func TestAFirstPageThatIsNotADictionaryIsRefused(t *testing.T) {
+	b := editedFixturePadded(t,
+		[2]string{"/Kids [ 7 0 R", "/Kids [ 6 0 R"},
+		[2]string{"/O 7", "/O 6"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this proves nothing: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "a page object is a dictionary") {
+		t.Errorf("it does not say what is wrong: %v", err)
+	}
+}
+
+// ⛔ THE OVERFLOW PAIR OF /H WAS READ AND NEVER EXAMINED. Table F.1 makes the
+// second pair optional; a file carrying one that points at nothing was
+// accepted, while qpdf reported that the overflow hint table is not a stream.
+func TestAnOverflowHintThatPointsAtNothingIsRefused(t *testing.T) {
+	for _, c := range []struct{ name, to, says string }{
+		{"at an offset that is not a stream", "/H [ 550 127 9 9 ]", "and not a stream"},
+		{"past the end of the file", "/H [ 550 127 1360 99 ]", "and the file is 1367"},
+		{"at no offset at all", "/H [ 550 127 0 9 ]", "the overflow /H starts at 0"},
+		{"in the middle of another object", "/H [ 550 127 690 50 ]", "no indirect object parses"},
+		{"with a length the object contradicts", "/H [ 550 127 550 099 ]",
+			"the overflow /H says 99 bytes"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", c.to})
+			if _, err := Linearized(b); err != nil {
+				t.Fatalf("the cheap check refused it: %v", err)
+			}
+			_, err := CheckLinearized(b)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("error is %v, want ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), c.says) {
+				t.Errorf("it does not name the claim that failed: %v", err)
+			}
+		})
+	}
+}
+
+// And a well-formed overflow pair is ACCEPTED, so the refusals above are
+// about the edits rather than about this refusing the entry outright. It
+// names the primary hint stream twice, which is not a sensible document but
+// is a valid pair: a real stream, at a real offset, of the length it claims.
+func TestAWellFormedOverflowHintIsAccepted(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 127 550 127 ]"})
+	lin, err := CheckLinearized(b)
+	if err != nil {
+		t.Fatalf("a valid overflow pair was refused: %v", err)
+	}
+	if !lin.HasOverflowHint || lin.OverflowHintOffset != 550 {
+		t.Errorf("the overflow pair was not read back: %+v", lin)
+	}
+}
+
+// ⛔⛔ THE 32-BIT OVERFLOW, WITH A VALUE THAT OVERFLOWS 64 BITS TOO. The bound
+// was written `HintOffset+HintLength > len(b)` and is now a subtraction;
+// review measured that the whole suite stayed green with the addition form
+// restored, because no test carried a length anywhere near the limit. This is
+// that test, and it fails on every word size with the addition form.
+func TestAHintLengthNearTheIntegerLimitIsRefused(t *testing.T) {
+	for _, huge := range []string{"9223372036854775807", "4294967295"} {
+		t.Run(huge, func(t *testing.T) {
+			b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 " + huge + " ]"})
+			if _, err := Linearized(b); err != nil {
+				t.Fatalf("the cheap check refused it: %v", err)
+			}
+			_, err := CheckLinearized(b)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("a hint length of %s was accepted: %v", huge, err)
+			}
+		})
+	}
+}
+
+// /E past the end of the file, which needed more digits than the fixture's
+// own value has.
+func TestAFirstPageEndingPastTheFileIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/E 902", "/E 99999"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "/E is 99999") {
+		t.Errorf("it does not name the claim: %v", err)
+	}
+}
+
 // And the fixture itself passes the deep check, so the refusals above are
 // about the edits and not about the checker disliking qpdf's output.
 func TestCheckLinearizedAcceptsTheCommittedFixture(t *testing.T) {
@@ -234,23 +429,44 @@ func TestAnOrdinaryFileIsRefusedByBothChecks(t *testing.T) {
 	}
 }
 
-// qpdf's output passes the deep check at several page counts, not only at the
-// one the committed fixture happens to have.
-func TestCheckLinearizedAgreesWithQpdfAcrossPageCounts(t *testing.T) {
-	for _, pages := range []int{1, 2, 5} {
-		t.Run(strconv.Itoa(pages)+" pages", func(t *testing.T) {
-			plain, linear := linearizedFixture(t, pages)
-			if _, err := CheckLinearized(plain); !errors.Is(err, ErrNotLinearized) {
-				t.Errorf("the plain file was not refused: %v", err)
-			}
-			lin, err := CheckLinearized(linear)
-			if err != nil {
-				t.Fatalf("qpdf linearized it and this refused it: %v", err)
-			}
-			if lin.PageCount != pages {
-				t.Errorf("/N %d, want %d", lin.PageCount, pages)
-			}
-		})
+// qpdfExtra lets a test ask qpdf for a different kind of linearized file; it
+// is reset by each subtest that sets it.
+var qpdfExtra []string
+
+// ⛔⛔ THE DIRECTION THAT MATTERS MOST: this must not REFUSE what qpdf
+// accepts, and the checks added after review — a hint length compared with
+// the real object, a version, a first page that must be a dictionary — each
+// risked exactly that. So qpdf's output is judged across page counts AND
+// across the ways it writes a file.
+//
+// `--compress-streams=n` is here because the hint length is now compared with
+// the parsed extent of the stream, which an uncompressed stream changes.
+func TestCheckLinearizedAgreesWithQpdfAcrossPageCountsAndShapes(t *testing.T) {
+	for _, shape := range []struct {
+		name  string
+		extra []string
+	}{
+		{"as qpdf writes it", nil},
+		{"with object streams", []string{"--object-streams=generate"}},
+		{"with streams uncompressed", []string{"--compress-streams=n"}},
+	} {
+		for _, pages := range []int{1, 2, 5, 25} {
+			t.Run(shape.name+", "+strconv.Itoa(pages)+" pages", func(t *testing.T) {
+				qpdfExtra = shape.extra
+				defer func() { qpdfExtra = nil }()
+				plain, linear := linearizedFixture(t, pages)
+				if _, err := CheckLinearized(plain); !errors.Is(err, ErrNotLinearized) {
+					t.Errorf("the plain file was not refused: %v", err)
+				}
+				lin, err := CheckLinearized(linear)
+				if err != nil {
+					t.Fatalf("qpdf linearized it and this refused it: %v", err)
+				}
+				if lin.PageCount != pages {
+					t.Errorf("/N %d, want %d", lin.PageCount, pages)
+				}
+			})
+		}
 	}
 }
 
@@ -276,7 +492,7 @@ func linearizedFixture(t *testing.T, pages int) (plain, linear []byte) {
 	if err := os.WriteFile(in, plain, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(qpdf, "--linearize", in, out)
+	cmd := exec.Command(qpdf, append([]string{"--linearize"}, append(qpdfExtra, in, out)...)...)
 	cmd.Stdin = nil
 	if b, err := cmd.CombinedOutput(); err != nil {
 		// qpdf exits 3 for warnings and still writes the file.
