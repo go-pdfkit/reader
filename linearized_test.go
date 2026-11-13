@@ -8,6 +8,7 @@ package reader
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -725,6 +726,72 @@ func TestAFirstPageSectionThatCannotAnswerIsRefused(t *testing.T) {
 				t.Errorf("it was refused, but not for the reason this case is about: %v", err)
 			}
 		})
+	}
+}
+
+// ⛔⛔ AN ENTRY AT EXACTLY len(b), which is the boundary the length guard is
+// about and the only input that tells `>=` from `>`. Past the end the parse
+// would fail anyway and the guard would be a bound nothing is holding —
+// review measured that mutation staying green — so the case that pins it is
+// the equal one: b[len(b):] is a legal empty slice, not a panic, and without
+// the guard this is refused for the wrong reason.
+func TestAnEntryStartingExactlyAtTheEndOfTheFileIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"0000000871 00000 n", "0000001367 00000 n"})
+	if len(b) != 1367 {
+		t.Fatalf("this test hard-codes the fixture's length; it is %d", len(b))
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "puts an object at byte 1367 and the file is 1367 bytes") {
+		t.Errorf("it was refused, but not by the length guard this test is about: %v", err)
+	}
+}
+
+// ⛔⛔ AN INCREMENTAL UPDATE POINTS startxref AT ITS OWN SECTION, and a
+// previous version of this reasoned that /L had already made that impossible.
+// It had not: rewriting /L to the new length passes every earlier check, and
+// the first-page end was then compared against an object from the update —
+// refused, with a reason that was not the reason.
+//
+// The file below is exactly that: a real appended revision whose /L is
+// corrected, which qpdf still calls linearized.
+func TestAnIncrementallyUpdatedFileIsNotJudgedByTheUpdatesSection(t *testing.T) {
+	orig, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "9 0 obj\n<< /Type /Nothing >>\nendobj\n"
+	xrefAt := len(orig) + len(body)
+	tail := fmt.Sprintf("xref\n0 1\n0000000000 65535 f \ntrailer << /Root 5 0 R /Size 10 /Prev 216 >>\nstartxref\n%d\n%%%%EOF\n", xrefAt)
+	s := string(orig) + body + tail
+
+	// /L must say the new length, or the cheap check refuses it for that and
+	// this test would never reach what it is about. Same width keeps every
+	// other offset valid, so the appended revision is the only change.
+	old, want := "/L 1367", fmt.Sprintf("/L %d", len(s))
+	if len(want) != len(old) {
+		t.Fatalf("the updated file is %d bytes, which is not the same width as the fixture's /L", len(s))
+	}
+	if strings.Count(s, old) != 1 {
+		t.Fatalf("%q appears %d times in the fixture, so this edit is not the one it is named for",
+			old, strings.Count(s, old))
+	}
+	b := []byte(strings.Replace(s, old, want, 1))
+
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so /L is not what this test is about: %v", err)
+	}
+	_, err = CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	// ⛔ THE REASON IS THE ASSERTION. Without the guard this file is still
+	// refused — by the /E comparison, naming an object the update appended —
+	// so a test that only checked for an error would pass either way.
+	if !strings.Contains(err.Error(), "written to since it was linearized") {
+		t.Errorf("it was refused, but not as an updated file: %v", err)
 	}
 }
 

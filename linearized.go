@@ -303,6 +303,15 @@ func isHintObject(lin *Linearization, off int64) bool {
 // file that tool writes. Both committed qpdf fixtures place the hint stream
 // before the first page and CANNOT tell the two rules apart — which is why
 // testdata/linearized-gs.pdf is committed beside them.
+//
+// ⛔⛔ AND WHAT THIS PROVES IS THAT /E AGREES WITH THAT SECTION, NOT THAT THE
+// SECTION IS RIGHT. A writer that leaves out objects page one genuinely needs
+// produces a file that is internally consistent and passes here. Review
+// measured Ghostscript doing it on a document with shared fonts, outlines and
+// links: /H = /E = 1941, accepted here, while qpdf computes 5500..5501 and
+// reports page one as 9 objects where the hint table claims 4. Deciding what
+// page one NEEDS means walking its resources — the partition the hint tables
+// describe — and that judgement is still outstanding (#40).
 func checkFirstPageEnd(b []byte, lin *Linearization) error {
 	// ⛔ A SEPARATE Document, not the one CheckLinearized opened. Open walks
 	// /Prev and merges every section into one table, and setEntry keeps the
@@ -320,6 +329,24 @@ func checkFirstPageEnd(b []byte, lin *Linearization) error {
 	if err != nil {
 		return fmt.Errorf("%w: the first-page cross-reference section cannot be found: %v",
 			ErrLinearizationStale, err)
+	}
+	// ⛔⛔ THE SECTION startxref NAMES IS NOT ALWAYS THE FIRST-PAGE ONE, and
+	// an earlier draft of this claimed /L had already made it so. It has not:
+	// an incremental update appends its own section and points startxref at
+	// THAT, and a file whose /L was rewritten to match its new length passes
+	// every earlier check. Following it then lands on the update's entries and
+	// compares /E with an object that has nothing to do with the first page —
+	// a refusal with a reason that is not the reason, which is worse than a
+	// miss because a reader believes it.
+	//
+	// Annex F puts the first-page section at part 3 and the main one at part
+	// 10, so the front section precedes /T. checkMainXref has already
+	// established /T against the file by the time this runs, and this says
+	// nothing about /E, so it still holds when /E is the thing under test.
+	if off >= int64(lin.MainXrefOffset) {
+		return fmt.Errorf("%w: the cross-reference section at byte %d is not the first-page one — "+
+			"it is at or past the main table /T names (%d), so the file has been written to since it was linearized",
+			ErrLinearizationStale, off, lin.MainXrefOffset)
 	}
 	if _, err := front.readXrefSection(off); err != nil {
 		return fmt.Errorf("%w: the first-page cross-reference section at byte %d does not read: %v",

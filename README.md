@@ -187,6 +187,24 @@ rules apart**, which is why `testdata/linearized-gs.pdf` is committed beside
 them: removing the exclusion turns exactly that test red and leaves the qpdf
 ones green. A second producer measures what the first cannot.
 
+⛔⛔ **What this proves is that `/E` agrees with the first-page section — not
+that the section is right.** A writer that leaves objects page one genuinely
+needs out of that section produces a file that is internally consistent and
+passes here. Ghostscript does exactly this on a document with shared fonts,
+outlines and links: it writes `/H` = `/E` = 1941, this checker accepts it, and
+`qpdf --check` computes `5500..5501` and reports the first page as having 9
+objects where the hint table claims 4. Deciding which objects page one *needs*
+means walking its resources, which is the partition the hint tables describe —
+so that judgement is still outstanding, and a pass here is not evidence about
+it.
+
+⚠ **Stricter than qpdf, deliberately.** qpdf computes `/E` as a *range*
+(`901..902` on the committed fixture), accepting the end with or without the
+line ending after `endobj`. This requires the end including it, which is what
+both measured producers actually write. A file carrying the lower value would
+pass `qpdf --check` and be refused here; none has been observed, and the
+alternative is a window that cannot tell a correct `/E` from one a byte short.
+
 ⚠ The **overflow** hint stream is excluded by the same reasoning and no file
 can reach it — it needs a four-entry `/H` whose second pair is both a real
 stream and the highest-offset object, and neither producer writes one. So the
