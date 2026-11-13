@@ -134,6 +134,52 @@ types; and `/L` against the real file length.
 Not checked: the hint tables themselves (F.4) — a file can pass this and still
 send a reader to the wrong offset.
 
+⛔⛔ **`Linearized` on its own is a weaker test than it looks, and a writer
+developed against it would pass without linearizing anything.** Of Table F.1's
+claims it checks exactly one against the file — `/L` against the byte count —
+because it is deliberately cheap: a reader deciding whether to stream a file
+has fetched 1024 bytes and has no cross-reference table to resolve anything
+with. `/O`, `/E`, `/N` and `/T` are read for type and never consulted, so a
+file carrying a correct `/L` and four **invented integers** is accepted. That
+is precisely what a first linearizer emits.
+
+`CheckLinearized(b)` is the other question, for the other caller: not "may a
+reader trust the front of this file" but "is this file actually what the front
+says". It opens the document, so it costs what opening costs, and it is the
+judgement a writer needs on bytes it has just produced. It establishes that
+every parameter **points at what it claims to** — `/N` is the real page count,
+`/O` is the real first page *and* is a `/Page`, `/H` begins at a real stream
+object, `/T` reaches the main cross-reference (either shape: Table F.1 gives
+it two meanings and both are real), `/E` is inside the file.
+
+The four cases that gate it are files `Linearized` **accepts** and
+`CheckLinearized` refuses: the committed qpdf fixture with one integer
+replaced by one of **the same width**, so `/L` still matches and nothing at
+the front of the file is wrong — what is wrong is that it describes a
+different document. The replacement's width is asserted by the helper, because
+an edit one byte longer would be refused for the length instead and the deep
+check would never run.
+
+⛔⛔ **`/E` is NOT gated, and a writer must not read a pass here as evidence
+about it.** Table F.1 calls `/E` the offset of the end of the first page, and
+qpdf *computes* it — on the committed fixture it reports `computed = 901..902`
+and refuses a wrong value. This only bounds `/E` between 1 and the file
+length, so a writer that miscomputes it passes here and fails qpdf. Computing
+it needs the first-page object set, which is the same partition the hint
+tables describe, so it waits for that work rather than being approximated now.
+
+⛔ **The `/H` length is compared with the object exactly**, not within a
+window. A first version allowed the declared length to exceed the parsed
+extent by 0–2 bytes, reasoning that a writer might use CRLF; that accepts
+`/H [ 550 126 ]` and `/H [ 550 128 ]` for a 126-byte object, both of which
+qpdf refuses. The end-of-line is now **read** rather than guessed, and every
+spelling of one (LF, CR, CRLF, none) has its own test — a tolerance wide
+enough to cover every line ending is wide enough to hide a wrong length.
+
+Still not checked, by either: the hint tables (F.4). `qpdf --check` remains the
+foreign judge, and it is run across 1/2/5/25 pages × plain, object-streams and
+uncompressed-streams.
+
 The positives are **qpdf's** output, not fixtures written to agree with this
 reading of Annex F. On five real library scans linearized by qpdf and judged by
 `qpdf --check` alongside: **5 agree, 0 disagree**, including a 68-page, 13 MB

@@ -163,7 +163,15 @@ func Linearized(b []byte) (*Linearization, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: /P is %T, want an integer", ErrLinearizationMalformed, v)
 		}
-		lin.FirstPageNumber = int(n)
+		// ⛔ /P is never used as an offset, which is exactly why it was the one
+		// entry left converting directly — and not a reason to leave it. It is
+		// a public field, so a 32-bit build would hand a caller 0 for 2^32 from
+		// the same bytes a 64-bit build reads correctly.
+		got, err := addressable(int64(n), "P")
+		if err != nil {
+			return nil, err
+		}
+		lin.FirstPageNumber = got
 	}
 	if err := readHintArray(dict, lin); err != nil {
 		return nil, err
@@ -184,6 +192,310 @@ func Linearized(b []byte) (*Linearization, error) {
 			ErrLinearizationStale, lin.FileLength, len(b))
 	}
 	return lin, nil
+}
+
+// CheckLinearized reads the parameter dictionary and then checks what it says
+// against the document it describes.
+//
+// ⛔⛔ [Linearized] ON ITS OWN IS A WEAKER TEST THAN IT LOOKS, AND A WRITER
+// DEVELOPED AGAINST IT WOULD PASS WITHOUT LINEARIZING ANYTHING. Of Table F.1's
+// claims it checks exactly one against the file — /L against the byte count —
+// because it is deliberately cheap: a reader deciding whether to stream a file
+// has fetched 1024 bytes and has no cross-reference table to resolve anything
+// with. /O, /E, /N and /T are read for type and never consulted. So a file
+// carrying a correct /L and four invented integers is accepted, which is
+// precisely what a first linearizer would emit.
+//
+// This is the other question, for the other caller: not "may a reader trust
+// the front of this file" but "is this file actually what the front says".
+// It opens the document, so it costs what opening costs, and it is the
+// judgement a writer needs on bytes it has just produced.
+//
+// ⛔ It still does NOT validate the hint tables (F.4), which is a larger job
+// again. What it establishes is that every parameter POINTS AT WHAT IT CLAIMS
+// TO: the page count is the real one, /O is the real first page, /H begins at
+// a real stream object of the length it declares, /T reaches the main
+// cross-reference. A file can pass this and still send a reader to the wrong
+// offset inside a hint table — so the error says which claim failed, and a
+// caller that needs more must read F.4. qpdf's `--check` remains the foreign
+// judge the tests print by.
+//
+// ⛔⛔ AND /E IS NOT GATED, SAID OUT LOUD BECAUSE A WRITER WILL BE TEMPTED TO
+// TRUST IT. Table F.1 calls /E the offset of the end of the first page, and
+// qpdf COMPUTES it: on the committed fixture it reports "computed = 901..902"
+// and refuses a wrong value. This only bounds /E between 1 and the file
+// length, so a writer that miscomputes /E passes here and fails qpdf. Review
+// measured the gap. Computing it needs the first-page object set — the same
+// partition the hint tables describe — which is why it waits for that work
+// rather than being approximated now. Until then: do not read a pass from
+// this as evidence about /E.
+//
+// The error wraps the same sentinels [Linearized] uses: a dictionary that
+// disagrees with the document around it is [ErrLinearizationStale], which is
+// what Table F.1 says such a file is — ordinary PDF.
+func CheckLinearized(b []byte) (*Linearization, error) {
+	lin, err := Linearized(b)
+	if err != nil {
+		return nil, err
+	}
+	d, err := Open(b)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the file carries linearization parameters and does not open: %v",
+			ErrLinearizationStale, err)
+	}
+	if err := checkFirstPage(d, lin); err != nil {
+		return nil, err
+	}
+	if err := checkHintStream(b, lin); err != nil {
+		return nil, err
+	}
+	if err := checkOverflowHint(b, lin); err != nil {
+		return nil, err
+	}
+	if err := checkMainXref(b, lin); err != nil {
+		return nil, err
+	}
+	// Table F.1: /E is "the offset of the end of the first page". Nothing here
+	// knows which objects the first page owns — that is the hint tables' job —
+	// so what is checked is the one thing that is checkable without them: an
+	// offset past the end of the file sends a reader nowhere.
+	if lin.FirstPageEnd <= 0 || lin.FirstPageEnd > len(b) {
+		return nil, fmt.Errorf("%w: /E is %d and the file is %d bytes",
+			ErrLinearizationStale, lin.FirstPageEnd, len(b))
+	}
+	return lin, nil
+}
+
+// checkFirstPage checks /N and /O against the document's own page tree.
+//
+// ⛔⛔ THERE IS NO "AND IS IT REALLY A PAGE?" CHECK, AND ITS ABSENCE IS THE
+// POINT. A first version asked d.Get for the object /O names and refused it
+// unless its /Type was /Page. But [Document.PageRef] is what the document
+// layer calls the first page, and it does not require /Type: walkPages treats
+// any resolvable dictionary with no /Kids as a leaf. A stricter definition
+// here would make this checker disagree with the reader that will actually
+// open the file — a judge and a subject that do not count alike — and would
+// report the reader's notion of the page tree as the file's defect. What /O
+// has to equal is what a reader will treat as page one.
+//
+// The coverage gate said so first: those branches could not be reached from
+// any file, which is what dead code dressed as thoroughness looks like.
+func checkFirstPage(d *Document, lin *Linearization) error {
+	// ⛔ BEFORE THE COMPARISON, or a /N of 0 is reported as a disagreement
+	// with whatever the document really holds, which sends the reader looking
+	// for a page tree that is not the problem. Table F.1 calls /N "the number
+	// of pages in the document"; a linearized document with none is not a
+	// document this format describes.
+	if lin.PageCount < 1 {
+		return fmt.Errorf("%w: /N says %d page(s), and a linearized document has at least one",
+			ErrLinearizationStale, lin.PageCount)
+	}
+	if n := d.PageCount(); n != lin.PageCount {
+		return fmt.Errorf("%w: /N says %d page(s) and the document has %d",
+			ErrLinearizationStale, lin.PageCount, n)
+	}
+	// PageRef counts from one, and the page count has just been established
+	// as lin.PageCount, which is at least one — so this cannot fail, and a
+	// branch for it would be one no file could reach.
+	ref, _ := d.PageRef(1)
+	if ref.Num != lin.FirstPageObject {
+		return fmt.Errorf("%w: /O says object %d and the first page is object %d",
+			ErrLinearizationStale, lin.FirstPageObject, ref.Num)
+	}
+	// ⛔⛔ AND IT MUST BE A DICTIONARY. This is NOT the /Type check deleted
+	// above, and the difference is the whole argument. Requiring /Type /Page
+	// would impose a stricter notion of "page" than the reader that opens the
+	// file, which is a judge disagreeing with its subject. Requiring a
+	// DICTIONARY imposes nothing extra: 7.7.3.3 says a page object is a
+	// dictionary, and no stream is one.
+	//
+	// Review found this reachable and harmful: a file whose page tree names
+	// the HINT STREAM as its first kid was accepted here, because walkPages
+	// treats any resolvable object with no /Kids as a leaf. qpdf reported
+	// that the page tree includes a non-dictionary object. That leniency in
+	// the page walker is its own question; what this must not do is repeat it
+	// while claiming to have checked the file.
+	// ⛔ The error is not branched on: PageRef returned this reference because
+	// walkPages had already resolved it, so a failure here is unreachable —
+	// and an object that did not read is nil, which is not a Dict and is
+	// reported by the one check below. A separate branch would be dead code
+	// dressed as thoroughness, which the coverage gate names.
+	obj, _ := d.Get(ref)
+	if _, ok := obj.(Dict); !ok {
+		return fmt.Errorf("%w: /O names object %d, which is %T — a page object is a dictionary",
+			ErrLinearizationStale, lin.FirstPageObject, obj)
+	}
+	return nil
+}
+
+// checkHintStream checks the first pair of /H.
+//
+// Table F.1 is explicit that the offset is "the beginning of the stream
+// object, not the beginning of the stream data", so what must be at it is an
+// indirect object, and that object must be a stream — the hint tables live in
+// its data.
+func checkHintStream(b []byte, lin *Linearization) error {
+	if lin.HintOffset <= 0 || lin.HintOffset >= len(b) {
+		return fmt.Errorf("%w: /H starts at %d and the file is %d bytes",
+			ErrLinearizationStale, lin.HintOffset, len(b))
+	}
+	// ⛔⛔ SUBTRACTION, NOT ADDITION, AND THAT IS A 32-BIT DEFECT RATHER THAN A
+	// STYLE. Both values come straight out of the file, so an attacker chooses
+	// them. Written `lin.HintOffset+lin.HintLength > len(b)`, a /H length near
+	// MaxInt32 OVERFLOWS to a negative number on a 32-bit build, the comparison
+	// is false, and the check lets through exactly the file it exists to
+	// refuse. The offset is already known to be inside the file, so
+	// len(b)-lin.HintOffset is positive and the subtraction cannot wrap.
+	if lin.HintLength <= 0 || lin.HintLength > len(b)-lin.HintOffset {
+		return fmt.Errorf("%w: /H is %d bytes from %d and the file is %d",
+			ErrLinearizationStale, lin.HintLength, lin.HintOffset, len(b))
+	}
+	// ⛔ No resolver, deliberately: a hint stream whose /Length is an indirect
+	// reference cannot be read by a reader that has only fetched the front of
+	// the file, which is the reader this format exists for.
+	_, obj, n, err := ParseIndirectObject(b[lin.HintOffset:], nil)
+	if err != nil {
+		return fmt.Errorf("%w: /H points at byte %d, where no indirect object parses: %v",
+			ErrLinearizationStale, lin.HintOffset, err)
+	}
+	if _, ok := obj.(*Stream); !ok {
+		return fmt.Errorf("%w: /H points at byte %d, where the object is %T and not a stream",
+			ErrLinearizationStale, lin.HintOffset, obj)
+	}
+	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
+	// which review found it was not: the pair was bounds-checked against the
+	// file and never against the stream it describes, so `/H [ 550 100 ]` for
+	// a 127-byte object passed while qpdf reported a hint table length
+	// mismatch. Table F.1 counts the whole object, so this is the parse's own
+	// extent.
+	if !spans(b, lin.HintOffset, n, lin.HintLength) {
+		return fmt.Errorf("%w: /H says the hint stream is %d bytes and the object at %d is %d",
+			ErrLinearizationStale, lin.HintLength, lin.HintOffset, n)
+	}
+	return nil
+}
+
+// spans says whether a declared length describes the object at off, which the
+// parse measured as n bytes.
+//
+// ⛔ IT IS NOT EQUALITY WITH n, AND MEASUREMENT IS WHY. Requiring n ==
+// declared refused every file qpdf produces: the parse ends at `endobj`,
+// while Table F.1's length counts the object AND the end-of-line that
+// terminates it.
+//
+// ⛔⛔ BUT A WINDOW IS NOT GOOD ENOUGH EITHER, which review measured. A first
+// version allowed declared-n in 0..2, reasoning that a writer might use CRLF.
+// That accepts /H [ 550 126 ] and /H [ 550 128 ] for a 126-byte object, both
+// of which qpdf refuses — "first page object offset mismatch" and "hint table
+// length mismatch". A tolerance wide enough to cover every line ending is
+// wide enough to hide a wrong length, and this file's whole purpose is to be
+// no weaker than the judge it will be measured against.
+//
+// So the end-of-line is READ rather than guessed, and the length must be
+// exactly the object plus it.
+func spans(b []byte, off, n, declared int) bool {
+	return declared == n+eolAfter(b, off+n)
+}
+
+// eolAfter is the length of the line ending at i: 2 for CRLF, 1 for a lone CR
+// or LF, 0 for anything else.
+func eolAfter(b []byte, i int) int {
+	if i >= len(b) {
+		return 0
+	}
+	if b[i] == '\r' {
+		if i+1 < len(b) && b[i+1] == '\n' {
+			return 2
+		}
+		return 1
+	}
+	if b[i] == '\n' {
+		return 1
+	}
+	return 0
+}
+
+// checkOverflowHint checks the second pair of /H, which Table F.1 makes
+// optional and which review found was read and never examined: a file
+// carrying `/H [ 550 127 9 9 ]` was accepted while qpdf reported that the
+// overflow hint table is not a stream. An entry present and unchecked is
+// worse than one absent, because the file claims something nothing verified.
+func checkOverflowHint(b []byte, lin *Linearization) error {
+	if !lin.HasOverflowHint {
+		return nil
+	}
+	if lin.OverflowHintOffset <= 0 || lin.OverflowHintOffset >= len(b) {
+		return fmt.Errorf("%w: the overflow /H starts at %d and the file is %d bytes",
+			ErrLinearizationStale, lin.OverflowHintOffset, len(b))
+	}
+	if lin.OverflowHintLength <= 0 ||
+		lin.OverflowHintLength > len(b)-lin.OverflowHintOffset {
+		return fmt.Errorf("%w: the overflow /H is %d bytes from %d and the file is %d",
+			ErrLinearizationStale, lin.OverflowHintLength, lin.OverflowHintOffset, len(b))
+	}
+	_, obj, n, err := ParseIndirectObject(b[lin.OverflowHintOffset:], nil)
+	if err != nil {
+		return fmt.Errorf("%w: the overflow /H points at byte %d, where no indirect object parses: %v",
+			ErrLinearizationStale, lin.OverflowHintOffset, err)
+	}
+	if _, ok := obj.(*Stream); !ok {
+		return fmt.Errorf("%w: the overflow /H points at byte %d, where the object is %T and not a stream",
+			ErrLinearizationStale, lin.OverflowHintOffset, obj)
+	}
+	if !spans(b, lin.OverflowHintOffset, n, lin.OverflowHintLength) {
+		return fmt.Errorf("%w: the overflow /H says %d bytes and the object at %d is %d",
+			ErrLinearizationStale, lin.OverflowHintLength, lin.OverflowHintOffset, n)
+	}
+	return nil
+}
+
+// checkMainXref checks /T.
+//
+// ⛔ TABLE F.1 GIVES IT TWO MEANINGS AND BOTH ARE REAL. For a file with a
+// traditional cross-reference table it is "the offset of the white-space
+// character preceding the first entry of the main cross-reference table (the
+// entry for object number 0)"; for a file using cross-reference streams it is
+// "the offset of the main cross-reference stream object". Accepting only one
+// would call every file of the other kind stale, so both are tried and the
+// failure names both.
+func checkMainXref(b []byte, lin *Linearization) error {
+	if lin.MainXrefOffset <= 0 || lin.MainXrefOffset >= len(b) {
+		return fmt.Errorf("%w: /T is %d and the file is %d bytes",
+			ErrLinearizationStale, lin.MainXrefOffset, len(b))
+	}
+	rest := b[lin.MainXrefOffset:]
+	if freeEntryFollows(rest) {
+		return nil
+	}
+	if _, obj, _, err := ParseIndirectObject(rest, nil); err == nil {
+		if s, ok := obj.(*Stream); ok {
+			if t, _ := s.Dict["Type"].(Name); t == "XRef" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%w: /T is %d, where there is neither the free entry of a "+
+		"cross-reference table nor a cross-reference stream", ErrLinearizationStale,
+		lin.MainXrefOffset)
+}
+
+// freeEntryFollows says whether the bytes begin with the whitespace and then
+// the object-zero entry of a traditional cross-reference table: ten digits, a
+// space, 65535, a space and `f`.
+func freeEntryFollows(b []byte) bool {
+	i := 0
+	for i < len(b) && isSpace(b[i]) {
+		i++
+	}
+	if i+18 > len(b) {
+		return false
+	}
+	for j := i; j < i+10; j++ {
+		if b[j] < '0' || b[j] > '9' {
+			return false
+		}
+	}
+	return string(b[i+10:i+18]) == " 65535 f"
 }
 
 // firstBodyDict parses the first indirect object of the body and returns its
@@ -239,13 +551,30 @@ func firstBodyDict(b []byte) (Dict, int, error) {
 // real branch uncovered, which is how I noticed that the example and the
 // implementation everybody uses disagree about it.
 func linearizedVersion(v Object) (float64, error) {
+	var got float64
 	switch n := v.(type) {
 	case Integer:
-		return float64(n), nil
+		got = float64(n)
 	case Real:
-		return float64(n), nil
+		got = float64(n)
+	default:
+		return 0, fmt.Errorf("%w: /Linearized is %T, want a direct number", ErrLinearizationMalformed, v)
 	}
-	return 0, fmt.Errorf("%w: /Linearized is %T, want a direct number", ErrLinearizationMalformed, v)
+	// ⛔⛔ THE VALUE IS CHECKED, AND IT WAS NOT. Review measured the gap: a
+	// file whose first object says `/Linearized 9` was ACCEPTED here while
+	// qpdf reported "File is not linearized". /Linearized is the one entry
+	// that says which format the rest of the dictionary is written in, so a
+	// version this code has never seen makes every other entry a guess —
+	// reading /H and /O out of it and reporting the file as sound is the
+	// checker agreeing with a document it cannot have understood.
+	//
+	// 1 and 1.0 are both accepted because the specification's own Example 2
+	// writes `/Linearized 1.0` and qpdf writes `/Linearized 1`.
+	if got != 1 {
+		return 0, fmt.Errorf("%w: /Linearized is %v, and the only version this reads is 1",
+			ErrLinearizationMalformed, got)
+	}
+	return got, nil
 }
 
 // directInteger reads a required entry that must be a direct integer.
@@ -258,7 +587,35 @@ func directInteger(d Dict, key Name) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("%w: /%s is %T, want a direct integer", ErrLinearizationMalformed, key, v)
 	}
-	return int(n), nil
+	return addressable(int64(n), key)
+}
+
+// addressable converts a value the file chose into an int, REFUSING one this
+// build cannot represent rather than letting it wrap.
+//
+// ⛔⛔ SILENT TRUNCATION IS THE 32-BIT HAZARD, NOT THE ADDITION. A plain
+// `int(n)` discards the high half where int is 32 bits, so a /H length of
+// 2^32+127 reads as 127 — a perfectly plausible value that every later bound
+// then accepts. The file would be judged sound on a 32-bit build and refused
+// on a 64-bit one, from the same bytes.
+//
+// Review named this hazard; CI proved it a different way first, with the 386
+// and arm lanes failing because 9223372036854775807 and 4294967295 BOTH
+// arrive as -1. That is the same truncation, caught only because the value
+// happened to land somewhere a bound rejected.
+// ⛔ intMax is a VARIABLE so that a test can shrink it. The refusal below is
+// unreachable on a 64-bit build — every int64 fits — so on this workstation
+// it would be a branch no test could enter, which the coverage gate reports
+// and which is otherwise only exercised by the 386 and arm lanes in CI. A
+// seam is how the 32-bit case gets a test where 32-bit machines are not.
+var intMax = int64(^uint(0) >> 1)
+
+func addressable(v int64, key Name) (int, error) {
+	if v > intMax || v < -intMax-1 {
+		return 0, fmt.Errorf("%w: /%s is %d, which this build cannot address "+
+			"(its largest int is %d)", ErrLinearizationMalformed, key, v, intMax)
+	}
+	return int(v), nil
 }
 
 // readHintArray reads /H, "an array of two or four integers".
@@ -280,7 +637,13 @@ func readHintArray(d Dict, lin *Linearization) error {
 		if !ok {
 			return fmt.Errorf("%w: /H[%d] is %T, want a direct integer", ErrLinearizationMalformed, i, e)
 		}
-		n[i] = int(v)
+		// ⛔ The same refusal as every other entry: /H is where the hostile
+		// value actually arrives, since both halves are used as a byte range.
+		got, err := addressable(int64(v), Name(fmt.Sprintf("H[%d]", i)))
+		if err != nil {
+			return err
+		}
+		n[i] = got
 	}
 	lin.HintOffset, lin.HintLength = n[0], n[1]
 	if len(n) == 4 {
