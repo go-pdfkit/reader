@@ -150,7 +150,7 @@ judgement a writer needs on bytes it has just produced. It establishes that
 every parameter **points at what it claims to** — `/N` is the real page count,
 `/O` is the real first page *and* is a `/Page`, `/H` begins at a real stream
 object, `/T` reaches the main cross-reference (either shape: Table F.1 gives
-it two meanings and both are real), `/E` is inside the file.
+it two meanings and both are real), `/E` is where the first page really ends.
 
 What gates it are files `Linearized` **accepts** and
 `CheckLinearized` refuses: the committed qpdf fixture with one integer
@@ -160,13 +160,38 @@ different document. The replacement's width is asserted by the helper, because
 an edit one byte longer would be refused for the length instead and the deep
 check would never run.
 
-⛔⛔ **`/E` is NOT gated, and a writer must not read a pass here as evidence
-about it.** Table F.1 calls `/E` the offset of the end of the first page, and
-qpdf *computes* it — on the committed fixture it reports `computed = 901..902`
-and refuses a wrong value. This only bounds `/E` between 1 and the file
-length, so a writer that miscomputes it passes here and fails qpdf. Computing
-it needs the first-page object set, which is the same partition the hint
-tables describe, so it waits for that work rather than being approximated now.
+⛔ **`/E` is checked against the objects the file says are the first page's,
+not merely against the file's length.** Table F.1 calls `/E` the offset of the
+end of the first page. This used to bound it only between 1 and the file
+length, on the reasoning that the first-page partition "is the hint tables'
+job" — which was true of the hint tables and false of the **first-page
+cross-reference section**, which Annex F puts at the front and the file's own
+`startxref` points at. Its entries *are* the first page's objects; that is the
+whole trick of the format. So `/E` must equal the end of the last of them, and
+a writer that is one byte out is now told so instead of passing.
+
+⛔⛔ **The hint stream is excluded, and a second producer is why that is not a
+guess.** F.3.1 permits the primary hint stream on either side of the first
+page, so the highest-offset entry in that section is not always a first-page
+object:
+
+| producer | `/H` offset | `/E` | hint stream sits |
+|---|---|---|---|
+| qpdf | 550 | 902 | **before** the first page |
+| Ghostscript `-dFastWebView` | 829 | 829 | **after** it, at `/E` exactly |
+
+On Ghostscript's file the naive maximum *is* the hint stream, ending at 967
+against an `/E` of 829 — so a rule that took it would refuse every file that
+tool writes. Both qpdf fixtures place it before and **cannot tell the two
+rules apart**, which is why `testdata/linearized-gs.pdf` is committed beside
+them: removing the exclusion turns exactly that test red and leaves the qpdf
+ones green. A second producer measures what the first cannot.
+
+⚠ The **overflow** hint stream is excluded by the same reasoning and no file
+can reach it — it needs a four-entry `/H` whose second pair is both a real
+stream and the highest-offset object, and neither producer writes one. So the
+question is asked of a function rather than inline, where four plain cases can
+put it and a mutation can kill it.
 
 ⛔⛔ **A value this build cannot address is refused, not truncated**, and the
 same bytes therefore get the same answer on a 32-bit build as on a 64-bit one.
