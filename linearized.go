@@ -255,15 +255,140 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	if err := checkMainXref(b, lin); err != nil {
 		return nil, err
 	}
-	// Table F.1: /E is "the offset of the end of the first page". Nothing here
-	// knows which objects the first page owns — that is the hint tables' job —
-	// so what is checked is the one thing that is checkable without them: an
-	// offset past the end of the file sends a reader nowhere.
-	if lin.FirstPageEnd <= 0 || lin.FirstPageEnd > len(b) {
-		return nil, fmt.Errorf("%w: /E is %d and the file is %d bytes",
-			ErrLinearizationStale, lin.FirstPageEnd, len(b))
+	if err := checkFirstPageEnd(b, lin); err != nil {
+		return nil, err
 	}
 	return lin, nil
+}
+
+// isHintObject says whether an object at this offset is one of the hint
+// streams /H names, and so is not a first-page object whose end could be /E.
+//
+// ⛔⛔ IT IS A FUNCTION SO THAT THE SECOND HALF CAN BE TESTED AT ALL. The
+// primary hint stream is reachable from a committed file — Ghostscript puts
+// it at /E — but the OVERFLOW stream is not: it needs a four-entry /H whose
+// second pair is both a real stream and the highest-offset object in the
+// first-page section, and neither qpdf nor Ghostscript writes one. Left
+// inline, that condition would be a branch no fixture could reach and no
+// mutation could kill, which is the vacuity this file has already spent
+// three review rounds removing. Asked directly it is four plain cases.
+func isHintObject(lin *Linearization, off int64) bool {
+	if off == int64(lin.HintOffset) {
+		return true
+	}
+	return lin.HasOverflowHint && off == int64(lin.OverflowHintOffset)
+}
+
+// checkFirstPageEnd checks /E, Table F.1's "offset of the end of the first
+// page", against the objects the file itself says belong to the first page.
+//
+// ⛔ THE FIRST-PAGE CROSS-REFERENCE SECTION IS THE ANSWER, and it costs
+// nothing to read. Annex F puts it at the front (part 3) and the file's own
+// `startxref` points at it, which is the whole trick of the format: a reader
+// fetches the front of the file and has page one. So its entries ARE the
+// first page's objects, and no hint table has to be decoded to learn that.
+// This checker used to say the partition "is the hint tables' job" and bound
+// /E only to the file's length; that was true of the hint tables and not of
+// this section.
+//
+// ⛔⛔ THE HINT STREAM IS EXCLUDED, AND A SECOND PRODUCER IS WHY THAT IS NOT
+// A GUESS. F.3.1 permits the primary hint stream on either side of the first
+// page, so the highest-offset entry here is not always a first-page object:
+//
+//	qpdf          /H at 550, /E 902 — the hint stream comes BEFORE
+//	Ghostscript   /H at 829, /E 829 — it comes AFTER, AT /E exactly
+//
+// On Ghostscript's file the naive maximum is the hint stream itself, ending
+// at 967 against an /E of 829, so a rule that took it would refuse every
+// file that tool writes. Both committed qpdf fixtures place the hint stream
+// before the first page and CANNOT tell the two rules apart — which is why
+// testdata/linearized-gs.pdf is committed beside them.
+//
+// ⛔⛔ AND WHAT THIS PROVES IS THAT /E AGREES WITH THAT SECTION, NOT THAT THE
+// SECTION IS RIGHT. A writer that leaves out objects page one genuinely needs
+// produces a file that is internally consistent and passes here. Review
+// measured Ghostscript doing it on a document with shared fonts, outlines and
+// links: /H = /E = 1941, accepted here, while qpdf computes 5500..5501 and
+// reports page one as 9 objects where the hint table claims 4. Deciding what
+// page one NEEDS means walking its resources — the partition the hint tables
+// describe — and that judgement is still outstanding (#40).
+func checkFirstPageEnd(b []byte, lin *Linearization) error {
+	// ⛔ A SEPARATE Document, not the one CheckLinearized opened. Open walks
+	// /Prev and merges every section into one table, and setEntry keeps the
+	// first definition it saw, so by then the front section's entries are no
+	// longer distinguishable from the rest of the file's. Reading that one
+	// section alone is the only way to ask which objects it listed.
+	front := &Document{
+		buf:     b,
+		xref:    map[int]xrefEntry{},
+		cache:   map[int]Object{},
+		loading: map[int]bool{},
+		objStms: map[int]map[int]Object{},
+	}
+	off, err := front.findStartxref()
+	if err != nil {
+		return fmt.Errorf("%w: the first-page cross-reference section cannot be found: %v",
+			ErrLinearizationStale, err)
+	}
+	// ⛔⛔ THE SECTION startxref NAMES IS NOT ALWAYS THE FIRST-PAGE ONE, and
+	// an earlier draft of this claimed /L had already made it so. It has not:
+	// an incremental update appends its own section and points startxref at
+	// THAT, and a file whose /L was rewritten to match its new length passes
+	// every earlier check. Following it then lands on the update's entries and
+	// compares /E with an object that has nothing to do with the first page —
+	// a refusal with a reason that is not the reason, which is worse than a
+	// miss because a reader believes it.
+	//
+	// Annex F puts the first-page section at part 3 and the main one at part
+	// 10, so the front section precedes /T. checkMainXref has already
+	// established /T against the file by the time this runs, and this says
+	// nothing about /E, so it still holds when /E is the thing under test.
+	if off >= int64(lin.MainXrefOffset) {
+		return fmt.Errorf("%w: the cross-reference section at byte %d is not the first-page one — "+
+			"it is at or past the main table /T names (%d), so the file has been written to since it was linearized",
+			ErrLinearizationStale, off, lin.MainXrefOffset)
+	}
+	if _, err := front.readXrefSection(off); err != nil {
+		return fmt.Errorf("%w: the first-page cross-reference section at byte %d does not read: %v",
+			ErrLinearizationStale, off, err)
+	}
+
+	// ⛔ THE COMPARISON STAYS IN int64 UNTIL THE VALUE IS KNOWN TO FIT. These
+	// offsets come from the file, and int(e.offset) is the same silent
+	// truncation `addressable` exists to refuse everywhere else.
+	last := int64(-1)
+	for _, e := range front.xref {
+		// An object inside an object stream has no offset of its own; its
+		// container has one and is listed here too, so skipping it loses
+		// nothing.
+		if e.kind != 'n' || isHintObject(lin, e.offset) {
+			continue
+		}
+		if e.offset > last {
+			last = e.offset
+		}
+	}
+	if last < 0 {
+		return fmt.Errorf("%w: the first-page cross-reference section lists no object in the file",
+			ErrLinearizationStale)
+	}
+	if last >= int64(len(b)) {
+		return fmt.Errorf("%w: the first-page cross-reference section puts an object at byte %d and the file is %d bytes",
+			ErrLinearizationStale, last, len(b))
+	}
+	at := int(last)
+	_, _, n, err := ParseIndirectObject(b[at:], nil)
+	if err != nil {
+		return fmt.Errorf("%w: the last first-page object, at byte %d, does not parse: %v",
+			ErrLinearizationStale, at, err)
+	}
+	// The same end-of-object rule the /H length uses: Table F.1 counts the
+	// line ending after `endobj` and the parse stops at it.
+	if end := at + n + eolAfter(b, at+n); lin.FirstPageEnd != end {
+		return fmt.Errorf("%w: /E says %d and the first page ends at %d",
+			ErrLinearizationStale, lin.FirstPageEnd, end)
+	}
+	return nil
 }
 
 // checkFirstPage checks /N and /O against the document's own page tree.

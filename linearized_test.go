@@ -8,6 +8,7 @@ package reader
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,7 +103,7 @@ func TestAParameterTheDocumentContradictsIsCaughtOnlyByTheDeepCheck(t *testing.T
 		{"a hint stream running off the end", "/H [ 550 127 ]", "/H [ 550 999 ]", "/H is 999 bytes from 550"},
 		{"a hint offset pointing at something that is not a stream",
 			"/H [ 550 127 ]", "/H [ 501 127 ]", "not a stream"},
-		{"a first page that ends nowhere", "/E 902", "/E 000", "/E is 0"},
+		{"a first page that ends nowhere", "/E 902", "/E 000", "/E says 0 and the first page ends at 902"},
 		{"a main cross-reference that is not there", "/T 1169", "/T 1160", "/T is 1160"},
 		{"a main cross-reference at no offset at all", "/T 1169", "/T 0000", "/T is 0"},
 		// ⛔ One byte from the end: the free-entry test has to notice that the
@@ -608,8 +609,210 @@ func TestAFirstPageEndingPastTheFileIsRefused(t *testing.T) {
 	if !errors.Is(err, ErrLinearizationStale) {
 		t.Fatalf("error is %v, want ErrLinearizationStale", err)
 	}
-	if !strings.Contains(err.Error(), "/E is 99999") {
-		t.Errorf("it does not name the claim: %v", err)
+	// ⛔ THE MESSAGE CHANGED WITH THE CHECK, AND SO DID WHAT IT PROVES. This
+	// used to be refused for being past the end of the file, which is the
+	// weakest thing wrong with it. It is now refused for disagreeing with the
+	// objects the file's own first-page section lists, and names both numbers.
+	if !strings.Contains(err.Error(), "/E says 99999 and the first page ends at 902") {
+		t.Errorf("it does not name the claim and what contradicts it: %v", err)
+	}
+}
+
+// ⛔⛔ /E OFF BY ONE IN EITHER DIRECTION, which is what a writer that
+// miscomputes it actually produces — not 99999. Neither is past the end of
+// the file, so the bound this check replaced accepted both.
+func TestAFirstPageEndingOffByOneIsRefused(t *testing.T) {
+	for _, to := range []string{"/E 901", "/E 903"} {
+		t.Run(to, func(t *testing.T) {
+			b := editedFixturePadded(t, [2]string{"/E 902", to})
+			if _, err := Linearized(b); err != nil {
+				t.Fatalf("the cheap check refused it: %v", err)
+			}
+			_, err := CheckLinearized(b)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("error is %v, want ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), "the first page ends at 902") {
+				t.Errorf("it does not say where the first page really ends: %v", err)
+			}
+		})
+	}
+}
+
+// ⛔⛔ THE FIXTURE THAT MAKES THE /H EXCLUSION A TEST RATHER THAN A HOPE.
+// Ghostscript's -dFastWebView writes the primary hint stream AFTER the first
+// page, at exactly /E — where qpdf writes it before — so it is the
+// highest-offset entry in the first-page section. Take it and this file is
+// refused although it is sound: the naive maximum ends at 967 against an /E
+// of 829.
+//
+// Both qpdf fixtures place it before and cannot distinguish the two rules,
+// which is the whole reason a second producer is committed here. Measured
+// with Ghostscript 10.08.0.
+func TestTheHintStreamIsNotTheEndOfTheFirstPage(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lin, err := CheckLinearized(b)
+	if err != nil {
+		t.Fatalf("a Ghostscript-linearized file was refused: %v", err)
+	}
+	// The precondition the test rests on: if a future fixture moved the hint
+	// stream before the first page, this test would pass while proving
+	// nothing, which is the failure mode it exists to prevent.
+	if lin.HintOffset != lin.FirstPageEnd {
+		t.Fatalf("this fixture no longer places /H at /E (/H=%d, /E=%d), so it no longer "+
+			"distinguishes the naive rule from the one with the exclusion",
+			lin.HintOffset, lin.FirstPageEnd)
+	}
+}
+
+// ⛔⛔ THE OVERFLOW HALF OF THE HINT EXCLUSION, WHICH NO FILE CAN REACH. It
+// needs a four-entry /H whose second pair is both a real stream and the
+// highest-offset object of the first-page section, and neither producer
+// writes one. Asked directly it is four cases, and each kills a mutation:
+// dropping the HasOverflowHint guard turns "an overflow offset that is not
+// declared" red, and replacing the second return with false turns "the
+// overflow hint stream" red.
+func TestOnlyTheStreamsSlashHNamesAreExcludedFromTheFirstPage(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		lin  Linearization
+		off  int64
+		want bool
+	}{
+		{"the primary hint stream", Linearization{HintOffset: 550}, 550, true},
+		{"an ordinary first-page object", Linearization{HintOffset: 550}, 871, false},
+		{"the overflow hint stream", Linearization{
+			HintOffset: 550, HasOverflowHint: true, OverflowHintOffset: 900}, 900, true},
+		{"an overflow offset that is not declared", Linearization{
+			HintOffset: 550, OverflowHintOffset: 900}, 900, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lin := c.lin
+			if got := isHintObject(&lin, c.off); got != c.want {
+				t.Errorf("isHintObject(%d) = %v, want %v", c.off, got, c.want)
+			}
+		})
+	}
+}
+
+// ⛔ THE WAYS THE FIRST-PAGE SECTION CAN FAIL TO ANSWER, each reached by a
+// same-width edit so the file still opens and /L still matches. A reader that
+// cannot find or read that section cannot judge /E, and saying so beats
+// returning nil and calling the file sound.
+func TestAFirstPageSectionThatCannotAnswerIsRefused(t *testing.T) {
+	for _, c := range []struct{ name, from, to, want string }{
+		{"a startxref that names no offset", "startxref\n216", "startxref\n/Na",
+			"cannot be found"},
+		{"a startxref pointing at no section", "startxref\n216", "startxref\n217",
+			"does not read"},
+		{"an entry past the end of the file", "0000000871 00000 n", "0009999871 00000 n",
+			"and the file is 1367 bytes"},
+		{"an entry pointing at no object", "0000000871 00000 n", "0000000860 00000 n",
+			"does not parse"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := editedFixturePadded(t, [2]string{c.from, c.to})
+			_, err := CheckLinearized(b)
+			if err == nil {
+				t.Fatal("it was accepted")
+			}
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("error is %v, want ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but not for the reason this case is about: %v", err)
+			}
+		})
+	}
+}
+
+// ⛔⛔ AN ENTRY AT EXACTLY len(b), which is the boundary the length guard is
+// about and the only input that tells `>=` from `>`. Past the end the parse
+// would fail anyway and the guard would be a bound nothing is holding —
+// review measured that mutation staying green — so the case that pins it is
+// the equal one: b[len(b):] is a legal empty slice, not a panic, and without
+// the guard this is refused for the wrong reason.
+func TestAnEntryStartingExactlyAtTheEndOfTheFileIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"0000000871 00000 n", "0000001367 00000 n"})
+	if len(b) != 1367 {
+		t.Fatalf("this test hard-codes the fixture's length; it is %d", len(b))
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "puts an object at byte 1367 and the file is 1367 bytes") {
+		t.Errorf("it was refused, but not by the length guard this test is about: %v", err)
+	}
+}
+
+// ⛔⛔ AN INCREMENTAL UPDATE POINTS startxref AT ITS OWN SECTION, and a
+// previous version of this reasoned that /L had already made that impossible.
+// It had not: rewriting /L to the new length passes every earlier check, and
+// the first-page end was then compared against an object from the update —
+// refused, with a reason that was not the reason.
+//
+// The file below is exactly that: a real appended revision whose /L is
+// corrected, which qpdf still calls linearized.
+func TestAnIncrementallyUpdatedFileIsNotJudgedByTheUpdatesSection(t *testing.T) {
+	orig, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "9 0 obj\n<< /Type /Nothing >>\nendobj\n"
+	xrefAt := len(orig) + len(body)
+	tail := fmt.Sprintf("xref\n0 1\n0000000000 65535 f \ntrailer << /Root 5 0 R /Size 10 /Prev 216 >>\nstartxref\n%d\n%%%%EOF\n", xrefAt)
+	s := string(orig) + body + tail
+
+	// /L must say the new length, or the cheap check refuses it for that and
+	// this test would never reach what it is about. Same width keeps every
+	// other offset valid, so the appended revision is the only change.
+	old, want := "/L 1367", fmt.Sprintf("/L %d", len(s))
+	if len(want) != len(old) {
+		t.Fatalf("the updated file is %d bytes, which is not the same width as the fixture's /L", len(s))
+	}
+	if strings.Count(s, old) != 1 {
+		t.Fatalf("%q appears %d times in the fixture, so this edit is not the one it is named for",
+			old, strings.Count(s, old))
+	}
+	b := []byte(strings.Replace(s, old, want, 1))
+
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so /L is not what this test is about: %v", err)
+	}
+	_, err = CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	// ⛔ THE REASON IS THE ASSERTION. Without the guard this file is still
+	// refused — by the /E comparison, naming an object the update appended —
+	// so a test that only checked for an error would pass either way.
+	if !strings.Contains(err.Error(), "written to since it was linearized") {
+		t.Errorf("it was refused, but not as an updated file: %v", err)
+	}
+}
+
+// ⛔ A FIRST-PAGE SECTION LISTING ONLY FREE OBJECTS names nothing whose end
+// could be /E. Every entry is marked `f`, which is the same width as `n`, so
+// the file is otherwise untouched.
+func TestAFirstPageSectionWithNoObjectInTheFileIsRefused(t *testing.T) {
+	b := editedFixturePadded(t,
+		[2]string{"0000000015 00000 n", "0000000015 00000 f"},
+		[2]string{"0000000501 00000 n", "0000000501 00000 f"},
+		[2]string{"0000000550 00000 n", "0000000550 00000 f"},
+		[2]string{"0000000677 00000 n", "0000000677 00000 f"},
+		[2]string{"0000000773 00000 n", "0000000773 00000 f"},
+		[2]string{"0000000871 00000 n", "0000000871 00000 f"},
+	)
+	_, err := CheckLinearized(b)
+	if err == nil {
+		t.Fatal("it was accepted")
+	}
+	if !strings.Contains(err.Error(), "lists no object in the file") {
+		t.Errorf("it was refused, but not for the reason this test is about: %v", err)
 	}
 }
 
