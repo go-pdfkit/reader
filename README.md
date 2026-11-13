@@ -160,8 +160,25 @@ different document. The replacement's width is asserted by the helper, because
 an edit one byte longer would be refused for the length instead and the deep
 check would never run.
 
+⛔⛔ **`/E` is NOT gated, and a writer must not read a pass here as evidence
+about it.** Table F.1 calls `/E` the offset of the end of the first page, and
+qpdf *computes* it — on the committed fixture it reports `computed = 901..902`
+and refuses a wrong value. This only bounds `/E` between 1 and the file
+length, so a writer that miscomputes it passes here and fails qpdf. Computing
+it needs the first-page object set, which is the same partition the hint
+tables describe, so it waits for that work rather than being approximated now.
+
+⛔ **The `/H` length is compared with the object exactly**, not within a
+window. A first version allowed the declared length to exceed the parsed
+extent by 0–2 bytes, reasoning that a writer might use CRLF; that accepts
+`/H [ 550 126 ]` and `/H [ 550 128 ]` for a 126-byte object, both of which
+qpdf refuses. The end-of-line is now **read** rather than guessed, and every
+spelling of one (LF, CR, CRLF, none) has its own test — a tolerance wide
+enough to cover every line ending is wide enough to hide a wrong length.
+
 Still not checked, by either: the hint tables (F.4). `qpdf --check` remains the
-foreign judge.
+foreign judge, and it is run across 1/2/5/25 pages × plain, object-streams and
+uncompressed-streams.
 
 The positives are **qpdf's** output, not fixtures written to agree with this
 reading of Annex F. On five real library scans linearized by qpdf and judged by

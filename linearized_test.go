@@ -85,6 +85,13 @@ func TestAParameterTheDocumentContradictsIsCaughtOnlyByTheDeepCheck(t *testing.T
 	}{
 		{"a hint length shorter than the object it describes", "/H [ 550 127 ]", "/H [ 550 125 ]",
 			"/H says the hint stream is 125 bytes"},
+		// ⛔ THE TWO NEIGHBOURS OF THE RIGHT ANSWER, which a 0..2 window let
+		// through and qpdf refuses: 126 omits the end-of-line Table F.1
+		// counts, 128 claims a byte that belongs to the next object.
+		{"a hint length one byte short of the terminator", "/H [ 550 127 ]", "/H [ 550 126 ]",
+			"/H says the hint stream is 126 bytes"},
+		{"a hint length one byte past the terminator", "/H [ 550 127 ]", "/H [ 550 128 ]",
+			"/H says the hint stream is 128 bytes"},
 		{"a hint length of nothing at all", "/H [ 550 127 ]", "/H [ 550 000 ]", "/H is 0 bytes"},
 		{"a main cross-reference at the very end", "/T 1169", "/T 1367", "/T is 1367"},
 		{"a page count the document contradicts", "/N 2", "/N 3", "/N says 3 page(s)"},
@@ -206,6 +213,41 @@ func TestAFrontThatSaysLinearizedOverABodyThatIsGone(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does not open") {
 		t.Errorf("it does not say the document would not open: %v", err)
+	}
+}
+
+// ⛔ THE LINE ENDING IS READ, SO EVERY SPELLING OF ONE HAS TO BE. qpdf writes
+// LF, so the committed fixtures exercise exactly one branch and the others
+// would go untested behind a suite that looks thorough — which is how the
+// 0..2 window got there in the first place, guessing at line endings instead
+// of reading them.
+//
+// A PDF may use CR alone (7.2.3 lists CR, LF and CRLF as end-of-line), and an
+// object that ends at EOF has no terminator at all.
+func TestEverySpellingOfALineEnding(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		tail string
+		want int
+	}{
+		{"a line feed, which is what qpdf writes", "\n", 1},
+		{"a carriage return alone", "\r", 1},
+		{"a carriage return and a line feed", "\r\n", 2},
+		{"a carriage return at the very end of the file", "\r", 1},
+		{"no terminator at all", "", 0},
+		{"something that is not a line ending", "x", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte("endobj" + c.tail)
+			if got := eolAfter(b, len("endobj")); got != c.want {
+				t.Errorf("eolAfter(%q) = %d, want %d", c.tail, got, c.want)
+			}
+		})
+	}
+	// And past the end of the buffer entirely, which is what an object
+	// finishing at EOF gives.
+	if got := eolAfter([]byte("endobj"), 99); got != 0 {
+		t.Errorf("past the end = %d, want 0", got)
 	}
 }
 
@@ -364,12 +406,26 @@ func TestAWellFormedOverflowHintIsAccepted(t *testing.T) {
 	}
 }
 
-// ⛔⛔ THE 32-BIT OVERFLOW, WITH A VALUE THAT OVERFLOWS 64 BITS TOO. The bound
-// was written `HintOffset+HintLength > len(b)` and is now a subtraction;
-// review measured that the whole suite stayed green with the addition form
-// restored, because no test carried a length anywhere near the limit. This is
-// that test, and it fails on every word size with the addition form.
-func TestAHintLengthNearTheIntegerLimitIsRefused(t *testing.T) {
+// ⛔⛔ THE 32-BIT OVERFLOW, AND A CORRECTION I PUBLISHED WRONG. The bound was
+// written `HintOffset+HintLength > len(b)` and is now a subtraction, which
+// cannot wrap. The previous commit's message claimed these two cases "fail on
+// every word size with the addition form". ⛔ THAT WAS FALSE, and review
+// measured it: with the addition form restored the suite stayed GREEN,
+// because `spans` refuses the file a few lines later for a different reason
+// and the test never reached the bound it was named for. I asserted it from
+// reading the code instead of running the mutation — with the tool for
+// running mutations already built and already used twice that hour.
+//
+// The fix is for the test to name the BOUND'S OWN SENTENCE. Only the length
+// check produces it; under the addition form the overflow slips past that
+// check and the refusal comes from `spans` with different words, so the
+// assertion goes red exactly as the name promises.
+func TestAHintLengthNearTheIntegerLimitIsRefusedByTheBound(t *testing.T) {
+	// ⛔ AND WHICH CASE CATCHES IT DEPENDS ON THE WORD SIZE, so say so rather
+	// than let a reader assume both do. Re-measured with the addition form
+	// restored: MaxInt64 turns this red on a 64-bit build, MaxUint32 does NOT
+	// — it overflows only where int is 32 bits, which is the build the bound
+	// exists for and is not the one these run on.
 	for _, huge := range []string{"9223372036854775807", "4294967295"} {
 		t.Run(huge, func(t *testing.T) {
 			b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 " + huge + " ]"})
@@ -379,6 +435,9 @@ func TestAHintLengthNearTheIntegerLimitIsRefused(t *testing.T) {
 			_, err := CheckLinearized(b)
 			if !errors.Is(err, ErrLinearizationStale) {
 				t.Fatalf("a hint length of %s was accepted: %v", huge, err)
+			}
+			if !strings.Contains(err.Error(), "/H is "+huge+" bytes from 550") {
+				t.Errorf("it was refused, but not by the length bound this test is about: %v", err)
 			}
 		})
 	}

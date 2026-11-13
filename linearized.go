@@ -206,10 +206,21 @@ func Linearized(b []byte) (*Linearization, error) {
 // ⛔ It still does NOT validate the hint tables (F.4), which is a larger job
 // again. What it establishes is that every parameter POINTS AT WHAT IT CLAIMS
 // TO: the page count is the real one, /O is the real first page, /H begins at
-// a real stream object, /T reaches the main cross-reference. A file can pass
-// this and still send a reader to the wrong offset inside a hint table — so
-// the error says which claim failed, and a caller that needs more must read
-// F.4. qpdf's `--check` remains the foreign judge the tests print by.
+// a real stream object of the length it declares, /T reaches the main
+// cross-reference. A file can pass this and still send a reader to the wrong
+// offset inside a hint table — so the error says which claim failed, and a
+// caller that needs more must read F.4. qpdf's `--check` remains the foreign
+// judge the tests print by.
+//
+// ⛔⛔ AND /E IS NOT GATED, SAID OUT LOUD BECAUSE A WRITER WILL BE TEMPTED TO
+// TRUST IT. Table F.1 calls /E the offset of the end of the first page, and
+// qpdf COMPUTES it: on the committed fixture it reports "computed = 901..902"
+// and refuses a wrong value. This only bounds /E between 1 and the file
+// length, so a writer that miscomputes /E passes here and fails qpdf. Review
+// measured the gap. Computing it needs the first-page object set — the same
+// partition the hint tables describe — which is why it waits for that work
+// rather than being approximated now. Until then: do not read a pass from
+// this as evidence about /E.
 //
 // The error wraps the same sentinels [Linearized] uses: a dictionary that
 // disagrees with the document around it is [ErrLinearizationStale], which is
@@ -349,27 +360,51 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// a 127-byte object passed while qpdf reported a hint table length
 	// mismatch. Table F.1 counts the whole object, so this is the parse's own
 	// extent.
-	if !spans(n, lin.HintLength) {
+	if !spans(b, lin.HintOffset, n, lin.HintLength) {
 		return fmt.Errorf("%w: /H says the hint stream is %d bytes and the object at %d is %d",
 			ErrLinearizationStale, lin.HintLength, lin.HintOffset, n)
 	}
 	return nil
 }
 
-// spans says whether a declared length describes an object the parse measured
-// as n bytes.
+// spans says whether a declared length describes the object at off, which the
+// parse measured as n bytes.
 //
-// ⛔ IT IS NOT EQUALITY, AND MEASUREMENT IS WHY. Requiring n == declared
-// refused every file qpdf produces: the parse ends at `endobj`, while Table
-// F.1's length counts the object AND the end-of-line that terminates it.
-// Measured on qpdf 12.4.2 output at 1, 2 and 5 pages and on both committed
-// fixtures — declared was n+1 in every case. Two bytes are allowed because a
-// writer may use CRLF; more than that is a length describing something else.
+// ⛔ IT IS NOT EQUALITY WITH n, AND MEASUREMENT IS WHY. Requiring n ==
+// declared refused every file qpdf produces: the parse ends at `endobj`,
+// while Table F.1's length counts the object AND the end-of-line that
+// terminates it.
 //
-// The asymmetry is deliberate: a declared length SHORTER than the object is
-// always wrong, because the object does not fit in the span the file claims.
-func spans(n, declared int) bool {
-	return declared >= n && declared-n <= 2
+// ⛔⛔ BUT A WINDOW IS NOT GOOD ENOUGH EITHER, which review measured. A first
+// version allowed declared-n in 0..2, reasoning that a writer might use CRLF.
+// That accepts /H [ 550 126 ] and /H [ 550 128 ] for a 126-byte object, both
+// of which qpdf refuses — "first page object offset mismatch" and "hint table
+// length mismatch". A tolerance wide enough to cover every line ending is
+// wide enough to hide a wrong length, and this file's whole purpose is to be
+// no weaker than the judge it will be measured against.
+//
+// So the end-of-line is READ rather than guessed, and the length must be
+// exactly the object plus it.
+func spans(b []byte, off, n, declared int) bool {
+	return declared == n+eolAfter(b, off+n)
+}
+
+// eolAfter is the length of the line ending at i: 2 for CRLF, 1 for a lone CR
+// or LF, 0 for anything else.
+func eolAfter(b []byte, i int) int {
+	if i >= len(b) {
+		return 0
+	}
+	if b[i] == '\r' {
+		if i+1 < len(b) && b[i+1] == '\n' {
+			return 2
+		}
+		return 1
+	}
+	if b[i] == '\n' {
+		return 1
+	}
+	return 0
 }
 
 // checkOverflowHint checks the second pair of /H, which Table F.1 makes
@@ -399,7 +434,7 @@ func checkOverflowHint(b []byte, lin *Linearization) error {
 		return fmt.Errorf("%w: the overflow /H points at byte %d, where the object is %T and not a stream",
 			ErrLinearizationStale, lin.OverflowHintOffset, obj)
 	}
-	if !spans(n, lin.OverflowHintLength) {
+	if !spans(b, lin.OverflowHintOffset, n, lin.OverflowHintLength) {
 		return fmt.Errorf("%w: the overflow /H says %d bytes and the object at %d is %d",
 			ErrLinearizationStale, lin.OverflowHintLength, lin.OverflowHintOffset, n)
 	}
