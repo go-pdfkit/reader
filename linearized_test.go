@@ -429,17 +429,76 @@ func TestAHintLengthNearTheIntegerLimitIsRefusedByTheBound(t *testing.T) {
 	for _, huge := range []string{"9223372036854775807", "4294967295"} {
 		t.Run(huge, func(t *testing.T) {
 			b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 " + huge + " ]"})
-			if _, err := Linearized(b); err != nil {
-				t.Fatalf("the cheap check refused it: %v", err)
+			// ⛔ ON A 32-BIT BUILD THE CHEAP CHECK REFUSES IT FIRST, AND THAT
+			// IS CORRECT: the value cannot be converted at all, so no bound is
+			// ever consulted. Asserting that the cheap check accepts — which
+			// is the right precondition on a 64-bit build — is what made this
+			// test fail on the 386 and arm lanes.
+			cheap := func() error { _, e := Linearized(b); return e }()
+			if strconv.IntSize == 32 {
+				if !errors.Is(cheap, ErrLinearizationMalformed) {
+					t.Fatalf("a value this build cannot address was read anyway: %v", cheap)
+				}
+				if !strings.Contains(cheap.Error(), "cannot address") {
+					t.Errorf("it does not say why: %v", cheap)
+				}
+				return
+			}
+			if cheap != nil {
+				t.Fatalf("the cheap check refused it: %v", cheap)
 			}
 			_, err := CheckLinearized(b)
-			if !errors.Is(err, ErrLinearizationStale) {
-				t.Fatalf("a hint length of %s was accepted: %v", huge, err)
+			if err == nil {
+				t.Fatalf("a hint length of %s was accepted", huge)
 			}
-			if !strings.Contains(err.Error(), "/H is "+huge+" bytes from 550") {
-				t.Errorf("it was refused, but not by the length bound this test is about: %v", err)
+			// ⛔⛔ WHICH REFUSAL IS CORRECT DEPENDS ON THE WORD SIZE, and
+			// saying "either" would be a test that cannot fail. CI found this
+			// the hard way: both values arrive as -1 on 386 and arm, because
+			// the conversion truncated, so the assertion written for a 64-bit
+			// build failed on the two lanes that exist to catch exactly this.
+			want := "/H is " + huge + " bytes from 550"
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("error is %v, want it to wrap ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("it was refused, but not for the reason this test is about: %v", err)
 			}
 		})
+	}
+}
+
+// ⛔⛔ THE TRUNCATION ITSELF, WHICH IS THE REAL 32-BIT HAZARD AND IS INVISIBLE
+// ON THIS WORKSTATION. 2^32+127 read through a plain `int(n)` on a 32-bit
+// build is 127 — not a wild value a bound would catch, but a perfectly
+// plausible hint length that every later check then accepts. The same bytes
+// would be judged sound on one machine and refused on another.
+//
+// The conversion refuses what it cannot represent now, so both builds answer;
+// they answer differently, and both answers are right.
+func TestAHintLengthThatWrapsOnA32BitBuildIsRefused(t *testing.T) {
+	// ⛔ THE SEAM IS WHAT MAKES THIS A TEST AND NOT A HOPE. On a 64-bit build
+	// every int64 fits an int, so the refusal cannot be reached from any
+	// file; shrinking intMax to a 32-bit machine's largest int reproduces
+	// that machine's arithmetic here. Without it the branch is exercised only
+	// by CI's 386 and arm lanes, i.e. after pushing.
+	old := intMax
+	t.Cleanup(func() { intMax = old })
+	intMax = 1<<31 - 1
+
+	// 4294967423 == 2^32 + 127, and 127 is the fixture's own hint length — so
+	// a plain int() conversion would read it as a PLAUSIBLE value that every
+	// later bound accepts, not as a wild one something would catch.
+	b := editedFixturePadded(t, [2]string{"/H [ 550 127 ]", "/H [ 550 4294967423 ]"})
+
+	_, err := Linearized(b)
+	if !errors.Is(err, ErrLinearizationMalformed) {
+		t.Fatalf("2^32+127 was read as a hint length on a 32-bit build: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot address") {
+		t.Errorf("it does not say why: %v", err)
+	}
+	if _, err := CheckLinearized(b); !errors.Is(err, ErrLinearizationMalformed) {
+		t.Errorf("the deep check accepted it: %v", err)
 	}
 }
 

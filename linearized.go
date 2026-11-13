@@ -579,7 +579,35 @@ func directInteger(d Dict, key Name) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("%w: /%s is %T, want a direct integer", ErrLinearizationMalformed, key, v)
 	}
-	return int(n), nil
+	return addressable(int64(n), key)
+}
+
+// addressable converts a value the file chose into an int, REFUSING one this
+// build cannot represent rather than letting it wrap.
+//
+// ⛔⛔ SILENT TRUNCATION IS THE 32-BIT HAZARD, NOT THE ADDITION. A plain
+// `int(n)` discards the high half where int is 32 bits, so a /H length of
+// 2^32+127 reads as 127 — a perfectly plausible value that every later bound
+// then accepts. The file would be judged sound on a 32-bit build and refused
+// on a 64-bit one, from the same bytes.
+//
+// Review named this hazard; CI proved it a different way first, with the 386
+// and arm lanes failing because 9223372036854775807 and 4294967295 BOTH
+// arrive as -1. That is the same truncation, caught only because the value
+// happened to land somewhere a bound rejected.
+// ⛔ intMax is a VARIABLE so that a test can shrink it. The refusal below is
+// unreachable on a 64-bit build — every int64 fits — so on this workstation
+// it would be a branch no test could enter, which the coverage gate reports
+// and which is otherwise only exercised by the 386 and arm lanes in CI. A
+// seam is how the 32-bit case gets a test where 32-bit machines are not.
+var intMax = int64(^uint(0) >> 1)
+
+func addressable(v int64, key Name) (int, error) {
+	if v > intMax || v < -intMax-1 {
+		return 0, fmt.Errorf("%w: /%s is %d, which this build cannot address "+
+			"(its largest int is %d)", ErrLinearizationMalformed, key, v, intMax)
+	}
+	return int(v), nil
 }
 
 // readHintArray reads /H, "an array of two or four integers".
@@ -601,7 +629,13 @@ func readHintArray(d Dict, lin *Linearization) error {
 		if !ok {
 			return fmt.Errorf("%w: /H[%d] is %T, want a direct integer", ErrLinearizationMalformed, i, e)
 		}
-		n[i] = int(v)
+		// ⛔ The same refusal as every other entry: /H is where the hostile
+		// value actually arrives, since both halves are used as a byte range.
+		got, err := addressable(int64(v), Name(fmt.Sprintf("H[%d]", i)))
+		if err != nil {
+			return err
+		}
+		n[i] = got
 	}
 	lin.HintOffset, lin.HintLength = n[0], n[1]
 	if len(n) == 4 {
