@@ -845,6 +845,136 @@ func TestAnOrdinaryFileIsRefusedByBothChecks(t *testing.T) {
 	}
 }
 
+// ⛔⛔ /S IS REQUIRED AND NOTHING LOOKED AT IT. Table F.2 lists the shared
+// object hint table as "(Required)", and F.3.6 says the primary hint stream's
+// dictionary "shall contain entries giving the position of the beginning of
+// each hint table in the stream". A primary stream naming none passed every
+// other check here: /H's extent was verified against the object that is
+// there, and its dictionary never was.
+//
+// ⛔ THE EDIT IS SAME-WIDTH, /S -> /X, so the stream, its /Length and every
+// offset after it are untouched. The only difference is that the key Table
+// F.2 requires is absent — and /X is a key no part of Annex F defines, which
+// is what a writer that invented its own name would produce.
+func TestAPrimaryHintStreamWithNoSharedObjectTableIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/S 43", "/X 43"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "has no /S") {
+		t.Errorf("it was refused, but not for the missing /S: %v", err)
+	}
+}
+
+// ⛔⛔ AND PRESENCE IS NOT ENOUGH, which the spec says and a presence-only
+// check does not. F.3.6: "the values of all entries in the hint streams'
+// dictionaries shall be direct objects and may contain no indirect object
+// references", the stream Length excepted. /S is a position counted in bytes,
+// so a name — or an indirect reference — is unusable by the reader this
+// format exists for, which has fetched the front of the file and can resolve
+// nothing.
+//
+// `/S 43` -> `/S /x` is the same width, so again only the value changes.
+func TestAPrimaryHintStreamWhoseSharedTablePositionIsNotANumberIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/S 43", "/S /x"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "/S is reader.Name") {
+		t.Errorf("it was refused, but not for /S's type: %v", err)
+	}
+}
+
+// ⛔ A POSITION CANNOT BE NEGATIVE, which review measured passing: `/S -1`
+// was accepted here while qpdf answered "overflow reading bit stream" — a
+// symptom of seeking outside the data rather than a statement about /S.
+//
+// `/S 43` -> `/S -1` is the same width, so again only the value changes.
+func TestANegativeSharedTablePositionIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/S 43", "/S -1"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be negative") {
+		t.Errorf("it was refused, but not for the negative position: %v", err)
+	}
+}
+
+// ⛔⛔ AND EVERY OTHER WRONG KIND, WHICH THE FILE-LEVEL TEST CANNOT REACH.
+// Review measured the gap: narrowing the check to "refuse only a Name" left
+// the suite GREEN, because `/S /x` is the single case a same-width edit of
+// `/S 43` can express. `/S 4.3` is six characters against five, and an
+// indirect reference or an array is longer still — and the hint stream sits
+// AFTER the fixture's padding run, so growing it there moves the object /H
+// points at and the file fails for the wrong reason.
+//
+// ⛔ SO THE FUNCTION IS ASKED DIRECTLY. checkHintStream takes the bytes and
+// the parameters, which is all these cases need: a stream object whose /S is
+// the wrong kind, with /H's extent made consistent from the parse itself so
+// that nothing EARLIER can be what refuses the file. Each case then differs
+// from the accepted one in exactly one thing — the kind of /S.
+func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
+	for _, c := range []struct{ name, s string }{
+		{"a name", "/x"},
+		{"an indirect reference", "9 0 R"},
+		{"an array", "[ 43 ]"},
+		{"a real", "4.3"},
+		{"a string", "(43)"},
+		{"a boolean", "true"},
+		{"null", "null"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			const head = "%PDF-1.7\n"
+			b := []byte(head + "1 0 obj\n<< /S " + c.s + " /Length 0 >>\nstream\n\nendstream\nendobj\n")
+			_, _, n, err := ParseIndirectObject(b[len(head):], nil)
+			if err != nil {
+				t.Fatalf("the fixture itself does not parse: %v", err)
+			}
+			lin := &Linearization{
+				HintOffset: len(head),
+				// From the parse, so the length bound and spans both hold and
+				// cannot be what refuses this.
+				HintLength: n + eolAfter(b, len(head)+n),
+			}
+			err = checkHintStream(b, lin)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("/S as %s was accepted (or refused oddly): %v", c.name, err)
+			}
+			if !strings.Contains(err.Error(), "F.3.6 requires a direct") {
+				t.Errorf("it was refused, but not for /S's kind: %v", err)
+			}
+		})
+	}
+
+	// ⛔ THE CONTROL: the same fixture with an integer /S is ACCEPTED, so the
+	// cases above fail for their kind and not because this hand-built stream
+	// is unacceptable for some other reason.
+	t.Run("an integer is accepted", func(t *testing.T) {
+		const head = "%PDF-1.7\n"
+		b := []byte(head + "1 0 obj\n<< /S 43 /Length 0 >>\nstream\n\nendstream\nendobj\n")
+		_, _, n, err := ParseIndirectObject(b[len(head):], nil)
+		if err != nil {
+			t.Fatalf("the fixture itself does not parse: %v", err)
+		}
+		lin := &Linearization{HintOffset: len(head), HintLength: n + eolAfter(b, len(head)+n)}
+		if err := checkHintStream(b, lin); err != nil {
+			t.Fatalf("an integer /S was refused, so these cases prove nothing: %v", err)
+		}
+	})
+}
+
 // ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative
 // control above was missing. go-pdfkit/reader#40 asks for exactly this before
 // a linearizing writer exists: two judges that have only ever agreed prove

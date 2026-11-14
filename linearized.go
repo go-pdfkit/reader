@@ -340,7 +340,9 @@ func checkFirstPageEnd(b []byte, lin *Linearization) error {
 	// miss because a reader believes it.
 	//
 	// Annex F puts the first-page section at part 3 and the main one at part
-	// 10, so the front section precedes /T. checkMainXref has already
+	// 11 — part 10 is the OVERFLOW hint stream, which this comment had wrong
+	// until F.3.1's layout was read — so the front section precedes /T.
+	// checkMainXref has already
 	// established /T against the file by the time this runs, and this says
 	// nothing about /E, so it still holds when /E is the thing under test.
 	if off >= int64(lin.MainXrefOffset) {
@@ -483,9 +485,63 @@ func checkHintStream(b []byte, lin *Linearization) error {
 		return fmt.Errorf("%w: /H points at byte %d, where no indirect object parses: %v",
 			ErrLinearizationStale, lin.HintOffset, err)
 	}
-	if _, ok := obj.(*Stream); !ok {
+	s, ok := obj.(*Stream)
+	if !ok {
 		return fmt.Errorf("%w: /H points at byte %d, where the object is %T and not a stream",
 			ErrLinearizationStale, lin.HintOffset, obj)
+	}
+	// ⛔⛔ /S IS REQUIRED, AND A WRITER THAT FORGETS IT PASSED EVERYTHING ELSE.
+	// Table F.2 lists the shared object hint table as "(Required)", and F.3.6
+	// says the primary hint stream's dictionary "shall contain entries giving
+	// the position of the beginning of each hint table in the stream". So a
+	// primary stream with no /S names no shared object hint table, and a
+	// reader that fetched the front of the file cannot find one. qpdf reports
+	// it; this checked the stream's extent and never its contents.
+	//
+	// ⛔ ONLY THE PRIMARY. F.3.6 is explicit that "the dictionary of the
+	// overflow hint stream shall not contain these entries", so requiring /S
+	// in checkOverflowHint would refuse exactly the conforming file. The two
+	// halves of /H are not symmetric and this is where they differ.
+	//
+	// ⛔ Presence only, not its value: the page offset table "shall be the
+	// first table in the stream and shall start at offset 0" and has no key at
+	// all, so the positions inside the stream are F.4's question, which this
+	// does not open.
+	sv, ok := s.Dict["S"]
+	if !ok {
+		return fmt.Errorf("%w: the primary hint stream at byte %d has no /S, and Table F.2 "+
+			"makes the shared object hint table required",
+			ErrLinearizationStale, lin.HintOffset)
+	}
+	// ⛔ AND IT MUST BE A DIRECT INTEGER, which presence alone does not say.
+	// F.3.6: "the values of all entries in the hint streams' dictionaries
+	// shall be direct objects and may contain no indirect object references",
+	// the stream Length excepted — and /S is a position counted in bytes, so
+	// an indirect reference or a name is unusable by the very reader this
+	// format exists for, which has fetched the front of the file and cannot
+	// resolve anything. A presence-only check accepts `/S /x`.
+	pos, ok := sv.(Integer)
+	if !ok {
+		return fmt.Errorf("%w: the primary hint stream's /S is %T, and F.3.6 requires a direct "+
+			"integer position for every hint table it names",
+			ErrLinearizationStale, sv)
+	}
+	// ⛔ AND A POSITION CANNOT BE NEGATIVE. F.3.6: the positions "shall be
+	// counted in bytes relative to the beginning of the stream data". Review
+	// measured `/S -1` passing, with qpdf answering "overflow reading bit
+	// stream" — a symptom of seeking outside the data rather than a statement
+	// about /S.
+	//
+	// ⚠ THE UPPER BOUND IS NOT CHECKED, and that is an open limit rather than
+	// an oversight: /S is an offset into the DECODED stream data, so bounding
+	// it means decoding the hint stream — which is the first step of reading
+	// the tables themselves (F.4) and belongs with that work. qpdf reports
+	// "/S (shared object) offset is out of bounds" for `/S 99` here and this
+	// does not. Recorded on #40.
+	if pos < 0 {
+		return fmt.Errorf("%w: the primary hint stream's /S is %d, and a position counted in bytes "+
+			"from the start of the stream data cannot be negative",
+			ErrLinearizationStale, int64(pos))
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the
