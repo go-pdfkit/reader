@@ -870,6 +870,29 @@ func TestAPrimaryHintStreamWithNoSharedObjectTableIsRefused(t *testing.T) {
 	}
 }
 
+// ⛔⛔ AND PRESENCE IS NOT ENOUGH, which the spec says and a presence-only
+// check does not. F.3.6: "the values of all entries in the hint streams'
+// dictionaries shall be direct objects and may contain no indirect object
+// references", the stream Length excepted. /S is a position counted in bytes,
+// so a name — or an indirect reference — is unusable by the reader this
+// format exists for, which has fetched the front of the file and can resolve
+// nothing.
+//
+// `/S 43` -> `/S /x` is the same width, so again only the value changes.
+func TestAPrimaryHintStreamWhoseSharedTablePositionIsNotANumberIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/S 43", "/S /x"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "/S is reader.Name") {
+		t.Errorf("it was refused, but not for /S's type: %v", err)
+	}
+}
+
 // ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative
 // control above was missing. go-pdfkit/reader#40 asks for exactly this before
 // a linearizing writer exists: two judges that have only ever agreed prove

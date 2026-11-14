@@ -507,10 +507,23 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// first table in the stream and shall start at offset 0" and has no key at
 	// all, so the positions inside the stream are F.4's question, which this
 	// does not open.
-	if _, ok := s.Dict["S"]; !ok {
+	sv, ok := s.Dict["S"]
+	if !ok {
 		return fmt.Errorf("%w: the primary hint stream at byte %d has no /S, and Table F.2 "+
 			"makes the shared object hint table required",
 			ErrLinearizationStale, lin.HintOffset)
+	}
+	// ⛔ AND IT MUST BE A DIRECT INTEGER, which presence alone does not say.
+	// F.3.6: "the values of all entries in the hint streams' dictionaries
+	// shall be direct objects and may contain no indirect object references",
+	// the stream Length excepted — and /S is a position counted in bytes, so
+	// an indirect reference or a name is unusable by the very reader this
+	// format exists for, which has fetched the front of the file and cannot
+	// resolve anything. A presence-only check accepts `/S /x`.
+	if _, ok := sv.(Integer); !ok {
+		return fmt.Errorf("%w: the primary hint stream's /S is %T, and F.3.6 requires a direct "+
+			"integer position for every hint table it names",
+			ErrLinearizationStale, sv)
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the
