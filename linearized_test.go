@@ -845,6 +845,58 @@ func TestAnOrdinaryFileIsRefusedByBothChecks(t *testing.T) {
 	}
 }
 
+// ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative
+// control above was missing. go-pdfkit/reader#40 asks for exactly this before
+// a linearizing writer exists: two judges that have only ever agreed prove
+// nothing about either, so the control is that an ordinary file from this
+// package's own writer is refused by BOTH — and qpdf is the one that had not
+// been asked.
+//
+// ⛔⛔ ITS EXIT STATUS IS 0 FOR A FILE IT HAS JUST CALLED NOT LINEARIZED.
+// Measured on qpdf 12.4.2: `qpdf --check` over a plain file prints
+//
+//	File is not linearized
+//
+// and exits 0. A test that read the status would pass against a qpdf that had
+// said nothing at all, or that had failed to open the file — the same vacuity
+// these checks exist to refuse. The TEXT is the verdict.
+func TestQpdfAlsoRefusesAnOrdinaryFileFromThisWriter(t *testing.T) {
+	plain, linear := linearizedFixture(t, 2)
+	qpdf := qpdfOrSkip(t)
+
+	check := func(name string, b []byte) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(qpdf, "--check", p)
+		cmd.Stdin = nil
+		// ⛔ The error is DISCARDED on purpose: qpdf exits 0 for a file it
+		// calls unlinearized and 3 for one it merely warns about, so the
+		// status cannot carry this verdict in either direction.
+		out, _ := cmd.CombinedOutput()
+		got := string(out)
+		// The control's control: qpdf must have actually read the file, or
+		// its silence about linearization would be indistinguishable from
+		// never having opened it.
+		if !strings.Contains(got, "PDF Version:") {
+			t.Fatalf("qpdf did not report on %s at all, so what it does not say proves nothing:\n%s", name, got)
+		}
+		return got
+	}
+
+	if got := check("plain.pdf", plain); !strings.Contains(got, "File is not linearized") {
+		t.Errorf("qpdf did not refuse this writer's ordinary output:\n%s", got)
+	}
+	// ⛔ AND THE PAIR IS WHAT MAKES IT A TEST. Without this, "File is not
+	// linearized" might be a line qpdf prints about every file, and the
+	// negative above would hold against a judge that judges nothing.
+	if got := check("linear.pdf", linear); strings.Contains(got, "File is not linearized") {
+		t.Errorf("qpdf said its OWN linearized output is not linearized, so that phrase decides nothing:\n%s", got)
+	}
+}
+
 // qpdfExtra lets a test ask qpdf for a different kind of linearized file; it
 // is reset by each subtest that sets it.
 var qpdfExtra []string
