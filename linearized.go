@@ -526,22 +526,36 @@ func checkHintStream(b []byte, lin *Linearization) error {
 			"integer position for every hint table it names",
 			ErrLinearizationStale, sv)
 	}
-	// ⛔ AND A POSITION CANNOT BE NEGATIVE. F.3.6: the positions "shall be
-	// counted in bytes relative to the beginning of the stream data". Review
+	// ⛔⛔ AND THE SHARED OBJECT TABLE CANNOT START BEFORE BYTE 36, which is
+	// arithmetic rather than a guess and needs no decoding at all.
+	//
+	// F.3.6: the page offset hint table "shall be the first table in the
+	// stream and shall start at offset 0". Table F.3 gives that table's
+	// header as exactly thirteen items of 32, 32, 16, 32, 16, 32, 16, 32, 16,
+	// 16, 16, 16 and 16 bits = 288 bits = 36 bytes, before a single per-page
+	// entry. So whatever follows it begins at 36 at the very earliest, and /S
+	// names where the shared object table begins.
+	//
+	// ⛔ 36 AND NOT MORE, BECAUSE THE MARGIN WAS MEASURED. Ghostscript emits
+	// /S 38 — two bytes above the floor — against qpdf's 43 for the same
+	// document. A bound picked by eye from qpdf alone would have refused
+	// every Ghostscript file. This also subsumes the negative case: review
 	// measured `/S -1` passing, with qpdf answering "overflow reading bit
-	// stream" — a symptom of seeking outside the data rather than a statement
+	// stream", a symptom of seeking outside the data rather than a statement
 	// about /S.
 	//
-	// ⚠ THE UPPER BOUND IS NOT CHECKED, and that is an open limit rather than
-	// an oversight: /S is an offset into the DECODED stream data, so bounding
-	// it means decoding the hint stream — which is the first step of reading
-	// the tables themselves (F.4) and belongs with that work. qpdf reports
-	// "/S (shared object) offset is out of bounds" for `/S 99` here and this
-	// does not. Recorded on #40.
-	if pos < 0 {
-		return fmt.Errorf("%w: the primary hint stream's /S is %d, and a position counted in bytes "+
-			"from the start of the stream data cannot be negative",
-			ErrLinearizationStale, int64(pos))
+	// ⚠ THE UPPER BOUND IS STILL NOT CHECKED, and that is an open limit with
+	// a reason: /S indexes the DECODED data, so bounding it above means
+	// decoding an attacker's bytes in the cheap path — capped at 1 GiB by
+	// filter.go, which refuses a bomb but is three orders of magnitude more
+	// than any hint stream needs. That wants a size bound derived from /N and
+	// the object count, which wants F.4's layouts. #40 carries the ordering.
+	const pageOffsetHeaderBytes = 36
+	if pos < pageOffsetHeaderBytes {
+		return fmt.Errorf("%w: the primary hint stream's /S is %d, and the shared object table "+
+			"cannot begin before byte %d — the page offset table starts at 0 and its header alone "+
+			"is %d bytes (Table F.3, thirteen items of 288 bits)",
+			ErrLinearizationStale, int64(pos), pageOffsetHeaderBytes, pageOffsetHeaderBytes)
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the

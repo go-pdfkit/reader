@@ -893,23 +893,49 @@ func TestAPrimaryHintStreamWhoseSharedTablePositionIsNotANumberIsRefused(t *test
 	}
 }
 
-// ⛔ A POSITION CANNOT BE NEGATIVE, which review measured passing: `/S -1`
-// was accepted here while qpdf answered "overflow reading bit stream" — a
-// symptom of seeking outside the data rather than a statement about /S.
+// ⛔⛔ THE SHARED OBJECT TABLE CANNOT START BEFORE BYTE 36, and that is
+// arithmetic rather than a guess. F.3.6 puts the page offset hint table first
+// and at offset 0; Table F.3 gives its header as thirteen items totalling 288
+// bits = 36 bytes before a single per-page entry. So /S, which names where the
+// shared object table begins, is at least 36.
 //
-// `/S 43` -> `/S -1` is the same width, so again only the value changes.
-func TestANegativeSharedTablePositionIsRefused(t *testing.T) {
-	b := editedFixturePadded(t, [2]string{"/S 43", "/S -1"})
-	if _, err := Linearized(b); err != nil {
-		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+// ⛔ AND 36 IS THE FLOOR BECAUSE THE MARGIN WAS MEASURED, not eyeballed from
+// qpdf. The three committed fixtures emit:
+//
+//	qpdf, table form     /S 43   (decoded 71 bytes)
+//	qpdf, object streams /S 43   (decoded 71 bytes)
+//	Ghostscript          /S 38   (decoded 67 bytes)
+//
+// Ghostscript is two bytes above the floor. A bound chosen by looking at qpdf
+// alone — 40, say — would have refused every file that tool writes, which is
+// the same trap the /H exclusion walked into before a second producer existed.
+//
+// Both edits are same-width against `/S 43`, so only the value changes.
+func TestASharedTablePositionInsideThePageOffsetHeaderIsRefused(t *testing.T) {
+	for _, to := range []string{"/S -1", "/S 35"} {
+		t.Run(to, func(t *testing.T) {
+			b := editedFixturePadded(t, [2]string{"/S 43", to})
+			if _, err := Linearized(b); err != nil {
+				t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+			}
+			_, err := CheckLinearized(b)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("error is %v, want ErrLinearizationStale", err)
+			}
+			if !strings.Contains(err.Error(), "cannot begin before byte 36") {
+				t.Errorf("it was refused, but not by the page offset header's own size: %v", err)
+			}
+		})
 	}
-	_, err := CheckLinearized(b)
-	if !errors.Is(err, ErrLinearizationStale) {
-		t.Fatalf("error is %v, want ErrLinearizationStale", err)
-	}
-	if !strings.Contains(err.Error(), "cannot be negative") {
-		t.Errorf("it was refused, but not for the negative position: %v", err)
-	}
+
+	// ⛔ AND 36 ITSELF IS ACCEPTED, or the bound would be off by one and no
+	// test above could tell: both refusals assert a message, not a boundary.
+	t.Run("36 is the floor and not past it", func(t *testing.T) {
+		b := editedFixturePadded(t, [2]string{"/S 43", "/S 36"})
+		if _, err := CheckLinearized(b); err != nil && strings.Contains(err.Error(), "cannot begin before") {
+			t.Errorf("36 is the first legal position and was refused: %v", err)
+		}
+	})
 }
 
 // ⛔⛔ AND EVERY OTHER WRONG KIND, WHICH THE FILE-LEVEL TEST CANNOT REACH.
