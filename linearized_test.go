@@ -845,6 +845,31 @@ func TestAnOrdinaryFileIsRefusedByBothChecks(t *testing.T) {
 	}
 }
 
+// ⛔⛔ /S IS REQUIRED AND NOTHING LOOKED AT IT. Table F.2 lists the shared
+// object hint table as "(Required)", and F.3.6 says the primary hint stream's
+// dictionary "shall contain entries giving the position of the beginning of
+// each hint table in the stream". A primary stream naming none passed every
+// other check here: /H's extent was verified against the object that is
+// there, and its dictionary never was.
+//
+// ⛔ THE EDIT IS SAME-WIDTH, /S -> /X, so the stream, its /Length and every
+// offset after it are untouched. The only difference is that the key Table
+// F.2 requires is absent — and /X is a key no part of Annex F defines, which
+// is what a writer that invented its own name would produce.
+func TestAPrimaryHintStreamWithNoSharedObjectTableIsRefused(t *testing.T) {
+	b := editedFixturePadded(t, [2]string{"/S 43", "/X 43"})
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "has no /S") {
+		t.Errorf("it was refused, but not for the missing /S: %v", err)
+	}
+}
+
 // ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative
 // control above was missing. go-pdfkit/reader#40 asks for exactly this before
 // a linearizing writer exists: two judges that have only ever agreed prove

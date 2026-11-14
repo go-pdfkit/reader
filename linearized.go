@@ -340,7 +340,9 @@ func checkFirstPageEnd(b []byte, lin *Linearization) error {
 	// miss because a reader believes it.
 	//
 	// Annex F puts the first-page section at part 3 and the main one at part
-	// 10, so the front section precedes /T. checkMainXref has already
+	// 11 — part 10 is the OVERFLOW hint stream, which this comment had wrong
+	// until F.3.1's layout was read — so the front section precedes /T.
+	// checkMainXref has already
 	// established /T against the file by the time this runs, and this says
 	// nothing about /E, so it still holds when /E is the thing under test.
 	if off >= int64(lin.MainXrefOffset) {
@@ -483,9 +485,32 @@ func checkHintStream(b []byte, lin *Linearization) error {
 		return fmt.Errorf("%w: /H points at byte %d, where no indirect object parses: %v",
 			ErrLinearizationStale, lin.HintOffset, err)
 	}
-	if _, ok := obj.(*Stream); !ok {
+	s, ok := obj.(*Stream)
+	if !ok {
 		return fmt.Errorf("%w: /H points at byte %d, where the object is %T and not a stream",
 			ErrLinearizationStale, lin.HintOffset, obj)
+	}
+	// ⛔⛔ /S IS REQUIRED, AND A WRITER THAT FORGETS IT PASSED EVERYTHING ELSE.
+	// Table F.2 lists the shared object hint table as "(Required)", and F.3.6
+	// says the primary hint stream's dictionary "shall contain entries giving
+	// the position of the beginning of each hint table in the stream". So a
+	// primary stream with no /S names no shared object hint table, and a
+	// reader that fetched the front of the file cannot find one. qpdf reports
+	// it; this checked the stream's extent and never its contents.
+	//
+	// ⛔ ONLY THE PRIMARY. F.3.6 is explicit that "the dictionary of the
+	// overflow hint stream shall not contain these entries", so requiring /S
+	// in checkOverflowHint would refuse exactly the conforming file. The two
+	// halves of /H are not symmetric and this is where they differ.
+	//
+	// ⛔ Presence only, not its value: the page offset table "shall be the
+	// first table in the stream and shall start at offset 0" and has no key at
+	// all, so the positions inside the stream are F.4's question, which this
+	// does not open.
+	if _, ok := s.Dict["S"]; !ok {
+		return fmt.Errorf("%w: the primary hint stream at byte %d has no /S, and Table F.2 "+
+			"makes the shared object hint table required",
+			ErrLinearizationStale, lin.HintOffset)
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the
