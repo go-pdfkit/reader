@@ -544,18 +544,37 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// stream", a symptom of seeking outside the data rather than a statement
 	// about /S.
 	//
-	// ⚠ THE UPPER BOUND IS STILL NOT CHECKED, and that is an open limit with
-	// a reason: /S indexes the DECODED data, so bounding it above means
-	// decoding an attacker's bytes in the cheap path — capped at 1 GiB by
-	// filter.go, which refuses a bomb but is three orders of magnitude more
-	// than any hint stream needs. That wants a size bound derived from /N and
-	// the object count, which wants F.4's layouts. #40 carries the ordering.
 	const pageOffsetHeaderBytes = 36
 	if pos < pageOffsetHeaderBytes {
 		return fmt.Errorf("%w: the primary hint stream's /S is %d, and the shared object table "+
 			"cannot begin before byte %d — the page offset table starts at 0 and its header alone "+
 			"is %d bytes (Table F.3, thirteen items of 288 bits)",
 			ErrLinearizationStale, int64(pos), pageOffsetHeaderBytes, pageOffsetHeaderBytes)
+	}
+	// ⭐ AND THE UPPER BOUND, FOR AN UNFILTERED STREAM, WHICH COSTS NOTHING.
+	// /S indexes the DECODED data, and decoding an attacker's bytes in the
+	// cheap path is what kept this open: filter.go caps expansion at 1 GiB,
+	// which refuses a bomb but is three orders of magnitude past anything a
+	// hint stream needs, so the bound wants a size limit derived from /N and
+	// the object count — F.4 work, ordered on #40.
+	//
+	// ⭐ But a stream with NO FILTER needs no decoding at all: its raw bytes
+	// ARE its data. That case is free, and it is the one that matters most
+	// while a writer is being developed, because an uncompressed hint stream
+	// is what somebody debugging one emits. Ghostscript writes one unfiltered
+	// already, and qpdf does under --compress-streams=n.
+	//
+	// ⛔ ASKED THROUGH filterChain, NOT BY LOOKING FOR THE KEY. /Filter may be
+	// present and Null, or an empty array, both of which mean no filtering;
+	// `_, ok := s.Dict["Filter"]` would call those filtered and skip the one
+	// check they are eligible for. An error from filterChain means the chain
+	// cannot be read, which is not this function's business to report.
+	if names, _, ferr := filterChain(s.Dict, nil); ferr == nil && len(names) == 0 {
+		if int64(pos) >= int64(len(s.Raw)) {
+			return fmt.Errorf("%w: the primary hint stream's /S is %d and its data is %d bytes, "+
+				"so the shared object table starts outside the stream",
+				ErrLinearizationStale, int64(pos), len(s.Raw))
+		}
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the
