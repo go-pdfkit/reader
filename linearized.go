@@ -520,10 +520,28 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// an indirect reference or a name is unusable by the very reader this
 	// format exists for, which has fetched the front of the file and cannot
 	// resolve anything. A presence-only check accepts `/S /x`.
-	if _, ok := sv.(Integer); !ok {
+	pos, ok := sv.(Integer)
+	if !ok {
 		return fmt.Errorf("%w: the primary hint stream's /S is %T, and F.3.6 requires a direct "+
 			"integer position for every hint table it names",
 			ErrLinearizationStale, sv)
+	}
+	// ⛔ AND A POSITION CANNOT BE NEGATIVE. F.3.6: the positions "shall be
+	// counted in bytes relative to the beginning of the stream data". Review
+	// measured `/S -1` passing, with qpdf answering "overflow reading bit
+	// stream" — a symptom of seeking outside the data rather than a statement
+	// about /S.
+	//
+	// ⚠ THE UPPER BOUND IS NOT CHECKED, and that is an open limit rather than
+	// an oversight: /S is an offset into the DECODED stream data, so bounding
+	// it means decoding the hint stream — which is the first step of reading
+	// the tables themselves (F.4) and belongs with that work. qpdf reports
+	// "/S (shared object) offset is out of bounds" for `/S 99` here and this
+	// does not. Recorded on #40.
+	if pos < 0 {
+		return fmt.Errorf("%w: the primary hint stream's /S is %d, and a position counted in bytes "+
+			"from the start of the stream data cannot be negative",
+			ErrLinearizationStale, int64(pos))
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the

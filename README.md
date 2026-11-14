@@ -169,6 +169,18 @@ overflow hint stream shall not contain these entries", so the same
 requirement on the overflow half would refuse exactly the conforming file.
 The two halves of `/H` are not symmetric, and this is where they differ.
 
+`/S` must also be a **direct integer and not negative**: F.3.6 says these
+positions "shall be counted in bytes relative to the beginning of the stream
+data", so a name, an indirect reference or `-1` names no position at all. A
+reader that has fetched only the front of the file can resolve nothing, which
+is the whole point of the format.
+
+⚠ **The upper bound on `/S` is NOT checked, and that is an open limit.** It is
+an offset into the *decoded* stream data, so bounding it means decoding the
+hint stream — which is the first step of reading the tables themselves (F.4)
+and belongs with that work. `qpdf --check` reports `/S (shared object) offset
+is out of bounds` for a `/S` past the data and this does not. Tracked in #40.
+
 ⚠ And `qpdf --check` prints `File is linearized` from the parameter
 dictionary **before** it validates the hint tables, then reports errors after
 it. That line is not qpdf's approval, which matters to anyone reading its
