@@ -26,10 +26,43 @@ jobs:
           check-latest: true
           cache: true
 
+      # ⛔⛔ THE FOREIGN JUDGE HAD NEVER RUN ON ANY LANE. Measured on run
+      # 43595391186: "qpdf" appears ZERO times in the whole log, and this job
+      # reported `ok 0.197s` where the same suite takes 0.758s on a machine
+      # that has qpdf. Every test that agrees with qpdf — the sweep over 42
+      # generated files, and the control that an ordinary file is REFUSED —
+      # skipped, and `go test` without -v says nothing about a skip, so
+      # nothing in the log could have told anyone. Coverage stayed at 100%
+      # the whole time: the same statements are reached by the tests that
+      # need no qpdf, so that gate cannot see this and never could.
+      #
+      # ⛔ This repository already holds the opposite standard one job down,
+      # about a missing qemu emulator: "A lane that reports success for an
+      # architecture it never ran is the one outcome this matrix exists to
+      # rule out."
+      #
+      # aptneed because a mirror outage must not read as a missing judge:
+      # go-pdfkit/ops#90 was four red runs in half an hour on a third
+      # party's DNS. --need is the binary, not the package: apt saying yes is
+      # not qpdf being on PATH.
+      - name: Install qpdf, the foreign judge the linearization tests print by
+        run: |
+          GOBIN=/usr/local/bin go install github.com/go-fleettools/fleettools/cmd/aptneed@latest
+          sudo aptneed --need qpdf qpdf
+
+      # Printed on purpose: the version is in the log, so "which qpdf agreed"
+      # is answerable after the fact rather than assumed.
+      - name: Say which qpdf will judge
+        run: qpdf --version
+
       - name: go vet
         run: go vet ./...
 
+      # REQUIRE_QPDF makes a missing judge FAIL here instead of skipping. It
+      # is set on this lane only, because this is the lane that installs it.
       - name: Test with coverage
+        env:
+          REQUIRE_QPDF: "1"
         run: go test -covermode=set -coverprofile=coverage.out ./...
 
       - name: Assert exact 100% statement coverage
