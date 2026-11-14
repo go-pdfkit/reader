@@ -938,6 +938,73 @@ func TestASharedTablePositionInsideThePageOffsetHeaderIsRefused(t *testing.T) {
 	})
 }
 
+// editedGS is editedFixture for the Ghostscript file. No padding arithmetic:
+// every edit here is same-width by construction, which the helper asserts, so
+// nothing in the file moves.
+func editedGS(t *testing.T, from, to string) []byte {
+	t.Helper()
+	if len(from) != len(to) {
+		t.Fatalf("%q and %q are not the same width, so this edit would move the file", from, to)
+	}
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if n := strings.Count(s, from); n != 1 {
+		t.Fatalf("%q appears %d times, so this edit is not the one it is named for", from, n)
+	}
+	return []byte(strings.Replace(s, from, to, 1))
+}
+
+// ⭐ THE UPPER BOUND ON /S, WHERE IT COSTS NOTHING. /S indexes the decoded
+// data, so bounding it above normally means decoding an attacker's bytes — the
+// reason it stayed open. But a stream with NO FILTER needs no decoding: its
+// raw bytes are its data.
+//
+// ⭐ GHOSTSCRIPT WRITES ONE UNFILTERED, which is why this is testable at all:
+// `<< /Length 67 /S 38 >>`, no /Filter, so the data is 67 bytes and /S 38 sits
+// inside it. qpdf's two fixtures are FlateDecode and are skipped by this
+// check, which is exactly the asymmetry being tested.
+//
+// ⛔ And it is the case that matters most while a writer is being developed,
+// since an uncompressed hint stream is what somebody debugging one emits.
+func TestASharedTablePositionOutsideAnUnfilteredStreamIsRefused(t *testing.T) {
+	// 99 >= 67, so the table would start past the end of the stream's data.
+	//
+	// ⛔ The anchor is `38>>` and not `/S 38`, because Ghostscript writes its
+	// integers space-padded — `<</Length         67\n/S         38>>` — which
+	// is the fixed-width placeholder technique a two-pass linearizing writer
+	// needs for /L, /H, /E and /T. Guessing the spacing is how the first
+	// version of this test failed, and the helper's uniqueness check is what
+	// said so.
+	b := editedGS(t, "38>>", "99>>")
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "starts outside the stream") {
+		t.Errorf("it was refused, but not for /S being past the data: %v", err)
+	}
+}
+
+// ⛔ AND THE CONTROL THAT KEEPS THE ABOVE HONEST: the same fixture untouched
+// is accepted, so the refusal is about the edit and not about this checker
+// disliking Ghostscript's output — which it does not, and #43 depends on it
+// not doing so.
+func TestTheUnfilteredFixtureItselfIsAccepted(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckLinearized(b); err != nil {
+		t.Fatalf("the Ghostscript fixture was refused: %v", err)
+	}
+}
+
 // ⛔⛔ AND EVERY OTHER WRONG KIND, WHICH THE FILE-LEVEL TEST CANNOT REACH.
 // Review measured the gap: narrowing the check to "refuse only a Name" left
 // the suite GREEN, because `/S /x` is the single case a same-width edit of
@@ -962,19 +1029,8 @@ func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
 		{"null", "null"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			const head = "%PDF-1.7\n"
-			b := []byte(head + "1 0 obj\n<< /S " + c.s + " /Length 0 >>\nstream\n\nendstream\nendobj\n")
-			_, _, n, err := ParseIndirectObject(b[len(head):], nil)
-			if err != nil {
-				t.Fatalf("the fixture itself does not parse: %v", err)
-			}
-			lin := &Linearization{
-				HintOffset: len(head),
-				// From the parse, so the length bound and spans both hold and
-				// cannot be what refuses this.
-				HintLength: n + eolAfter(b, len(head)+n),
-			}
-			err = checkHintStream(b, lin)
+			b, lin := hintFixture(t, c.s)
+			err := checkHintStream(b, lin)
 			if !errors.Is(err, ErrLinearizationStale) {
 				t.Fatalf("/S as %s was accepted (or refused oddly): %v", c.name, err)
 			}
@@ -987,18 +1043,41 @@ func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
 	// ⛔ THE CONTROL: the same fixture with an integer /S is ACCEPTED, so the
 	// cases above fail for their kind and not because this hand-built stream
 	// is unacceptable for some other reason.
+	//
+	// ⭐ AND IT EARNED ITS KEEP IMMEDIATELY. The first version of this fixture
+	// carried `/Length 0` and no data, so when the unfiltered upper bound on
+	// /S arrived, this control went red — /S 43 does point outside zero bytes.
+	// The check was right and the fixture was not; without the control the
+	// seven cases above would have gone on passing for the wrong reason.
 	t.Run("an integer is accepted", func(t *testing.T) {
-		const head = "%PDF-1.7\n"
-		b := []byte(head + "1 0 obj\n<< /S 43 /Length 0 >>\nstream\n\nendstream\nendobj\n")
-		_, _, n, err := ParseIndirectObject(b[len(head):], nil)
-		if err != nil {
-			t.Fatalf("the fixture itself does not parse: %v", err)
-		}
-		lin := &Linearization{HintOffset: len(head), HintLength: n + eolAfter(b, len(head)+n)}
+		b, lin := hintFixture(t, "43")
 		if err := checkHintStream(b, lin); err != nil {
 			t.Fatalf("an integer /S was refused, so these cases prove nothing: %v", err)
 		}
 	})
+}
+
+// hintFixture builds a minimal unfiltered hint stream whose /S is the given
+// spelling, with /H's extent taken FROM THE PARSE so that nothing earlier in
+// checkHintStream can be what refuses it.
+//
+// ⛔ The data is 64 bytes because /S 43 has to be INSIDE it. An empty stream
+// made the control above fail the moment the upper bound existed, which is
+// the fixture being unrealistic rather than the bound being wrong: a shared
+// object table cannot start at byte 43 of nothing.
+func hintFixture(t *testing.T, s string) ([]byte, *Linearization) {
+	t.Helper()
+	const head = "%PDF-1.7\n"
+	data := strings.Repeat("h", 64)
+	b := []byte(head + "1 0 obj\n<< /S " + s + " /Length 64 >>\nstream\n" + data + "\nendstream\nendobj\n")
+	_, _, n, err := ParseIndirectObject(b[len(head):], nil)
+	if err != nil {
+		t.Fatalf("the fixture itself does not parse: %v", err)
+	}
+	return b, &Linearization{
+		HintOffset: len(head),
+		HintLength: n + eolAfter(b, len(head)+n),
+	}
 }
 
 // ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative
