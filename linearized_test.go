@@ -938,10 +938,43 @@ func TestCheckLinearizedAgreesWithQpdfAcrossPageCountsAndShapes(t *testing.T) {
 	}
 }
 
+// qpdfOrSkip finds the foreign judge, and REFUSES TO SKIP IT UNDER CI.
+//
+// ⛔⛔ IT SKIPPED EVERYWHERE, AND NOWHERE MORE QUIETLY THAN IN CI. Measured on
+// run 43595391186: the word "qpdf" appears ZERO times in the whole log, and
+// the suite reports `ok 0.197s` where the same suite takes 0.758s on a
+// workstation that has qpdf. Every test that agrees with qpdf — the sweep
+// across 42 generated files, and the negative control that an ordinary file
+// is refused — has never run on any lane, and `go test` without -v prints
+// nothing about a skip, so the log could not say so either. Coverage stayed
+// at 100% throughout, because the same statements are reached by the tests
+// that need no qpdf: that gate cannot see this and never could.
+//
+// ⛔ THIS REPOSITORY ALREADY HOLDS THE OPPOSITE STANDARD, one job away. Of a
+// missing qemu emulator its own workflow says: "A missing emulator FAILS this
+// lane. A lane that reports success for an architecture it never ran is the
+// one outcome this matrix exists to rule out." A missing foreign judge is the
+// same outcome for a different reason, and go-pdfkit/ops already does this
+// for pdftoppm — its render tests t.Fatal when CI is set.
+//
+// ⛔ IT KEYS ON REQUIRE_QPDF AND NOT ON CI, because not every lane CAN run it
+// and a rule that demands the impossible gets deleted. Under qemu-user the
+// test binary is emulated and an `execve` of the host's x86-64 qpdf is not
+// something the emulator can carry out; the Windows lane has no apt. So ONE
+// lane installs qpdf and sets REQUIRE_QPDF, and on that lane a missing judge
+// is a failure. The others skip, which is now a stated design rather than an
+// accident nobody could see.
+//
+// Off CI it skips too: a contributor without qpdf should be able to run the
+// suite, and that skip is visible to them because they chose it.
 func qpdfOrSkip(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("qpdf")
 	if err != nil {
+		if os.Getenv("REQUIRE_QPDF") != "" {
+			t.Fatal("REQUIRE_QPDF is set and qpdf is not installed: the foreign judge is the whole " +
+				"point of this test, and a lane that skips it reports success for an agreement it never checked")
+		}
 		t.Skip("qpdf is not installed, so there is no independent linearizer to agree with")
 	}
 	return path
