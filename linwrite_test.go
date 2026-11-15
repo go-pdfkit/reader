@@ -139,6 +139,61 @@ func TestTheParameterObjectIsAlwaysTheReservedWidth(t *testing.T) {
 	t.Logf("the widest possible parameter object is %d bytes of %d reserved", used, paramSpan)
 }
 
+// ⛔⛔ AND THE DICTIONARY IS READ BACK, which the tests above do not do: they
+// assert its LENGTH and its padding and never that it is a dictionary at all.
+// A formatting error — a missing space before `>>`, the wrong bracket spacing
+// in /H, a key this package's own lexer will not take — produces an object of
+// exactly the right width that no reader accepts, and every assertion above
+// would still pass.
+//
+// ⛔ Linearized() is the judge here and it is MY OWN reader, so this is a round
+// trip and not a foreign witness. It is worth having anyway: it is the reader
+// every other test in this package trusts, and a dictionary it rejects could
+// not possibly be right. The foreign judge for the writer is qpdf --check, and
+// that arrives with the emission, which this PR does not add.
+func TestTheParameterObjectIsADictionaryThisPackageCanRead(t *testing.T) {
+	p := linParams{L: 1367, H0: 550, H1: 127, O: 7, E: 902, N: 2, T: 1169}
+	obj, err := p.object(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A file is a header, the parameter object, and enough of a tail that
+	// Linearized can find /L's claim about the length. /L must equal the
+	// file's real length, so the tail is padded to make it so.
+	head := "%PDF-1.7\n"
+	file := append([]byte(head), obj...)
+	if int64(len(file)) > p.L {
+		t.Fatalf("the header and parameter object are %d bytes and /L claims %d, so this "+
+			"fixture cannot be built", len(file), p.L)
+	}
+	file = append(file, bytes.Repeat([]byte{'\n'}, int(p.L)-len(file))...)
+
+	lin, err := Linearized(file)
+	if err != nil {
+		t.Fatalf("this package cannot read the dictionary it just wrote: %v", err)
+	}
+
+	// ⛔ EVERY VALUE, because a reader that silently dropped one would leave
+	// the others agreeing and the test green.
+	for _, c := range []struct {
+		name      string
+		got, want int
+	}{
+		{"/L", lin.FileLength, int(p.L)},
+		{"/H's offset", lin.HintOffset, int(p.H0)},
+		{"/H's length", lin.HintLength, int(p.H1)},
+		{"/O", lin.FirstPageObject, int(p.O)},
+		{"/E", lin.FirstPageEnd, int(p.E)},
+		{"/N", lin.PageCount, int(p.N)},
+		{"/T", lin.MainXrefOffset, int(p.T)},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s read back as %d, written as %d", c.name, c.got, c.want)
+		}
+	}
+}
+
 // ⛔⛔ AND A DICTIONARY THAT WILL NOT FIT IS REFUSED, NOT TRUNCATED. One byte
 // too long does not give a broken dictionary: it gives a file where every
 // offset after part 2 is one byte further along than /E, /T and the first-page
