@@ -250,11 +250,23 @@ func (d *Document) Partition() (*Partition, error) {
 	//	5 pages, page 2: ours [1 2 15] = 3 objects, qpdf says 2
 	//	25 pages, page 2: ours [1 2 55] = 3 objects, qpdf says 2
 	//
-	// The extra number is the same on every page of a document — 15 in one, 55
-	// in the other — because it is a SHARED object, which F.3.9 puts in part 8.
-	// Item 1 counts the page's own objects; a shared one reaches the page
-	// through items 3, 4 and 5 instead, and counting it twice would make every
-	// page claim an object the layout places elsewhere.
+	// ⛔⛔⛔ AND THE REASON FIRST WRITTEN HERE WAS INVENTED. It said the extra
+	// number "is a SHARED object, which F.3.9 puts in part 8". Measured: in the
+	// five-page fixture object 15 is in PART 6 and part 8 holds ZERO objects;
+	// in the twenty-five-page one object 55 is likewise part 6, part 8 again
+	// empty. Part 8 cannot be why qpdf excluded it.
+	//
+	// What it actually is: a part-6 object THE FIRST PAGE ALSO REACHES, which
+	// qpdf hands to page 2 as a first-page shared entry — nshared 1,
+	// identifier [2]. So item 1 counts the objects private to the page, and an
+	// object already placed in part 6 arrives through items 3, 4 and 5 instead.
+	// Counting it in both places would make every page claim an object the
+	// layout puts at the front.
+	//
+	// ⛔ The filter below is unchanged and still right, because object 15 is
+	// part 6 and pages after the first want part 7. Only the explanation was
+	// wrong — which is the harder failure to catch: the rule passed every test
+	// while the comment taught the next reader something false.
 	//
 	// ⛔ SO THE FILTER IS `of`, AND IT HAS TO RUN HERE rather than in the loop
 	// above: part 4 and the part 9 sweep are decided after it, so an object's

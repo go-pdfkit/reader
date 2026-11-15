@@ -239,15 +239,64 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 // the byte comparisons elsewhere in this package — and it is still the only
 // outside witness for this quantity. Said plainly rather than implied.
 func TestThePerPageObjectCountsAgreeWithQpdf(t *testing.T) {
-	for _, pages := range []int{1, 2, 5, 25} {
-		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+	// ⛔⛔ TWELVE SHAPES, NOT FOUR. The first version used only plain documents
+	// of 1, 2, 5 and 25 pages, all of the same trivial form — one object the
+	// first page also reaches, two private objects per page. Review ran eight
+	// more looking for a counterexample to the part filter and found none, so
+	// they are rows here rather than a claim in a commit message:
+	//
+	//	sharedResourceFixture 3p/2f, 10p/4f, 25p/8f — the first page shares the
+	//	  dictionary too, so part 8 stays EMPTY and part 6 grows to 6, 8 and 12
+	//	linearized-shared.pdf — a real part 8, which none of the others have
+	//	linearized-objstm.pdf, and generated object streams at 2 and 5 pages —
+	//	  compressed objects, which the per-page table also has to account for
+	for _, c := range []struct {
+		pages, fonts int
+		fixture      string
+		extra        []string
+		name         string
+	}{
+		{pages: 1}, {pages: 2}, {pages: 5}, {pages: 25},
+		{pages: 3, fonts: 2}, {pages: 10, fonts: 4}, {pages: 25, fonts: 8},
+		{fixture: "linearized.pdf"},
+		{fixture: "linearized-shared.pdf"},
+		{fixture: "linearized-objstm.pdf"},
+		{pages: 2, extra: []string{"--object-streams=generate"}, name: "2 pages in object streams"},
+		{pages: 5, extra: []string{"--object-streams=generate"}, name: "5 pages in object streams"},
+	} {
+		name := c.name
+		if name == "" {
+			name = fmt.Sprintf("%d pages %d fonts", c.pages, c.fonts)
+			if c.fixture != "" {
+				name = c.fixture
+			}
+		}
+		t.Run(name, func(t *testing.T) {
 			qpdf := qpdfOrSkip(t)
-			_, linear := linearizedFixture(t, pages)
+			if c.extra != nil {
+				qpdfExtra = c.extra
+				defer func() { qpdfExtra = nil }()
+			}
+
+			var linear []byte
+			switch {
+			case c.fixture != "":
+				b, err := os.ReadFile(filepath.Join("testdata", c.fixture))
+				if err != nil {
+					t.Fatal(err)
+				}
+				linear = b
+			case c.fonts == 0:
+				_, linear = linearizedFixture(t, c.pages)
+			default:
+				_, linear = sharedResourceFixture(t, c.pages, c.fonts)
+			}
 
 			d, err := Open(linear)
 			if err != nil {
 				t.Fatal(err)
 			}
+			pages := len(d.pageRefs())
 			p, err := d.Partition()
 			if err != nil {
 				t.Fatal(err)
@@ -274,9 +323,9 @@ func TestThePerPageObjectCountsAgreeWithQpdf(t *testing.T) {
 				}
 			}
 
-			// ⛔ AND THE SETS ARE SORTED AND HOLD THE PAGE'S OWN OBJECT, which
-			// the count cannot show. A writer emitting in map order would give
-			// a different file every run from the same input.
+			// ⛔ AND THE SETS ARE SORTED, which the count cannot show. A writer
+			// emitting in map order would give different bytes every run from
+			// the same input.
 			for i, set := range p.Pages {
 				if len(set) == 0 {
 					t.Errorf("page %d has no objects at all", i+1)
@@ -289,17 +338,84 @@ func TestThePerPageObjectCountsAgreeWithQpdf(t *testing.T) {
 					}
 				}
 			}
-			own := false
-			for _, num := range p.Pages[0] {
-				if num == p.FirstPageObject {
-					own = true
-				}
-			}
-			if !own {
-				t.Errorf("the first page's set %v does not hold its own object %d, and Table "+
-					"F.4 item 1 counts it", p.Pages[0], p.FirstPageObject)
-			}
+			assertPerPageInvariants(t, d, p)
 		})
+	}
+}
+
+// assertPerPageInvariants checks the three properties qpdf cannot judge.
+//
+// ⛔⛔⛔ THE COUNT IS WEAKER THAN I ADMITTED, AND REVIEW MEASURED HOW MUCH. I
+// wrote that two different sets of the same size would agree. Worse than that:
+// on every fixture the cardinalities are UNIFORM — page one is all of part 6,
+// every other page is exactly 2 (its page object and its content stream) — and
+// the union of the sets is exactly parts 6 and 7 (11 of 11 objects, 51 of 51).
+// So SWAPPING two pages' private objects keeps every count correct and passes.
+//
+// ⛔ And qpdf publishes nothing per-page that attributes a part-7 object to a
+// page, so that judge cannot pin membership EVEN IN PRINCIPLE. It is not a
+// matter of reading more of its output.
+//
+// ⭐ These three hold today, need no qpdf, and a swap breaks all three:
+// every page holds its own object, the sets are pairwise disjoint, and their
+// union is exactly the part-6 and part-7 objects. Review proposed them; they
+// are the attribution evidence the count cannot give.
+func assertPerPageInvariants(t *testing.T, d *Document, p *Partition) {
+	t.Helper()
+
+	pages := d.pageRefs()
+	if len(pages) != len(p.Pages) {
+		t.Fatalf("the document has %d page(s) and Pages holds %d", len(pages), len(p.Pages))
+	}
+
+	// 1. Every page holds its own object. ⛔ EVERY page: an earlier version of
+	// this test checked only Pages[0] while its comment claimed otherwise.
+	for i, set := range p.Pages {
+		own := false
+		for _, num := range set {
+			if num == pages[i].Num {
+				own = true
+			}
+		}
+		if !own {
+			t.Errorf("page %d's set %v does not hold its own object %d, and Table F.4 item 1 "+
+				"counts it", i+1, set, pages[i].Num)
+		}
+	}
+
+	// 2. Pairwise disjoint: a private object belongs to one page by definition,
+	// and an object in two sets would be written once and counted twice.
+	owner := map[int]int{}
+	for i, set := range p.Pages {
+		for _, num := range set {
+			if prev, dup := owner[num]; dup {
+				t.Errorf("object %d is in both page %d's set and page %d's, so it is not "+
+					"private to either", num, prev+1, i+1)
+				continue
+			}
+			owner[num] = i
+		}
+	}
+
+	// 3. The union is exactly parts 6 and 7. ⛔ BOTH DIRECTIONS: a missing
+	// object means a page under-reports item 1, and an extra one means a part
+	// 4, 8 or 9 object is being claimed by a page that does not own it.
+	want := map[int]bool{}
+	for num, part := range p.Of {
+		if part == PartFirstPage || part == PartOtherPrivate {
+			want[num] = true
+		}
+	}
+	for num := range want {
+		if _, ok := owner[num]; !ok {
+			t.Errorf("object %d is in %v and no page's set holds it", num, p.Of[num])
+		}
+	}
+	for num := range owner {
+		if !want[num] {
+			t.Errorf("object %d is in a page's set and its part is %v, which no page owns",
+				num, p.Of[num])
+		}
 	}
 }
 
