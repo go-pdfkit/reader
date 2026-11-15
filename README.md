@@ -457,10 +457,75 @@ shapes green. It was found by mutation and is now held by a test of its own.
 fixtures give every page its own resources. So F.3.9's whole subject is held by
 a hand-built document rather than by the sweep.
 
-⛔ **Reading and partitioning is all it does — there is no linearizing writer
-yet.** The checker came first on purpose: a writer cannot be trusted without
-one. What remains for #40 is the hint tables (F.4), the layout and the
-two-pass fixpoint for `/L`, `/H`, `/E` and `/T`.
+### Inside the hint tables (F.4), where the parameter checks could not go
+
+The page offset hint table's header — Table F.3's thirteen items — is decoded
+now, which is the first time this package reads the index a reader would
+actually fetch by rather than the numbers at the front of the file. That is the
+gap #40 named: "a file can pass this and still have hint tables that send a
+reader to the wrong offset."
+
+⭐ **It has the best judge in the arc.** `qpdf --show-linearization` prints every
+field of the decoded table by name, so all thirteen items are compared against
+the reference implementation's reading of the same bytes — across 1/2/5/25
+pages × plain, object-streams and uncompressed-streams. Twelve shapes, and a
+field left out of that comparison is a field nothing checks.
+
+⛔⛔ **Every item is bit-aligned, not byte-aligned**, which is why there is a bit
+reader rather than `encoding/binary`. Table F.3's header happens to be whole
+bytes, but Table F.4's per-page items take their widths *from* that header —
+"See Table F.3, item 3" — and those are any value in 0–32. A two-page document
+with `nbits_delta_nobjects` of 1 writes one bit per page, so page two's entry
+begins mid-byte. Reading such a table a byte at a time gives numbers that look
+plausible and are wrong, which is the worst failure available here.
+
+⛔ A width of 0 is legal and means 0, which F.4.1 requires rather than
+permits: qpdf writes `nbits_delta_nobjects: 0` for the one-page fixtures.
+
+⛔⛔ **And a 16-bit field can hold a number that is not a width.** F.4.1 bounds
+every bit count to 0–32 but has them stored as 16-bit numbers, so the field can
+say 65535 — and a reader that believed it would consume 65535 bits of whatever
+followed and report the result as a page's object count. All seven width items
+are refused above 32, before any of them is used. Not hypothetical: the
+Ghostscript fixture writes 65536 into the *other* table's `min_group_length`,
+which is `0x10000` and plainly a placeholder nobody filled in.
+
+⚠ **None of this is exported yet, deliberately.** The decoder is reached only
+from inside the package, so an exported `HintTables` or `PageOffsetHeader`
+would be a name no caller could obtain a value of — surface that exists to be
+renamed later. When `CheckLinearized` consults the tables, exporting them is a
+deliberate change with a caller to justify each name.
+
+⛔⛔ **Item 2 is not the offset it looks like.** The table stores the first
+page's location computed **as if the primary hint stream were not there** —
+Table F.4 item 2 says it outright, "a conforming product shall skip over the
+primary hint stream, wherever it is located" — so the effective offset adds the
+hint stream's length when it lies at or before that point. Measured across all
+twelve shapes: the stored value equals `/H`'s own offset and qpdf reports
+stored + `/H`'s length, exactly.
+
+| producer | stored | `/H` | qpdf reports |
+|---|---|---|---|
+| qpdf, 2 pages | 550 | `[550 127]` | **677** |
+| qpdf, 25 pages (objstm) | 613 | `[613 141]` | **754** |
+| Ghostscript | 577 | `[829 138]` | **577** — unadjusted |
+
+⚠ **Only a second producer could show that the condition is needed.** Ghostscript
+puts `/H` *after* the first page, so no length is added — and adding it
+unconditionally agrees with all twelve qpdf shapes and is wrong about every
+Ghostscript file. Measured: that mutation reddens exactly one test, the
+Ghostscript one.
+
+⚠ Decoding the hint stream is the cost the `/S` upper bound declined to pay, and
+it is paid here because reading the tables *is* the purpose. The expansion cap
+in `filter.go` bounds it.
+
+⛔ **Reading, partitioning and the page offset header is all it does — there is
+no linearizing writer yet.** The checker came first on purpose: a writer cannot
+be trusted without one. What remains for #40 is the per-page entries (Table
+F.4), the shared object hint table (F.4.2), the layout, and the two-pass
+fixpoint for `/L`, `/H`, `/E` and `/T`. `CheckLinearized` does not yet consult
+any of this, so the Ghostscript fixture is still accepted.
 
 Next wave: the operations built on all of this.
 
