@@ -326,6 +326,28 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 // isHintObject says whether an object at this offset is one of the hint
 // streams /H names, and so is not a first-page object whose end could be /E.
 //
+// ⛔⛔ THE SKIP IS LOAD-BEARING ON THREE OF THE FOUR FIXTURES, which corrects a
+// claim this arc recorded in the other direction — "belt-and-braces today,
+// because the hint stream's number falls outside 1..firstPageCount". That is
+// true of OUR output and false of every other file in the corpus. Measured over
+// testdata:
+//
+//	linearized.pdf        /H at 550 is object  6; front section 4..9   IN
+//	linearized-shared.pdf /H at 530 is object  9; front section 7..11  IN
+//	linearized-gs.pdf     /H at 829 is object 12; front section 7..12  IN
+//	our own Linearize     /H at 579 is object  8; front section 1..3    OUT
+//
+// All three foreign producers list the primary hint stream in the first-page
+// cross-reference section; this writer is the only one that does not. So this
+// function is why checkFirstPageEnd works on their files, not a precaution.
+//
+// ⛔ AND /E DOES NOT DEPEND ON OUR LAYOUT KEEPING IT OUT. The skip handles both
+// sides, exercised by three real files, so nothing here constrains where the
+// hint stream may go. When the real tables land, putting it INSIDE the front
+// section — as all three producers do, since a reader fetching only the front
+// needs an xref entry for it unless it trusts /H alone — is a layout decision to
+// make deliberately, not a constraint inherited from this checker.
+//
 // ⛔⛔ IT IS A FUNCTION SO THAT THE SECOND HALF CAN BE TESTED AT ALL. The
 // primary hint stream is reachable from a committed file — Ghostscript puts
 // it at /E — but the OVERFLOW stream is not: it needs a four-entry /H whose
