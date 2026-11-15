@@ -482,6 +482,51 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 				"file has", errHintTable, i+1, pages, n, maxObjects)
 		}
 	}
+	// ⛔⛔⛔ AND THE BUDGET IN BYTES, which the two bit bounds do NOT provide.
+	// "total ≤ bits remaining" is literally true and useless: one reference per
+	// BIT at eight bytes each IS 64 bytes per input byte, so the
+	// proportionality constant is the amplification. Review measured it,
+	// accepted, on the code as first pushed:
+	//
+	//	4096 pages, 4096 objects, 16 380 000 references, widths 13/0/0
+	//	128.1 MiB allocated from a 2 MiB stream = 64x, no error
+	//
+	// The page ceiling above closes the 176x term; this is the 32x term #56 was
+	// actually filed about, and it needs only a 4096-object document.
+	//
+	// ⛔ THE FIGURE IS MEASURED, NOT CHOSEN, which is what this bound's own
+	// lesson demands — a resource bound stated in the resource. References per
+	// byte of decoded hint stream, over every fixture here including documents
+	// whose pages share a /Resources dictionary:
+	//
+	//	entry bytes per stream byte   0.6x  1.2x  3.1x  6.6x  9.4x  10.3x  11.2x
+	//	references per stream byte    0.00  0.01  0.05  0.43  0.67   0.85   0.85
+	//	the bomb above                                                     7.80
+	//
+	// ⛔⛔ AND THE TWO RATIOS ABOVE ARE NOT THE SAME NUMBER, which cost this
+	// comment a wrong sentence that a mutation caught. Entry BYTES per stream
+	// byte reach 11.2x; REFERENCES per stream byte reach 0.85. An earlier
+	// version of this note said "one reference per stream byte would refuse
+	// real files" — it would not, 0.85 < 1. Setting the budget to 1 and running
+	// the suite leaves the real-document cases GREEN, which is how the slip
+	// surfaced.
+	//
+	// ⚠ What review actually proposed was `total*8 > len(r.b)`, which is 0.125
+	// references per byte, and THAT does refuse real files — 0.85 is nearly
+	// seven times it. So the shape of the bound was right and the constant was
+	// not.
+	//
+	// Four is chosen over 1 for headroom: 4.7x above the measured maximum for
+	// real documents and 2x below the bomb's 7.8. One would work today with
+	// 18% margin, which is too little for a number nobody will re-measure.
+	// This is an empirical budget with both ends measured, not an invariant,
+	// and it is written here as such.
+	const sharedRefsPerStreamByte = 4
+	if budget := int64(len(r.b)) * sharedRefsPerStreamByte; total > budget {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s), which would "+
+			"hold %d bytes of entries from a %d-byte hint stream, and this reader allows %d "+
+			"reference(s) per stream byte", errHintTable, total, total*8, len(r.b), budget/int64(len(r.b)))
+	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
 			"bits remain, so most of them describe nothing",

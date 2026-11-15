@@ -1381,6 +1381,82 @@ func TestOnePagesSharedReferencesCannotExceedTheDocumentsObjects(t *testing.T) {
 		t.Errorf("a document of %d objects was still refused by the object cap: %v",
 			manyObjects, err)
 	}
+
+	// ⛔⛔ AND THE BOUNDARY ITSELF, both sides, which review noted a `>=` mutant
+	// would otherwise survive. The count is 200, so 200 objects is exactly
+	// enough and 199 is one short. Testing only the far side of a comparison
+	// leaves its edge free to move.
+	if _, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, 200); err != nil &&
+		strings.Contains(err.Error(), "more objects than the file has") {
+		t.Errorf("a count of 200 against exactly 200 objects was refused: %v", err)
+	}
+	_, err = readPageEntries(&bits{b: b}, entriesHeader(), 2, 199)
+	if !errors.Is(err, errHintTable) ||
+		!strings.Contains(err.Error(), "more objects than the file has") {
+		t.Errorf("a count of 200 against 199 objects was not refused by the object cap: %v", err)
+	}
+}
+
+// ⛔⛔⛔ THE 64x THAT SURVIVED THE OBJECT CEILINGS, which review measured and
+// which the per-page bound alone does not stop. maxObjects² is reachable from a
+// small stream: with 4096 pages in a 4096-object document, each page's count of
+// 4000 passes `counts[i] <= maxObjects`, and the identifier and numerator
+// widths of 0 make the bit-cost bound vacuous.
+//
+// ⭐ Measured by review on the code as first pushed: 16 380 000 references
+// ACCEPTED, 128.1 MiB allocated from a 2 MiB stream, no error. The page ceiling
+// closes the 176x term and this is the 32x term #56 was filed about — so
+// "Closes #56" was an overstatement until the byte budget landed.
+func TestTheReferenceTotalIsBudgetedInBytesNotBits(t *testing.T) {
+	const (
+		pages   = 4096
+		perPage = 4000
+		stream  = 2 << 20
+	)
+	h := &pageOffsetHeader{
+		NBitsNSharedObjects:  13, // 4000 fits thirteen bits
+		NBitsSharedIdent:     0,  // so the bit-cost bound is vacuous
+		NBitsSharedNumerator: 0,
+	}
+
+	// Group (c) is thirteen bits per page. Page one must be 0; every other
+	// page gets 4000, written big-endian into the bit stream by hand.
+	w := &bitw{}
+	w.push(13, 0)
+	for i := 1; i < pages; i++ {
+		w.push(13, perPage)
+	}
+	b := w.bytes()
+	if len(b) < stream {
+		b = append(b, make([]byte, stream-len(b))...)
+	}
+
+	_, err := readPageEntries(&bits{b: b}, h, pages, pages)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("%d references from a %d-byte stream were accepted: %v",
+			(pages-1)*perPage, len(b), err)
+	}
+	if !strings.Contains(err.Error(), "reference(s) per stream byte") {
+		t.Errorf("it was refused, but not by the byte budget: %v", err)
+	}
+
+	// ⛔ THE CONTROL: the same shape with few enough references per stream byte
+	// passes the budget, so the refusal is about the ratio and not about the
+	// table. Four per byte is the budget, so two per byte must be allowed.
+	w = &bitw{}
+	small := len(b) * 2 / pages
+	w.push(13, 0)
+	for i := 1; i < pages; i++ {
+		w.push(13, uint32(small))
+	}
+	c := w.bytes()
+	if len(c) < stream {
+		c = append(c, make([]byte, stream-len(c))...)
+	}
+	if _, err := readPageEntries(&bits{b: c}, h, pages, pages); err != nil &&
+		strings.Contains(err.Error(), "per stream byte") {
+		t.Errorf("two references per stream byte were refused by the budget: %v", err)
+	}
 }
 
 // ⛔⛔⛔ AND THE SAME THING ON REAL QPDF OUTPUT, which is what the suite could
@@ -1690,19 +1766,36 @@ func TestSharedReferencesThatCannotFitAreRefusedBeforeBeingRead(t *testing.T) {
 	// which bounded the bit cost alone and so passed anything when that cost
 	// was nought. The second bounds the bit cost, for counts small enough to
 	// be plausible and still too expensive.
+	// ⛔⛔ THE SIZES ARE CHOSEN SO THAT THE INTENDED BOUND IS THE ONE THAT
+	// FIRES, and that took arithmetic once the byte budget was added. The
+	// budget allows 4 references per stream byte; the bits-remaining bound
+	// allows 8N − c, where N is the stream and c the bits already consumed. So
+	// the budget is the tighter of the two whenever c < 4N bits — which is
+	// almost always — and the bits bound is reachable only when MOST of the
+	// stream is already spent.
+	//
+	// With entriesHeader's eight-bit widths and two pages, groups (a), (b) and
+	// (c) consume 48 bits, so the bits bound is tighter only for N < 12. At
+	// N = 11 the budget allows 44 and the bits bound allows 40, and a count of
+	// 42 falls between them. This case used 255 in a 12-byte stream and the
+	// budget intercepted it — the test went red and said so, which is how the
+	// relationship came to be written down here.
 	for _, c := range []struct {
 		name  string
 		count byte
+		bytes int
 		want  string
 	}{
-		{"a count larger than the bits that remain", 255, "describe nothing"},
-		{"a count that is plausible and still too expensive", 6, "bits, and"},
+		{"a count larger than the bits that remain", 42, 11, "describe nothing"},
+		{"a count that is plausible and still too expensive", 6, 12, "bits, and"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			b := []byte{0, 0, 0, 0, 0, c.count, 0, 0, 0, 0, 0, 0}
+			b := make([]byte, c.bytes)
+			b[5] = c.count // group (c), the second page's count
 			_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, manyObjects)
 			if !errors.Is(err, errHintTable) {
-				t.Fatalf("%d references in a 12-byte table were accepted: %v", c.count, err)
+				t.Fatalf("%d references in a %d-byte table were accepted: %v",
+					c.count, c.bytes, err)
 			}
 			if !strings.Contains(err.Error(), c.want) {
 				t.Errorf("it was refused, but not by the bound this case is about (%q): %v",
