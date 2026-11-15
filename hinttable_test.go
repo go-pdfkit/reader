@@ -685,8 +685,11 @@ func TestTheSecondSequenceOfSharedGroupsIsOneRunWithTheFirst(t *testing.T) {
 // assumptions.
 func TestAHintStreamWhoseSlashSCannotLocateTheTableIsRefused(t *testing.T) {
 	const head = "%PDF-1.7\n"
+	// ⛔ bytes is the stream's length, 36 (Table F.3's header exactly) unless a
+	// case needs room past it.
 	for _, c := range []struct {
 		name, body, want string
+		bytes            int
 	}{
 		{
 			name: "no /S at all",
@@ -702,18 +705,65 @@ func TestAHintStreamWhoseSlashSCannotLocateTheTableIsRefused(t *testing.T) {
 			// ⛔ The page offset table reads and the SHARED one does not, so
 			// the failure has to come out of readHintTables rather than be
 			// swallowed: a thirty-six byte stream is the header exactly, and
-			// /S 99 is past it. checkHintStream refuses such an /S before
-			// this is reached in normal use, which is why the propagation
-			// needs a test of its own.
+			// /S 99 is past it.
+			//
+			// ⛔ THE MESSAGE MOVED, deliberately. This used to be caught
+			// downstream by seekByte ("a table was placed at byte 99"); /S is
+			// now bounded against the stream before it is used in arithmetic
+			// at all, so the refusal names /S itself. The earlier wording was
+			// the symptom of a check that had not happened yet.
 			name: "an /S past the end of the stream",
 			body: "<< /S 99 /Length 36 >>",
-			want: "a table was placed at byte 99",
+			want: "/S is 99 and the decoded hint stream holds 36 byte(s)",
+		},
+		{
+			// ⛔⛔ AN /S THAT OVERFLOWS THE OVERRUN CHECK'S OWN ARITHMETIC,
+			// which is the THIRD defect of this class in this file (#42, #53,
+			// and the overrun check as first written). 2^61+40 times eight
+			// wraps to 320, so `r.pos > 8*int64(pos)` compared the entries'
+			// end against 320 and did not fire; seekByte then caught it by
+			// luck, and on a 32-bit build int(pos) keeps the low bits — 40 —
+			// which seekByte can ACCEPT.
+			//
+			// ⛔ The number is written out rather than computed, so the case
+			// cannot drift with the expression it defends.
+			name: "an /S whose bit offset overflows int64",
+			body: "<< /S 2305843009213693992 /Length 36 >>",
+			want: "the decoded hint stream holds 36 byte(s)",
+		},
+		{
+			// ⛔ And the other side of the same bound: a negative /S would
+			// index before the stream.
+			name: "a negative /S",
+			body: "<< /S -8 /Length 36 >>",
+			want: "/S is -8",
+		},
+		{
+			// ⛔⛔ AN /S INSIDE THE STREAM WHOSE TABLE IS STILL BAD, which is
+			// the only way left to reach readSharedTable's failure from here.
+			// The bound added above catches /S 99 before readSharedTable runs
+			// at all, so that case no longer witnesses this propagation — and
+			// an error returned by a function nothing can make fail is an
+			// error nobody has checked.
+			//
+			// Forty bytes: the page offset header takes the first thirty-six
+			// and every width in it is zero, so one page's entries consume no
+			// bits and the table ends exactly at /S = 36. Table F.5's header
+			// then wants twenty-four bytes and four remain.
+			name:  "an /S inside the stream with no room for the shared header",
+			body:  "<< /S 36 /Length 40 >>",
+			want:  "Table F.5",
+			bytes: 40,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			n := c.bytes
+			if n == 0 {
+				n = 36
+			}
 			d := bareDoc(nil, nil, nil)
 			d.buf = []byte(head + "9 0 obj\n" + c.body + "\nstream\n" +
-				strings.Repeat("\x00", 36) + "\nendstream\nendobj\n")
+				strings.Repeat("\x00", n) + "\nendstream\nendobj\n")
 			_, err := d.readHintTables(&Linearization{HintOffset: len(head), PageCount: 1})
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("it was accepted: %v", err)

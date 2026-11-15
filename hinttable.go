@@ -779,8 +779,12 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	}
 
 	// ⛔ /S COMES FROM THE STREAM'S OWN DICTIONARY, not from the table: F.3.6
-	// makes it a dictionary entry, and checkHintStream has already required it
-	// to be a direct integer at or above 36 with room for its 24-byte header.
+	// makes it a dictionary entry.
+	//
+	// ⛔⛔ AND IT IS UNTRUSTED HERE. checkHintStream requires /S to be a direct
+	// integer at or above 36 with room for its 24-byte header — but only
+	// CheckLinearized calls checkHintStream, and nothing makes a caller of
+	// readHintTables call it first. Every bound /S needs is applied below.
 	sv, ok := s.Dict["S"]
 	if !ok {
 		return nil, fmt.Errorf("%w: the primary hint stream has no /S, so the shared object "+
@@ -805,10 +809,32 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	// and it was invisible to every test that compared numbers rather than
 	// bytes: the encoder could not reproduce those bytes, which is how it
 	// surfaced.
+	// ⛔⛔⛔ /S IS BOUNDED BEFORE IT IS MULTIPLIED, and the first version of the
+	// refusal below was not. This is the THIRD time this file has produced a
+	// defect of one class — a uint32 or an int64 out of an untrusted file used
+	// in arithmetic that its type cannot hold (#42, #53, and here).
+	//
+	// ⛔ The comment above credited checkHintStream with having bounded /S. It
+	// does bound it — and ONLY CheckLinearized calls it, which is not on this
+	// path at all: readHintTables is reached without it. A justification that
+	// names another function's check is worth nothing until the call is there.
+	//
+	// ⭐ MEASURED: /S = 2305843009213693992 (2^61 + 40) makes 8*int64(pos) wrap
+	// to 320, so an overrun of a one-page table did NOT fire and seekByte
+	// caught it afterwards by luck. On a 32-bit build int(pos) keeps the low
+	// bits — 40 — which seekByte can ACCEPT.
+	//
+	// The bound is the stream itself: /S is a byte offset into these very
+	// bytes, so anything past them is already wrong, and after this neither
+	// 8*pos nor int(pos) can misbehave on any architecture.
+	if pos < 0 || int64(pos) > int64(len(r.b)) {
+		return nil, fmt.Errorf("%w: /S is %d and the decoded hint stream holds %d byte(s), so "+
+			"the shared object table cannot begin there", errHintTable, int64(pos), len(r.b))
+	}
 	if r.pos > 8*int64(pos) {
 		return nil, fmt.Errorf("%w: the page offset table's entries end at bit %d and /S puts "+
 			"the shared object table at byte %d (bit %d), so %d bit(s) of the entries are "+
-			"really the next table", errHintTable, r.pos, int(pos), 8*int64(pos),
+			"really the next table", errHintTable, r.pos, int64(pos), 8*int64(pos),
 			r.pos-8*int64(pos))
 	}
 	// ⛔ The object count is the cap on how many groups the table may claim;

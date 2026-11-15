@@ -619,6 +619,68 @@ It now refuses it, naming the overrun in bits — a defect found only because an
 encoder could not reproduce those bytes. ⛔ This is why Ghostscript is excluded
 from the round-trip list, with the reason written at the exclusion.
 
+### ⛔⛔ Three of the eleven lettered groups write nothing on any file here
+
+The pad above is not the only thing the byte oracle cannot see. Measured across
+all fourteen shapes, qpdf writes:
+
+```text
+Table F.3 item 7  (nbits_delta_content_offset) = 0
+Table F.3 item 12 (nbits_shared_numerator)     = 0
+Table F.5 item 5  (nbits_nobjects)             = 0, and every group has 1 object
+```
+
+So F.4's groups (e) and (f) and F.6's group (d) emit **zero bits** on every file
+in the corpus, and Table F.6 item 4's "1 less than the number of objects" has no
+byte witness at all. Swapping (e) with (f) leaves all fourteen shapes green.
+
+⭐ So those three groups get cases whose expected bytes are spelled out from the
+annex's item sizes, with every width set to 4 bits so the arithmetic is checkable
+by eye. The (e)/(f) swap reddens **only** those cases — which is the measurement
+that says the corpus could not have caught it.
+
+⛔ An earlier version of the oracle's own comment claimed it proved "the whole
+layout". It does not, and the claim is now the measured list above. The oracle is
+the strongest instrument in this arc and it is still only as wide as its corpus.
+
+### ⛔⛔ The writer emitted widths its own reader refuses
+
+F.4.1 bounds every bit width to 0..32 and says 16-bit fields shall hold them, so
+a width of 40 **fits its field perfectly**. The per-value guard cannot catch it:
+the `n > 32` refusal lives in the lettered group that uses the width, and an
+empty group writes nothing. For a one-page table groups (d) and (e) never run,
+so the encoder produced a valid-looking 36-byte header ending `00 28 00 00 00 00`
+that `readPageOffsetHeader` then refused — an encoder whose output its own
+decoder rejects.
+
+Both header writers now check the same nine width items their readers check,
+before writing anything. One consequence is worth stating: with the widths
+bounded, every item of Table F.5's header fits its field by construction, so it
+is written with `push` and carries no refusal. That is not "discard the error
+because it cannot happen" — the guarantee is a refusal three lines above that
+the tests exercise item by item, not a comment.
+
+### ⛔⛔ And the overrun check's own arithmetic overflowed
+
+The `/S` refusal described above was itself the sixth site of a class this fleet
+has already swept twice. `/S` arrives from the stream dictionary as an `int64`
+and nothing bounded it, so `8*int64(pos)` with `/S = 2^61+40` **wraps to 320**:
+the refusal did not fire, and `seekByte` caught it afterwards by luck. On a
+32-bit build `int(pos)` keeps the low bits — 40 — which `seekByte` can accept.
+
+⛔ The comment above the check justified the missing bound by naming
+`checkHintStream`, which does require `/S ≥ 36` — and which only
+`CheckLinearized` calls, so it is not on this path at all. **A justification that
+cites another function's check is worth nothing until the call is there.** `/S`
+is now bounded against the decoded stream before any arithmetic touches it.
+
+⚠ Worth recording how this was found: 100% block coverage, `go vet` on
+`linux/386` and `linux/arm`, and nine CI jobs including six architectures under
+qemu all passed. The check was *covered* — the Ghostscript fixture exercises it.
+It was its arithmetic that overflowed, and a gate an honest input walks through
+says nothing about a hostile one. An external review found it by reading the
+type of `pos` instead of the comment above it.
+
 ### ⛔⛔ A pad that every fixture in the corpus is blind to
 
 Table F.6's item 2 is a one-bit signature flag and item 3 is the 16-byte MD5 it

@@ -24,13 +24,28 @@ import (
 // ⛔ It is also the equality oracle the writer needs. #40 orders the work
 // "port the reference exactly (it is the equality oracle) → measure →
 // optimise", and for a bit-packed format the reference is the bytes a
-// reference implementation emits. If encode(decode(x)) == x for every file
-// qpdf produces, the encoder agrees with qpdf about the whole layout and not
-// just about thirteen integers.
+// reference implementation emits.
 //
-// ⚠ What it does NOT prove: that the VALUES are right for a document this
-// package laid out itself. That is the layout and the fixpoint, still to come.
-// This proves the serialisation.
+// ⛔⛔ BUT IT IS SILENT ABOUT THREE OF THE ELEVEN LETTERED GROUPS, and an
+// earlier version of this comment claimed it proved "the whole layout". It does
+// not. Measured over all fourteen shapes below, qpdf writes:
+//
+//	Table F.3 item 7  (nbits_delta_content_offset) = 0
+//	Table F.3 item 12 (nbits_shared_numerator)     = 0
+//	Table F.5 item 5  (nbits_nobjects)             = 0, every NObjects = 1
+//
+// So F.4's groups (e) and (f) and F.6's group (d) write ZERO BITS on every
+// file in the corpus, their pads are unobservable, and Table F.6 item 4's
+// "1 less than the number of objects" has no byte witness at all. Swapping (e)
+// with (f), or deleting either of their align() calls, leaves this test green.
+//
+// ⭐ So the synthetic cases below are not decoration: they carry the three
+// groups the corpus cannot reach, with their bytes spelled out from the
+// annex's item sizes. See TestTheGroupsQpdfLeavesEmptyAreLaidOutFromTheAnnex.
+//
+// ⚠ What this does NOT prove either: that the VALUES are right for a document
+// this package laid out itself. That is the layout and the fixpoint, still to
+// come. This proves the serialisation of the groups it can see.
 func TestReEncodingQpdfsHintTablesReproducesItsBytes(t *testing.T) {
 	qpdfOrSkip(t)
 
@@ -136,15 +151,22 @@ func assertHintTablesRoundTrip(t *testing.T, linear []byte) {
 	if err != nil {
 		t.Fatalf("the shared object table does not re-encode: %v", err)
 	}
-	// ⛔ AND THE SHARED TABLE IS COMPARED ONLY AS FAR AS IT GOES. Anything
-	// after it belongs to F.4's optional tables, which this package neither
-	// reads nor writes; requiring the rest would be asserting something about
-	// the FILE rather than about the encoder.
-	if at+len(gotShared) > len(data) {
-		t.Fatalf("the re-encoded shared table is %d bytes and only %d remain after /S=%d",
-			len(gotShared), len(data)-at, at)
+	// ⛔⛔ AND ITS LENGTH IS ASSERTED, NOT JUST ITS PREFIX. An earlier version
+	// compared data[at:at+len(gotShared)], which a SHORT encoding passes: drop
+	// a trailing group and the prefix still matches. The shared object table is
+	// the last thing F.3.6 requires in the primary stream, and on every shape
+	// here it runs to the end of the decoded data, so the remainder is the
+	// exact expectation.
+	//
+	// ⚠ If a future fixture carries one of F.4's OPTIONAL tables after it this
+	// will fail, and that is the right outcome: it would be telling me the
+	// stream holds something this package does not yet account for, which is a
+	// fact worth a failing test rather than a silent allowance.
+	if got, want := len(gotShared), len(data)-at; got != want {
+		t.Fatalf("the re-encoded shared table is %d bytes and %d remain after /S=%d",
+			got, want, at)
 	}
-	if want := data[at : at+len(gotShared)]; !bytes.Equal(gotShared, want) {
+	if want := data[at:]; !bytes.Equal(gotShared, want) {
 		t.Errorf("the re-encoded shared object table differs from qpdf's:\n got % x\nwant % x",
 			gotShared, want)
 	}
@@ -397,16 +419,23 @@ func TestEveryWayTheHintTablesRefuseToBeWritten(t *testing.T) {
 				pages: []pageEntry{{NObjects: 50}},
 				want:  "page 1's object count is 50",
 			},
-			// ⛔⛔ AND A HEADER FIELD THAT IS NOT A WIDTH. Table F.3's 32-bit
-			// items cannot overflow a uint32, so the header's own error path
-			// is reachable only through one of its SIXTEEN-bit items — which
-			// is the same asymmetry that makes 65535 a readable value and an
-			// impossible width.
+			// ⛔⛔ AND A HEADER FIELD THAT IS NOT A WIDTH — item 13, the shared
+			// denominator, which is the ONE place Table F.3's header can
+			// overflow. Its 32-bit items hold a uint32 by construction, and its
+			// other sixteen-bit items are the seven widths, now bounded to
+			// 0..32 before they are written.
+			//
+			// ⛔ THIS CASE USED TO USE NBitsDeltaNObjects: 70000, and the width
+			// check added for the reader/writer asymmetry intercepts that with
+			// a better message. 70000 is not a width, so the width refusal is
+			// the right one — but it left item 13 as the only live witness that
+			// the header's own overflow path works at all, which is why the
+			// case moved here rather than being deleted.
 			{
-				name:  "a bit-count item that does not fit sixteen bits",
-				h:     &pageOffsetHeader{NBitsDeltaNObjects: 70000},
+				name:  "a header field that does not fit sixteen bits",
+				h:     &pageOffsetHeader{SharedDenominator: 70000},
 				pages: []pageEntry{{}},
-				want:  "Table F.3, item 3 of 13",
+				want:  "Table F.3, item 13 of 13",
 			},
 		} {
 			t.Run(c.name, func(t *testing.T) {
@@ -472,14 +501,20 @@ func TestEveryWayTheHintTablesRefuseToBeWritten(t *testing.T) {
 				groups: []sharedGroup{{NObjects: 9}},
 				want:   "Table F.6 item 4 for group 1",
 			},
-			{
-				// Table F.5's 32-bit items cannot overflow a uint32, so its
-				// own error path is reachable only through a 16-bit one.
-				name:   "a bit-count item that does not fit sixteen bits",
-				h:      &sharedHeader{NSharedTotal: 1, NBitsNObjects: 70000},
-				groups: []sharedGroup{{NObjects: 1}},
-				want:   "Table F.5, item 5 of 7",
-			},
+			// ⛔⛔ TABLE F.5'S HEADER HAS NO OVERFLOW CASE LEFT, and the case
+			// that used to sit here (NBitsNObjects: 70000, expecting "Table
+			// F.5, item 5 of 7") is gone deliberately rather than by neglect.
+			//
+			// Its seven items are five uint32 in 32-bit fields and two widths
+			// now bounded to 0..32 before they are written, so every one fits
+			// its field by construction and writeSharedTable pushes them
+			// without a refusal there would be no way to reach. 70000 is not a
+			// width, and the refusal it now gets is the width one, asserted
+			// item by item in
+			// TestTheWriterRefusesEveryWidthItsReaderWouldRefuse.
+			//
+			// ⚠ Table F.3's header kept its overflow case, because its item 13
+			// is a uint32 in a sixteen-bit field. The asymmetry is real.
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				_, err := writeSharedTable(c.h, c.groups)
@@ -490,6 +525,202 @@ func TestEveryWayTheHintTablesRefuseToBeWritten(t *testing.T) {
 					t.Errorf("it was refused, but not for %q: %v", c.want, err)
 				}
 			})
+		}
+	})
+}
+
+// ⛔⛔ THE WRITER REFUSES EVERY WIDTH ITS OWN READER WOULD REFUSE, which it did
+// not when this file was first written. Table F.3's items 3..12 and Table F.5's
+// items 5 and 7 are SIXTEEN-BIT FIELDS holding a number F.4.1 bounds to 0..32,
+// so a width of 40 fits the field perfectly. The per-value `write` guard cannot
+// catch it, because the `n > 32` refusal lives in the lettered group that USES
+// the width — and an empty group writes nothing.
+//
+// ⛔ Measured before the fix: writePageOffsetTable with NBitsSharedIdent 40 and
+// one page returned a 36-byte header ending `00 28 00 00 00 00`, which
+// readPageOffsetHeader then refused with "nbits_shared_identifier is 40". An
+// encoder whose output its own decoder rejects is a defect even with no caller
+// that supplies such a header: the two directions are supposed to describe one
+// format, and for a one-page table groups (d) and (e) never run.
+func TestTheWriterRefusesEveryWidthItsReaderWouldRefuse(t *testing.T) {
+	t.Run("Table F.3's seven width items", func(t *testing.T) {
+		for _, c := range []struct {
+			name string
+			set  func(*pageOffsetHeader, int)
+			want string
+		}{
+			{"item 3", func(h *pageOffsetHeader, n int) { h.NBitsDeltaNObjects = n }, "nbits_delta_nobjects"},
+			{"item 5", func(h *pageOffsetHeader, n int) { h.NBitsDeltaPageLength = n }, "nbits_delta_page_length"},
+			{"item 7", func(h *pageOffsetHeader, n int) { h.NBitsDeltaContentOff = n }, "nbits_delta_content_offset"},
+			{"item 9", func(h *pageOffsetHeader, n int) { h.NBitsDeltaContentLen = n }, "nbits_delta_content_length"},
+			{"item 10", func(h *pageOffsetHeader, n int) { h.NBitsNSharedObjects = n }, "nbits_nshared_objects"},
+			{"item 11", func(h *pageOffsetHeader, n int) { h.NBitsSharedIdent = n }, "nbits_shared_identifier"},
+			{"item 12", func(h *pageOffsetHeader, n int) { h.NBitsSharedNumerator = n }, "nbits_shared_numerator"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				// ⛔ ONE PAGE, so that every group which would consume the
+				// width is empty. That is the shape the guard missed.
+				h := &pageOffsetHeader{}
+				c.set(h, 40)
+				_, err := writePageOffsetTable(h, []pageEntry{{}})
+				if !errors.Is(err, errHintTable) {
+					t.Fatalf("a width of 40 was written: %v", err)
+				}
+				if !strings.Contains(err.Error(), c.want) {
+					t.Errorf("it was refused, but not for %q: %v", c.want, err)
+				}
+
+				// ⛔ AND 32 IS ACCEPTED, which is the control: without it this
+				// case would pass against a writer that refused every width.
+				h = &pageOffsetHeader{}
+				c.set(h, 32)
+				if _, err := writePageOffsetTable(h, []pageEntry{{}}); err != nil {
+					t.Errorf("a width of 32 was refused, and F.4.1 allows 0..32: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Table F.5's two width items", func(t *testing.T) {
+		for _, c := range []struct {
+			name string
+			set  func(*sharedHeader, int)
+			want string
+		}{
+			{"item 5", func(h *sharedHeader, n int) { h.NBitsNObjects = n }, "nbits_nobjects"},
+			{"item 7", func(h *sharedHeader, n int) { h.NBitsDeltaGroupLength = n }, "nbits_delta_group_length"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				// ⛔ NO GROUPS AT ALL, so every group that would use the width
+				// is empty.
+				h := &sharedHeader{}
+				c.set(h, 40)
+				_, err := writeSharedTable(h, nil)
+				if !errors.Is(err, errHintTable) {
+					t.Fatalf("a width of 40 was written: %v", err)
+				}
+				if !strings.Contains(err.Error(), c.want) {
+					t.Errorf("it was refused, but not for %q: %v", c.want, err)
+				}
+
+				h = &sharedHeader{}
+				c.set(h, 32)
+				if _, err := writeSharedTable(h, nil); err != nil {
+					t.Errorf("a width of 32 was refused, and F.4.1 allows 0..32: %v", err)
+				}
+			})
+		}
+	})
+}
+
+// ⛔⛔ THE THREE GROUPS QPDF LEAVES EMPTY ON EVERY FILE IN THE CORPUS. F.4's
+// groups (d) and (e) carry a shared reference's identifier and numerator, and
+// F.6's group (d) carries a group's object count; qpdf writes width 0 for
+// nbits_shared_numerator and nbits_nobjects and gives every shared group one
+// object, so (e) and F.6 (d) emit nothing at all and the byte oracle is blind
+// to their order, their pads and item 4's "1 less than the number".
+//
+// ⛔ THE EXPECTATION IS SPELLED OUT, not computed by the code under test. Every
+// width here is 4 bits so the arithmetic fits in this comment and can be
+// checked by eye against Table F.3, Table F.4 and Table F.6.
+func TestTheGroupsQpdfLeavesEmptyAreLaidOutFromTheAnnex(t *testing.T) {
+	t.Run("the page offset table's groups (d), (e) and (f)", func(t *testing.T) {
+		h := &pageOffsetHeader{
+			MinNObjects:          1,
+			FirstPageOffset:      0,
+			NBitsDeltaNObjects:   4,
+			MinPageLength:        10,
+			NBitsDeltaPageLength: 4,
+			MinContentOffset:     0,
+			NBitsDeltaContentOff: 4, // item 7, zero in every fixture
+			MinContentLength:     0,
+			NBitsDeltaContentLen: 4,
+			NBitsNSharedObjects:  4,
+			NBitsSharedIdent:     4,
+			NBitsSharedNumerator: 4, // item 12, zero in every fixture
+			SharedDenominator:    1,
+		}
+		pages := []pageEntry{
+			// Page 1 is at every minimum, and F.4 item 3 requires 0 shared
+			// references for it.
+			{NObjects: 1, Length: 10, ContentOffset: 0, ContentLength: 0},
+			// Page 2 is one above each minimum and carries one reference.
+			{
+				NObjects: 2, Length: 11, ContentOffset: 1, ContentLength: 1,
+				Shared: []sharedRef{{Identifier: 3, Numerator: 5}},
+			},
+		}
+
+		got, err := writePageOffsetTable(h, pages)
+		if err != nil {
+			t.Fatalf("it was refused: %v", err)
+		}
+
+		// Table F.3's thirteen items, widths 32 32 16 32 16 32 16 32 16 16 16
+		// 16 16 = 288 bits = 36 bytes.
+		want := []byte{
+			0x00, 0x00, 0x00, 0x01, // 1  min_nobjects            = 1
+			0x00, 0x00, 0x00, 0x00, // 2  first_page_offset       = 0
+			0x00, 0x04, // ........... 3  nbits_delta_nobjects    = 4
+			0x00, 0x00, 0x00, 0x0a, // 4  min_page_length         = 10
+			0x00, 0x04, // ........... 5  nbits_delta_page_len    = 4
+			0x00, 0x00, 0x00, 0x00, // 6  min_content_offset      = 0
+			0x00, 0x04, // ........... 7  nbits_delta_content_off = 4
+			0x00, 0x00, 0x00, 0x00, // 8  min_content_length      = 0
+			0x00, 0x04, // ........... 9  nbits_delta_content_len = 4
+			0x00, 0x04, // ...........10  nbits_nshared_objects   = 4
+			0x00, 0x04, // ...........11  nbits_shared_ident      = 4
+			0x00, 0x04, // ...........12  nbits_shared_numerator  = 4
+			0x00, 0x01, // ...........13  shared_denominator      = 1
+			// Then F.4.1's seven lettered groups, column-major, each padded to
+			// a byte boundary. Two pages at 4 bits each fills one byte exactly;
+			// the single reference in (d) and (e) fills a nibble and pads.
+			0x01, // (a) item 1: deltas 0, 1       -> 0000 0001
+			0x01, // (b) item 2: deltas 0, 1       -> 0000 0001
+			0x01, // (c) item 3: counts 0, 1       -> 0000 0001
+			0x30, // (d) item 4: identifier 3      -> 0011 +pad
+			0x50, // (e) item 5: numerator 5       -> 0101 +pad
+			0x01, // (f) item 6: deltas 0, 1       -> 0000 0001
+			0x01, // (g) item 7: deltas 0, 1       -> 0000 0001
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("the page offset table was written as\n % x\nand the annex lays it out as\n % x",
+				got, want)
+		}
+	})
+
+	t.Run("the shared object table's group (d) and item 4's minus one", func(t *testing.T) {
+		h := &sharedHeader{
+			NSharedFirstPage:      1,
+			NSharedTotal:          2,
+			NBitsNObjects:         4, // item 5, zero in every fixture
+			MinGroupLength:        100,
+			NBitsDeltaGroupLength: 4,
+		}
+		groups := []sharedGroup{
+			{Length: 100, NObjects: 3},
+			{Length: 105, NObjects: 1},
+		}
+
+		got, err := writeSharedTable(h, groups)
+		if err != nil {
+			t.Fatalf("it was refused: %v", err)
+		}
+
+		// Table F.6's groups (a)..(d), each padded to a byte boundary:
+		//   (a) item 1: length deltas 0 and 5      -> 0000 0101
+		//   (b) item 2: signature flags 0 and 0    -> 00 +pad
+		//   (c) item 3: no signatures, nothing
+		//   (d) item 4: NObjects-1, so 2 and 0     -> 0010 0000
+		//
+		// ⛔ Group (d) is the ONLY witness in this package that item 4 stores
+		// one LESS than the count: 3 objects are written as 2. An encoder that
+		// stored the count itself would put 0x30 there and no fixture would
+		// notice.
+		want := sharedTableBytes(0, 0, 1, 2, 4, 100, 4, 0x05, 0x00, 0x20)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("the shared object table was written as\n % x\nand the annex lays it out as\n % x",
+				got, want)
 		}
 	})
 }

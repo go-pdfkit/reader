@@ -134,9 +134,41 @@ func writePageOffsetTable(h *pageOffsetHeader, pages []pageEntry) ([]byte, error
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("%w: a hint table for no pages", errHintTable)
 	}
-	if pages[0].Shared != nil && len(pages[0].Shared) != 0 {
+	if len(pages[0].Shared) != 0 {
 		return nil, fmt.Errorf("%w: the first page carries %d shared object reference(s), and "+
 			"Table F.4 item 3 requires 0 there", errHintTable, len(pages[0].Shared))
+	}
+
+	// ⛔⛔ THE WIDTHS ARE CHECKED BEFORE THEY ARE WRITTEN, and the per-item
+	// `write` guard is NOT enough. Items 3..12 go into 16-bit fields, so a width
+	// of 40 is written happily; the `n > 32` refusal lives in the groups that
+	// USE the width, and a group writes nothing when it is empty. For a
+	// one-page table groups (d) and (e) never run at all, so
+	// writePageOffsetTable would emit a 36-byte header holding
+	// nbits_shared_identifier = 40 — which readPageOffsetHeader then REFUSES.
+	//
+	// ⛔ An encoder whose output its own decoder rejects is a defect even when
+	// no reachable caller supplies such a header, because the whole point of
+	// this package is that the two directions describe one format. The
+	// reader's list below is deliberately the SAME seven items, in the same
+	// order, with the same names.
+	for _, c := range []struct {
+		name string
+		item int
+		n    int
+	}{
+		{"nbits_delta_nobjects", 3, h.NBitsDeltaNObjects},
+		{"nbits_delta_page_length", 5, h.NBitsDeltaPageLength},
+		{"nbits_delta_content_offset", 7, h.NBitsDeltaContentOff},
+		{"nbits_delta_content_length", 9, h.NBitsDeltaContentLen},
+		{"nbits_nshared_objects", 10, h.NBitsNSharedObjects},
+		{"nbits_shared_identifier", 11, h.NBitsSharedIdent},
+		{"nbits_shared_numerator", 12, h.NBitsSharedNumerator},
+	} {
+		if c.n < 0 || c.n > 32 {
+			return nil, fmt.Errorf("%w: %s is %d, and F.4.1 bounds every bit width to 0..32 "+
+				"(Table F.3, item %d)", errHintTable, c.name, c.n, c.item)
+		}
 	}
 
 	w := &bitw{}
@@ -277,24 +309,53 @@ func writeSharedTable(h *sharedHeader, groups []sharedGroup) ([]byte, error) {
 			"F.5 item 4 includes item 3", errHintTable, h.NSharedTotal, h.NSharedFirstPage)
 	}
 
-	w := &bitw{}
-
-	for i, f := range []struct {
-		n int
-		v uint32
+	// ⛔⛔ THE SAME CHECK AS writePageOffsetTable'S, for the same reason: items 5
+	// and 7 are 16-bit fields, and the `n > 32` guard fires only in the groups
+	// that use them. With no groups at all, every group is empty and a header
+	// naming a 40-bit object count would be written and then refused by
+	// readSharedTable.
+	for _, c := range []struct {
+		name string
+		item int
+		n    int
 	}{
-		{32, h.FirstSharedObj},
-		{32, h.FirstSharedOffset},
-		{32, h.NSharedFirstPage},
-		{32, h.NSharedTotal},
-		{16, uint32(h.NBitsNObjects)},
-		{32, h.MinGroupLength},
-		{16, uint32(h.NBitsDeltaGroupLength)},
+		{"nbits_nobjects", 5, h.NBitsNObjects},
+		{"nbits_delta_group_length", 7, h.NBitsDeltaGroupLength},
 	} {
-		if err := w.write(f.n, f.v); err != nil {
-			return nil, fmt.Errorf("%w (Table F.5, item %d of 7)", err, i+1)
+		if c.n < 0 || c.n > 32 {
+			return nil, fmt.Errorf("%w: %s is %d, and F.4.1 bounds every bit width to 0..32 "+
+				"(Table F.5, item %d)", errHintTable, c.name, c.n, c.item)
 		}
 	}
+
+	w := &bitw{}
+
+	// Table F.5, items 1..7: 32 32 32 32 16 32 16 = 192 bits = 24 bytes.
+	//
+	// ⛔ THESE GO THROUGH push AND NOT write, and that is a consequence of the
+	// width check above rather than an exemption from it. Five of the items are
+	// a uint32 in a 32-bit field, which fits by construction; the other two are
+	// the widths just bounded to 0..32, which fit sixteen bits by construction.
+	// Nothing here can overflow, so `write` would contribute a refusal no input
+	// can reach — and this package's coverage gate rightly refuses to carry one.
+	//
+	// ⛔ This is NOT "call write and discard the error because it cannot
+	// happen", which is the shape that already cost this file a silent wrong
+	// value. The difference is where the guarantee lives: there it was a
+	// comment, here it is a refusal three lines up that the tests exercise
+	// item by item. If that check is ever weakened, these pushes become wrong
+	// and TestTheWriterRefusesEveryWidthItsReaderWouldRefuse goes red.
+	//
+	// ⚠ Table F.3's header still uses `write`, because its item 13 is a uint32
+	// in a SIXTEEN-bit field and genuinely can overflow. The two tables differ
+	// here for a reason, not by oversight.
+	w.push(32, h.FirstSharedObj)
+	w.push(32, h.FirstSharedOffset)
+	w.push(32, h.NSharedFirstPage)
+	w.push(32, h.NSharedTotal)
+	w.push(16, uint32(h.NBitsNObjects))
+	w.push(32, h.MinGroupLength)
+	w.push(16, uint32(h.NBitsDeltaGroupLength))
 
 	// (a) Item 1 for every group.
 	for i, g := range groups {
