@@ -6,6 +6,7 @@
 package reader
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -85,6 +86,62 @@ func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
 			// about our file that it does not also make about the file we were
 			// given. That needs no list and cannot go stale with qpdf's
 			// wording.
+			// ⛔⛔ PART 5 BEFORE PART 6, ASSERTED HERE BECAUSE QPDF DOES NOT
+			// POLICE IT. Review found the first version emitting the hint
+			// stream AFTER the first page and `qpdf --check` passing it
+			// anyway: the judge below is "no complaints qpdf does not also
+			// make about the input", and qpdf never complains about which
+			// part the hint stream occupies. A divergence from F.3.1's
+			// numbering AND from qpdf's own output sailed through.
+			//
+			// ⭐ So the fix needs its own witness. /H must come before the
+			// first page's own object, or the tables that tell a streaming
+			// reader what to fetch arrive after the bytes they were meant to
+			// save it from fetching.
+			lin, err := Linearized(out)
+			if err != nil {
+				t.Fatalf("this package cannot read the file it just wrote: %v", err)
+			}
+			written, err := Open(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pageEntry, ok := written.xref[lin.FirstPageObject]
+			if !ok {
+				t.Fatalf("/O names object %d and our own xref has no entry for it",
+					lin.FirstPageObject)
+			}
+			if int64(lin.HintOffset) >= pageEntry.offset {
+				t.Errorf("the hint stream is at %d and the first page's object at %d, so part 5 "+
+					"follows part 6 — the tables arrive after the page they describe",
+					lin.HintOffset, pageEntry.offset)
+			}
+			if lin.HintOffset <= 0 {
+				t.Errorf("/H is %d, so the hint stream was never placed", lin.HintOffset)
+			}
+
+			// ⛔ THE OTHER SIDE OF THE BRACKET. The check above only says part 5
+			// does not follow part 6; it says nothing about part 5 landing in
+			// the MIDDLE of part 4. The emission slices `order` into
+			// order[:catalogueCount] and order[catalogueCount:firstPageCount],
+			// which is only the two parts if Order is part-major — and if that
+			// assumption broke, a catalogue object would be written after the
+			// hint stream with /H still ahead of the first page, so the check
+			// above would pass.
+			rootRef, ok := written.trailer["Root"].(Ref)
+			if !ok {
+				t.Fatalf("our own trailer's /Root is %T, not a reference", written.trailer["Root"])
+			}
+			rootEntry, ok := written.xref[rootRef.Num]
+			if !ok {
+				t.Fatalf("/Root names object %d and our own xref has no entry for it",
+					rootRef.Num)
+			}
+			if rootEntry.offset >= int64(lin.HintOffset) {
+				t.Errorf("the catalogue is at %d and the hint stream at %d, so part 5 was written "+
+					"inside part 4", rootEntry.offset, lin.HintOffset)
+			}
+
 			base := qpdfComplaints(t, qpdf, dir, "in.pdf", plain)
 			ours := qpdfComplaints(t, qpdf, dir, "ours.pdf", out)
 			for l := range ours {
@@ -159,6 +216,123 @@ func isAboutHintTables(line string) bool {
 		}
 	}
 	return false
+}
+
+// ⛔⛔ THE EMISSION IS STABLE ACROSS PASSES, which the writer relies on and
+// which no guard inside it can state. The first version compared pass 1's
+// measurements against pass 0's and refused a mismatch; that branch is
+// unreachable, because everything ahead of the objects is fixed width, and the
+// coverage gate refused it.
+//
+// ⛔⛔ AND REPEATING Linearize IS NOT THE PROPERTY. Four calls redo the same two
+// passes and would agree whether or not the fixpoint converged, so that half of
+// this test witnesses DETERMINISM only — worth having, and not what the removed
+// guard claimed.
+//
+// ⭐ THE CONVERGENCE WITNESS IS THAT Linearized ACCEPTS THE FILE. /L is written
+// from the PREVIOUS pass's measurement, and F.3.3 requires it to "be exactly
+// equal to the actual length of the PDF file" — so if anything ahead of the
+// objects ever becomes variable-width (a trailer key, a subsection header, a
+// span that stops being reserved) the length moves under a /L already written.
+// This package's own reader refuses exactly that, and measuring the mutation
+// proved it: one pass instead of two gives "/L says 0 bytes and the file is
+// 1112" from Linearized itself, on all three shapes.
+//
+// ⛔ Which is why there is no /L comparison HERE. The first version of this test
+// added one, and it was unreachable: Linearized had already returned the error,
+// so the branch could never run. An unreachable assertion in a test is the same
+// fault as an unreachable guard in the code — a claim nothing can falsify — and
+// it is the fault this test exists to correct.
+func TestTheEmissionIsStableAcrossPasses(t *testing.T) {
+	for _, pages := range []int{1, 2, 5} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			d, err := Open(buildPages(t, pages))
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := d.Linearize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Linearized(first); err != nil {
+				t.Fatalf("this package cannot read the file it just wrote: %v", err)
+			}
+			for pass := 2; pass <= 4; pass++ {
+				again, err := d.Linearize()
+				if err != nil {
+					t.Fatalf("pass %d refused what pass 1 wrote: %v", pass, err)
+				}
+				if !bytes.Equal(first, again) {
+					t.Fatalf("pass %d produced %d bytes and pass 1 produced %d, so the layout "+
+						"is not stable", pass, len(again), len(first))
+				}
+			}
+		})
+	}
+}
+
+// ⛔⛔ /Info AND /ID SURVIVE THE COPY, which no fixture could show: neither
+// buildPages nor any committed file carries either, which is exactly why the
+// first version dropped them in silence and no test noticed. Review found it by
+// reading what the trailer does NOT write.
+//
+// ⛔ A document information dictionary is metadata a reader shows a person, and
+// /ID is how a reader tells whether two files are the same document. Losing
+// either is not a crash; it is a quieter kind of wrong.
+func TestTheTrailerCarriesInfoAndID(t *testing.T) {
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	content := w.Add(&Stream{Dict: Dict{}, Raw: []byte("0 g")})
+	page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": content})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page},
+		"Count":    Integer(1),
+		"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+	info := w.Add(Dict{"Producer": String("go-pdfkit/reader"), "Title": String("a title")})
+	id := Array{String("0123456789abcdef"), String("0123456789abcdef")}
+
+	plain, err := w.Finish(Dict{"Root": root, "Info": info, "ID": id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.Linearize()
+	if err != nil {
+		t.Fatalf("a document with /Info and /ID was refused: %v", err)
+	}
+
+	got, err := Open(out)
+	if err != nil {
+		t.Fatalf("our own file does not open: %v", err)
+	}
+	ref, isRef := got.trailer["Info"].(Ref)
+	if !isRef {
+		t.Fatalf("/Info came out as %v, not an indirect reference", got.trailer["Info"])
+	}
+	// ⛔ AND IT RESOLVES, which the reference alone does not show: a renumbered
+	// /Info pointing at an object the layout dropped would still be a Ref.
+	infoDict, err := got.Get(ref)
+	if err != nil {
+		t.Fatalf("/Info names object %d and it does not read: %v", ref.Num, err)
+	}
+	dict, ok := ToDict(infoDict)
+	if !ok {
+		t.Fatalf("/Info resolves to %v, not a dictionary", infoDict)
+	}
+	if s, _ := dict["Title"].(String); string(s) != "a title" {
+		t.Errorf("/Info's /Title came out as %q", dict["Title"])
+	}
+	arr, isArr := got.trailer["ID"].(Array)
+	if !isArr || len(arr) != 2 {
+		t.Fatalf("/ID came out as %v", got.trailer["ID"])
+	}
+	if s, _ := arr[0].(String); string(s) != "0123456789abcdef" {
+		t.Errorf("/ID's first string changed to %q — a reader uses it to tell two files "+
+			"apart, so a linearized copy must keep it", s)
+	}
 }
 
 // ⛔⛔ AND THE NEGATIVE CONTROL #40 ASKED FOR: an ordinary file from the same

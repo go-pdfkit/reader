@@ -189,6 +189,25 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 		}
 	})
 
+	t.Run("a first-page object of part 6 that does not read", func(t *testing.T) {
+		// ⛔ THE THIRD CALL SITE. emit is called from three loops — part 4,
+		// part 6, and parts 7..9 — and the coverage gate found part 6's
+		// uncovered after part 5 moved between them. A test of two would leave
+		// the third free to swallow the error.
+		d := bareDoc(nil, nil, map[int]Object{1: Dict{"Type": Name("Catalog")}})
+		d.buf = []byte("%PDF-1.7\n")
+		d.xref[4] = xrefEntry{kind: 'n', offset: 100000}
+		p := &Partition{
+			Of:              map[int]Part{1: PartCatalog, 4: PartFirstPage},
+			Pages:           [][]int{{4}},
+			FirstPageObject: 4,
+		}
+		_, err := d.linearizeFrom(p)
+		if !errors.Is(err, ErrCannotLinearize) {
+			t.Fatalf("an unreadable part-6 object was accepted: %v", err)
+		}
+	})
+
 	t.Run("a later object that does not read", func(t *testing.T) {
 		// ⛔ The SECOND call site, after the hint stream. Both loops call the
 		// same emit and both must propagate; a test of one would leave the

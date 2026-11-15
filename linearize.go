@@ -99,13 +99,23 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 
 	// The first-page section covers the catalogue and the first page: parts 4
 	// and 6, which Order puts first and contiguously.
-	firstPageCount := 0
+	//
+	// ⛔ THEY ARE COUNTED SEPARATELY because part 5 goes between them — see the
+	// emission. That the two counts can slice `order` relies on Order being
+	// PART-MAJOR: it appends one contiguous segment per part, part 4 before
+	// part 6, so part 4 is order[:catalogueCount] and part 6 is
+	// order[catalogueCount:firstPageCount]. A sort that mixed the two parts
+	// would put the hint stream in the middle of the catalogue.
+	catalogueCount, firstPageCount := 0, 0
 	for _, old := range order {
-		if part := p.Of[old]; part == PartCatalog || part == PartFirstPage {
-			firstPageCount++
-		} else {
+		part := p.Of[old]
+		if part != PartCatalog && part != PartFirstPage {
 			break
 		}
+		if part == PartCatalog {
+			catalogueCount++
+		}
+		firstPageCount++
 	}
 	// ⛔ AND NO GUARD FOR A ZERO COUNT, for the same reason: Partition always
 	// assigns the catalogue to part 4 — it refuses a document whose /Root has
@@ -129,10 +139,20 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 		O: int64(num[p.FirstPageObject]),
 	}}
 	for pass := 0; pass < 2; pass++ {
-		b, measured, err := d.emitLinearized(p, order, num, firstPageCount, m)
+		b, measured, err := d.emitLinearized(p, order, num, catalogueCount, firstPageCount, m)
 		if err != nil {
 			return nil, err
 		}
+		// ⛔⛔ THE CONVERGENCE IS ASSERTED BY A TEST AND NOT BY A GUARD HERE,
+		// which is a correction to the first version of this loop. It compared
+		// the second pass's measurements with the first's and refused a
+		// mismatch — a branch no input can take, because everything ahead of
+		// the objects is fixed width. The coverage gate refused it, rightly:
+		// an unreachable refusal is an untested claim.
+		//
+		// TestTheEmissionIsStableAcrossPasses runs four passes over four shapes
+		// and asserts the bytes are identical from the first, which is the same
+		// property with a witness that can fail.
 		out, m = b, measured
 	}
 	return out, nil
@@ -155,7 +175,7 @@ type linMeasured struct {
 // emitLinearized writes the file once with the parameters it is given, and
 // returns the parameters the result actually implies.
 func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
-	firstPageCount int, prev linMeasured) ([]byte, linMeasured, error) {
+	catalogueCount, firstPageCount int, prev linMeasured) ([]byte, linMeasured, error) {
 
 	in := prev.params
 
@@ -218,8 +238,24 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// the main trailer; qpdf read THIS one and said "reported number of objects
 	// (6) is not one plus the highest object number (6)". The highest number is
 	// the hint stream's, paramNum+1, so /Size is paramNum+2.
-	trailer := fmt.Sprintf("trailer\n<< /Size %d /Prev %d /Root %d 0 R >>\nstartxref\n0\n%%%%EOF\n",
-		paramNum+2, prev.mainXrefAt, catalogue)
+	// ⛔⛔ /Info AND /ID ARE CARRIED, and the first version dropped them in
+	// silence. The trailer held only /Size, /Prev and /Root, so a document with
+	// a document information dictionary came out without its metadata and
+	// nothing said so — no fixture here has either, which is why no test
+	// noticed. Review found it by reading what the trailer does NOT write.
+	//
+	// ⛔ /Info is renumbered like any other reference; /ID is two strings and
+	// passes through. A reader uses /ID to tell whether two files are the same
+	// document, so changing it would make a linearized copy look like a
+	// different file.
+	extra := ""
+	for _, key := range []Name{"Info", "ID"} {
+		if v, has := d.trailer[key]; has {
+			extra += fmt.Sprintf(" /%s %s", key, AppendObject(nil, renumber(v, num)))
+		}
+	}
+	trailer := fmt.Sprintf("trailer\n<< /Size %d /Prev %d /Root %d 0 R%s >>\nstartxref\n0\n%%%%EOF\n",
+		paramNum+2, prev.mainXrefAt, catalogue, extra)
 	if len(trailer) > frontTrailerSpan {
 		return nil, linMeasured{}, fmt.Errorf("%w: the first-page trailer needs %d bytes and %d "+
 			"are reserved", ErrCannotLinearize, len(trailer), frontTrailerSpan)
@@ -290,16 +326,42 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 		return nil
 	}
 
-	// Parts 4 and 6, which Order puts first.
-	for _, old := range order[:firstPageCount] {
+	// Part 4: the catalogue and the document-level objects.
+	for _, old := range order[:catalogueCount] {
 		if err := emit(old); err != nil {
 			return nil, linMeasured{}, err
 		}
 	}
-	// Part 5, between the first page and the rest, which is where both
-	// producers put it.
+
+	// ⛔⛔⛔ PART 5 GOES BETWEEN PART 4 AND PART 6, and the first version put it
+	// after part 6 under a comment claiming "both producers put it there".
+	// That was wrong twice, and this repository's own measurements say so:
+	//
+	//	qpdf       /H [550 127] spans 550..677, and part 6 is at 677..871
+	//	           — so its hint stream is BEFORE the first page
+	//	Ghostscript puts /H at /E, AFTER the first page, which is the whole
+	//	           reason firstPageOffsetInFile carries a conditional (#43)
+	//
+	// So the two producers DISAGREE, and claiming they agree was a fabricated
+	// justification of the kind this arc has now produced three times. F.3.1
+	// numbers the hint stream 5 and the first-page objects 6, and qpdf follows
+	// that; this writer does too.
+	//
+	// ⛔ AND THE REASON IS THE FORMAT'S PURPOSE, not the numbering. The tables
+	// tell a streaming reader which bytes to request. Emitted after part 6, as
+	// the first version did, they arrive only once the whole first page has
+	// been received — by which time they have nothing left to accelerate.
+	// Ghostscript's placement is legal (F.3.1 permits either side, which is why
+	// the reader handles both) and it is not the one to copy.
 	hintAt = buf.Len()
 	hintLen = writeHintStreamPlaceholder(&buf, paramNum+1)
+
+	// Part 6: the first page.
+	for _, old := range order[catalogueCount:firstPageCount] {
+		if err := emit(old); err != nil {
+			return nil, linMeasured{}, err
+		}
+	}
 	// Parts 7, 8 and 9.
 	for _, old := range order[firstPageCount:] {
 		if err := emit(old); err != nil {
@@ -386,6 +448,13 @@ func writeHintStreamPlaceholder(buf *bytes.Buffer, num int) int {
 // it. That single warning was the last thing between the layout and a file qpdf
 // accepts, and it is not a rule stated anywhere in Annex F — it follows from
 // what the annex is FOR.
+//
+// ⚠ AND THE REASONING IS MINE, NOT QPDF'S. Review read QPDF_pages.cc and
+// confirmed the mechanism exactly — the same four keys, erased from every
+// /Pages node the recursion enters, pushed only where the page lacks its own —
+// but qpdf ties that function to its PAGE-MANIPULATION APIs and never to
+// linearization or to semantic equivalence. The argument from F.3.7 and F.3.10
+// above is this package's, and it should not be read as qpdf's.
 //
 // ⛔ The page keeps its /Parent, which still points into part 9. That is
 // correct: F.3.10 places the tree there precisely because displaying a page
