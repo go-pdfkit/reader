@@ -615,28 +615,34 @@ func readSharedTable(r *bits, at int, maxGroups int64) (*sharedHeader, []sharedG
 			"more groups than there are", errHintTable, total, maxGroups)
 	}
 
-	// ⛔⛔ AND THE SECOND SEQUENCE IS REFUSED RATHER THAN GUESSED AT. F.4.2 says
-	// "There shall be two sequences of shared object group entries: the ones
-	// for objects located in the first page, followed by the ones for objects
-	// located in the shared objects section", and then "The order of items in
-	// EACH SEQUENCE shall be as follows". Read strictly, each sequence is
-	// column-major and aligned on its own, which differs from one run of
-	// nshared_total entries whenever the first sequence's widths do not end on
-	// a byte.
+	// ⛔⛔ F.4.2's "TWO SEQUENCES" ARE ONE COLUMN-MAJOR RUN, WHICH WAS MEASURED
+	// AFTER BEING REFUSED. The clause says "There shall be two sequences of
+	// shared object group entries: the ones for objects located in the first
+	// page, followed by the ones for objects located in the shared objects
+	// section", and then "The order of items in EACH SEQUENCE shall be as
+	// follows". Read strictly, each sequence would be column-major and
+	// byte-aligned ON ITS OWN — which differs from one run of nshared_total
+	// entries whenever the first sequence's widths do not end on a byte.
 	//
-	// ⛔ NO FILE IN THIS PACKAGE'S CORPUS CAN SETTLE IT: every fixture has
-	// nshared_total == nshared_first_page, so the second sequence is empty
-	// throughout and both readings agree. Decoding it under a guess would
-	// produce group lengths and object counts that parse and are wrong — the
-	// silent failure this whole arc exists to avoid — so a non-empty second
-	// sequence is refused, by name, until a file that exercises it exists.
-	if h.NSharedTotal > h.NSharedFirstPage {
-		return nil, nil, fmt.Errorf("%w: the table has %d group(s) for the shared objects "+
-			"section beyond the first page's %d, and F.4.2's two sequences may each be "+
-			"column-major on their own — no file in this package's corpus settles which, so "+
-			"this is refused rather than decoded under a guess",
-			errHintTable, h.NSharedTotal-h.NSharedFirstPage, h.NSharedFirstPage)
-	}
+	// ⛔ THE CORPUS COULD NOT SETTLE IT, SO A FIXTURE WAS BUILT FOR IT.
+	// testdata's qpdf files all have nshared_total == nshared_first_page, so
+	// the second sequence is empty and both readings agree. A document whose
+	// LATER pages share a fat object page one does not use gives qpdf a
+	// non-empty part 8 — and the group lengths then separate the readings:
+	//
+	//	min_group_length 99, nbits_delta_group_length 9, lengths 108, 99, 601
+	//	  so the deltas are 9, 0 and 502
+	//	bits after the 24-byte header:
+	//	  00000100 10000000 00111110 11000000
+	//	ONE RUN:       bits 0-8 = 9, 9-17 = 0, 18-26 = 111110110 = 502  ✓
+	//	TWO SEQUENCES: would align to bit 24 and read 110000000 = 384   ✗
+	//
+	// ⭐ So qpdf writes a single run of nshared_total entries, confirmed on
+	// three- and five-page fixtures, and that is what this reads. The first
+	// attempt at this function read one run by assumption; being unable to
+	// justify it, it refused instead; and the refusal is gone now because the
+	// assumption turned out to be measurable. The spec's wording remains
+	// ambiguous and the measurement does not.
 
 	groups := make([]sharedGroup, total)
 

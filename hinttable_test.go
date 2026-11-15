@@ -594,43 +594,88 @@ func TestATableClaimingMoreGroupsThanTheDocumentHasObjectsIsRefused(t *testing.T
 	}
 }
 
-// ⛔⛔⛔ AND F.4.2's SECOND SEQUENCE IS REFUSED RATHER THAN GUESSED AT, which is
-// the honest answer to a question the corpus cannot settle.
+// ⛔⛔⛔ F.4.2's "TWO SEQUENCES" ARE ONE COLUMN-MAJOR RUN, AND THIS IS THE TEST
+// THAT SETTLED IT. The clause says there are two sequences of group entries —
+// first-page objects, then the shared objects section — and then gives the
+// item order "in EACH SEQUENCE". Read strictly, each would be column-major and
+// byte-aligned on its own, which differs from one run of nshared_total entries
+// whenever the first sequence's widths do not end on a byte.
 //
-// F.4.2: "There shall be two sequences of shared object group entries: the
-// ones for objects located in the first page, followed by the ones for objects
-// located in the shared objects section", and then "The order of items in EACH
-// SEQUENCE shall be as follows". Read strictly, each sequence is column-major
-// and byte-aligned on its own — which differs from one run of nshared_total
-// entries whenever the first sequence's widths do not end on a byte.
+// ⛔ The other committed fixtures all have nshared_total == nshared_first_page,
+// so their second sequence is empty and BOTH readings agree on every one of
+// them. testdata/linearized-shared.pdf has a non-empty part 8 and the two
+// readings then disagree:
 //
-// ⛔ EVERY FIXTURE HERE HAS nshared_total == nshared_first_page, so the second
-// sequence is empty and both readings agree. Decoding it under a guess would
-// produce group lengths and object counts that parse and are wrong, which is
-// the failure this whole arc exists to avoid. So it is refused by name until a
-// file that exercises it exists — and this test is where that refusal is
-// recorded, so lifting it is a deliberate act.
-func TestANonEmptySecondSequenceIsRefusedRatherThanGuessedAt(t *testing.T) {
-	// Three groups in all, one of them for the first page: two belong to the
-	// shared objects section.
-	b := sharedTableBytes(0, 0, 1, 3, 0, 0, 0, 0x00)
-	_, _, err := readSharedTable(&bits{b: b}, 0, 100)
-	if !errors.Is(err, errHintTable) {
-		t.Fatalf("a non-empty second sequence was decoded: %v", err)
-	}
-	if !strings.Contains(err.Error(), "2 group(s) for the shared objects section") {
-		t.Errorf("it was refused, but without naming how many: %v", err)
-	}
-	if !strings.Contains(err.Error(), "refused rather than decoded under a guess") {
-		t.Errorf("it was refused, but without saying the layout is unsettled: %v", err)
+//	min_group_length 99, nbits_delta_group_length 9, lengths 108, 99, 601
+//	bits after the 24-byte header: 00000100 10000000 00111110 11000000
+//	ONE RUN:       bits 0-8 = 9, 9-17 = 0, 18-26 = 111110110 = 502  -> 601  ✓
+//	TWO SEQUENCES: would align to bit 24 and read 110000000 = 384   -> 483  ✗
+//
+// ⭐ 601 came OUT OF THE DECODE and was not chosen to fit, which is what makes
+// this evidence rather than arithmetic. An earlier version of readSharedTable
+// REFUSED a non-empty second sequence because it could not justify either
+// reading; the refusal is gone because the question turned out to be
+// answerable with a file nobody had built.
+//
+// ⛔⛔ THE FIXTURE IS COMMITTED BYTES AND NOT GENERATED AT TEST TIME, which is
+// the difference between pinning a FORMAT question and tracking a TOOL. The
+// twelve generated shapes exist to check agreement with whatever qpdf is
+// installed; this file exists to hold one answer still, so a qpdf upgrade that
+// changed its output cannot silently change what is measured here.
+//
+// ⛔ ITS PROVENANCE, so it can be remade rather than reverse-engineered: a
+// three-page document written by this package's own writer, where pages 2 and
+// 3 point at ONE /Resources dictionary of eight Helvetica-BoldOblique fonts
+// and page 1 has its own empty one — F.3.9's definition of a part 8 object —
+// then `qpdf --linearize`, qpdf 12.4.2. The dictionary is deliberately FAT:
+// with a small one its group length IS min_group_length, so its delta is zero
+// and the padding bits are zero too, and both readings produce IDENTICAL
+// numbers. The first attempt at this fixture had a non-empty part 8 and still
+// settled nothing for exactly that reason.
+func TestTheSecondSequenceOfSharedGroupsIsOneRunWithTheFirst(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	const name = "linearized-shared.pdf"
+	path := filepath.Join("testdata", name)
+	linear, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// ⛔ THE CONTROL: a table whose every group belongs to the first page is
-	// accepted, so the refusal is about the second sequence and not about
-	// having groups at all.
-	b = sharedTableBytes(0, 0, 1, 1, 0, 0, 0, 0x00)
-	if _, _, err := readSharedTable(&bits{b: b}, 0, 100); err != nil {
-		t.Errorf("a table with only first-page groups was refused: %v", err)
+	d, err := Open(linear)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lin, err := Linearized(linear)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.readHintTables(lin)
+	if err != nil {
+		t.Fatalf("a file with a non-empty part 8 does not read: %v", err)
+	}
+
+	// ⛔ THE FIXTURE'S OWN PREMISE, ASSERTED: without a second sequence this
+	// test is the same as the ones above it and proves nothing new. If a
+	// future edit flattens the fixture, this says so rather than passing.
+	h := got.shared
+	if h.NSharedTotal <= h.NSharedFirstPage {
+		t.Fatalf("nshared_total %d and nshared_first_page %d: %s has an EMPTY second "+
+			"sequence, so it cannot distinguish the two readings",
+			h.NSharedTotal, h.NSharedFirstPage, name)
+	}
+
+	_, lengths := qpdfSharedTable(t, qpdf, path)
+	if len(got.sharedGroups) != len(lengths) {
+		t.Fatalf("read %d group(s), qpdf prints %d", len(got.sharedGroups), len(lengths))
+	}
+	// ⛔ AND THE LAST GROUP IS THE ONE THAT DECIDES: it lives in the second
+	// sequence, and the two readings give it different bits.
+	for i, g := range got.sharedGroups {
+		if g.Length != lengths[i] {
+			t.Errorf("group %d: length = %d, qpdf says %d — a group in the second sequence "+
+				"disagreeing means the one-run reading is wrong", i, g.Length, lengths[i])
+		}
 	}
 }
 
