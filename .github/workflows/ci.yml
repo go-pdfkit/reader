@@ -52,17 +52,47 @@ jobs:
       # architecture it never ran is the one outcome this matrix exists to
       # rule out."
       #
-      # aptneed because a mirror outage must not read as a missing judge:
-      # go-pdfkit/ops#90 was four red runs in half an hour on a third
-      # party's DNS. --need is the binary, not the package: apt saying yes is
-      # not qpdf being on PATH.
-      - name: Install qpdf, the foreign judge the linearization tests print by
+      # ⛔⛔ QPDF 12 AND NOT THE DISTRIBUTION'S 11.9.0, WHICH WAS MEASURED
+      # RATHER THAN PREFERRED. `--show-linearization` prints its "Computed
+      # Linearization Part Assignments" section only from qpdf 12 onwards, and
+      # that section IS the foreign judge the partition test compares against.
+      # On ubuntu's 11.9.0 it is absent: the test refused to compare against
+      # nothing — correctly, and the whole CI run went red to say so.
+      #
+      # ⛔ It is also the version measured against locally. A judge that
+      # differs between the terminal and CI is two judges, and the one that
+      # matters is whichever happens to be red.
+      #
+      # ⛔ THE DIGEST IS PINNED AS A LITERAL, not fetched: a checksum file
+      # served from the same release is only as trustworthy as the release, so
+      # what guards the download from here on is this recorded value, and a
+      # version bump needs a new one deliberately.
+      #
+      # ⛔⛔ AND HERE IS EXACTLY WHAT WAS AND WAS NOT VERIFIED, because "verified
+      # by hand" overstates it. On 2026-11-15 the zip was downloaded and its
+      # SHA-256 computed locally as
+      # db367d897829f22c4198ce1094143c9d467bd6ee7dfabc44ba6f02056b24f8b1, which
+      # matched the qpdf-12.4.2.sha256 published in the SAME release. That
+      # establishes the download was not corrupted in transit. It does NOT
+      # establish that the release is authentic — both came from one channel.
+      # The release also ships qpdf-12.4.2.sha256.sigstore and a .tar.gz.asc,
+      # which would be the independent channel and were NOT checked. Trust
+      # here is first-use, pinned; saying so is the point.
+      - name: Install qpdf 12, the foreign judge the linearization tests print by
+        env:
+          QPDF_VERSION: "12.4.2"
+          QPDF_SHA256: "db367d897829f22c4198ce1094143c9d467bd6ee7dfabc44ba6f02056b24f8b1"
         run: |
-          GOBIN=/usr/local/bin go install github.com/go-fleettools/fleettools/cmd/aptneed@latest
-          sudo aptneed --need qpdf qpdf
+          zip="qpdf-${QPDF_VERSION}-bin-linux-x86_64.zip"
+          curl -fsSL --retry 3 -O "https://github.com/qpdf/qpdf/releases/download/v${QPDF_VERSION}/${zip}"
+          printf '%s  %s\n' "$QPDF_SHA256" "$zip" | sha256sum -c -
+          sudo unzip -q -o "$zip" -d /opt/qpdf
+          echo "/opt/qpdf/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/opt/qpdf/lib" >> "$GITHUB_ENV"
 
       # Printed on purpose: the version is in the log, so "which qpdf agreed"
-      # is answerable after the fact rather than assumed.
+      # is answerable after the fact rather than assumed. It is also how the
+      # 11.9.0 finding above was diagnosed at all.
       - name: Say which qpdf will judge
         run: qpdf --version
 
