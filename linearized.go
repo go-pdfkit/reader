@@ -99,6 +99,25 @@ var (
 	// that is an indirect reference where "all values in this dictionary
 	// shall be direct objects".
 	ErrLinearizationMalformed = errors.New("reader: the linearization parameter dictionary is malformed")
+
+	// ErrHintTablesInvalid says the parameter dictionary agrees with the file
+	// and the hint tables /H names do not read as Annex F's F.4 describes
+	// them.
+	//
+	// ⛔⛔ IT IS A SEPARATE ERROR BECAUSE THE HINT TABLES ARE AN OPTIMISATION
+	// AND THE PARAMETERS ARE NOT. F.3.6: the tables let a reader fetch and
+	// display page one before the rest arrives. A file whose tables are wrong
+	// is still a correct PDF that any reader can open by the ordinary route —
+	// what it has lost is the fast path. A caller that cannot tell this from
+	// ErrLinearizationStale must either reject readable files or accept
+	// parameters that lie, and neither is what Table F.1 asks for.
+	//
+	// ⭐ testdata/linearized-gs.pdf is exactly this case and is committed for
+	// it: Ghostscript 10.08.0 writes sound parameters and hint tables that
+	// qpdf reports five problems in. Before this error existed the fixture had
+	// to be described in prose as "a positive for the parameters and a
+	// negative for the tables"; now the distinction is in the type.
+	ErrHintTablesInvalid = errors.New("reader: the hint tables do not describe this file")
 )
 
 // linearizationWindow is the first 1024 bytes, which F.3.3 says the parameter
@@ -257,6 +276,28 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	}
 	if err := checkFirstPageEnd(b, lin); err != nil {
 		return nil, err
+	}
+	// ⛔⛔ AND THE HINT TABLES THEMSELVES, WHICH NOTHING HERE READ UNTIL NOW.
+	// #40 named this gap in writing — "a file can pass this and still have hint
+	// tables that send a reader to the wrong offset" — and
+	// testdata/linearized-gs.pdf was committed as the file that does exactly
+	// that: sound parameters, and hint tables qpdf reports five problems in.
+	//
+	// ⛔ IT COMES LAST, DELIBERATELY. Every check above is about the parameter
+	// dictionary and the file's own landmarks, and each returns a message about
+	// the thing it tested. Decoding the tables needs /H and /S to have been
+	// established first, and running it earlier would answer a question about
+	// /S with a complaint about Table F.4.
+	//
+	// ⚠ WHAT THIS DOES AND DOES NOT CHECK. It requires the tables to DECODE as
+	// F.4 describes them — every width in 0..32, the entries inside the stream,
+	// the page offset table ending at or before /S, the counts bounded by the
+	// document. It does NOT yet compare their VALUES against the document: the
+	// page lengths and group lengths qpdf also reports on are the next step,
+	// and they need the partition. So this closes "the tables are unreadable"
+	// and not "the tables are wrong", and saying otherwise would overstate it.
+	if _, err := d.readHintTables(lin); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrHintTablesInvalid, err)
 	}
 	return lin, nil
 }
