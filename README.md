@@ -639,6 +639,19 @@ annex's item sizes, with every width set to 4 bits so the arithmetic is checkabl
 by eye. The (e)/(f) swap reddens **only** those cases — which is the measurement
 that says the corpus could not have caught it.
 
+⛔⛔ **And the first version of that test was blind in the same way.** Two pages
+at 4 bits each is exactly 8 bits per group, so every pad landed on a byte
+boundary anyway and deleting one changed nothing: the suite stayed green with
+group (f)'s `align()` removed. The case is three pages and three shared
+references, making every group 12 bits, so all seven pads are observable — and no
+two groups hold the same bytes, so the order is pinned as well as the padding.
+Item 1's deltas are 0,1,3 rather than 0,1,2 for exactly that reason, since group
+(c)'s values are forced to be the reference counts 0,1,2.
+
+The lesson generalises past this file: **a test written to witness padding has to
+use a shape whose padding is not zero.** A witness built on a round number
+witnesses nothing, and it looks identical to one that works.
+
 ⛔ An earlier version of the oracle's own comment claimed it proved "the whole
 layout". It does not, and the claim is now the measured list above. The oracle is
 the strongest instrument in this arc and it is still only as wide as its corpus.

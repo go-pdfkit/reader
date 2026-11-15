@@ -640,14 +640,32 @@ func TestTheGroupsQpdfLeavesEmptyAreLaidOutFromTheAnnex(t *testing.T) {
 			NBitsSharedNumerator: 4, // item 12, zero in every fixture
 			SharedDenominator:    1,
 		}
+		// ⛔⛔ THREE PAGES AND THREE REFERENCES, NOT TWO AND ONE, and that is
+		// the whole point of the shape. With two pages at 4 bits each, every
+		// "all pages" group is exactly 8 bits — one byte — so its pad is a
+		// no-op and deleting it changes nothing. Measured: with the first
+		// version of this test, deleting the align() after group (f) left the
+		// entire suite green.
+		//
+		// Three pages make each group 12 bits, and three references make
+		// groups (d) and (e) 12 bits too, so EVERY one of the seven pads has
+		// to be there for the bytes below to come out.
+		//
+		// ⛔ And no two groups hold the same bytes, so the order is pinned as
+		// well as the padding. Item 1's deltas are 0,1,3 rather than 0,1,2
+		// precisely so that group (a) cannot be confused with group (c), whose
+		// values are forced to be the reference counts 0,1,2.
 		pages := []pageEntry{
 			// Page 1 is at every minimum, and F.4 item 3 requires 0 shared
 			// references for it.
 			{NObjects: 1, Length: 10, ContentOffset: 0, ContentLength: 0},
-			// Page 2 is one above each minimum and carries one reference.
 			{
-				NObjects: 2, Length: 11, ContentOffset: 1, ContentLength: 1,
+				NObjects: 2, Length: 12, ContentOffset: 3, ContentLength: 4,
 				Shared: []sharedRef{{Identifier: 3, Numerator: 5}},
+			},
+			{
+				NObjects: 4, Length: 14, ContentOffset: 6, ContentLength: 8,
+				Shared: []sharedRef{{Identifier: 6, Numerator: 7}, {Identifier: 9, Numerator: 11}},
 			},
 		}
 
@@ -673,15 +691,16 @@ func TestTheGroupsQpdfLeavesEmptyAreLaidOutFromTheAnnex(t *testing.T) {
 			0x00, 0x04, // ...........12  nbits_shared_numerator  = 4
 			0x00, 0x01, // ...........13  shared_denominator      = 1
 			// Then F.4.1's seven lettered groups, column-major, each padded to
-			// a byte boundary. Two pages at 4 bits each fills one byte exactly;
-			// the single reference in (d) and (e) fills a nibble and pads.
-			0x01, // (a) item 1: deltas 0, 1       -> 0000 0001
-			0x01, // (b) item 2: deltas 0, 1       -> 0000 0001
-			0x01, // (c) item 3: counts 0, 1       -> 0000 0001
-			0x30, // (d) item 4: identifier 3      -> 0011 +pad
-			0x50, // (e) item 5: numerator 5       -> 0101 +pad
-			0x01, // (f) item 6: deltas 0, 1       -> 0000 0001
-			0x01, // (g) item 7: deltas 0, 1       -> 0000 0001
+			// a byte boundary. Three 4-bit values is TWELVE bits, so every
+			// group below carries four bits of zero padding — which is what
+			// makes each align() observable.
+			0x01, 0x30, // (a) item 1: deltas 0,1,3  -> 0000 0001 0011 +pad
+			0x02, 0x40, // (b) item 2: deltas 0,2,4  -> 0000 0010 0100 +pad
+			0x01, 0x20, // (c) item 3: counts 0,1,2  -> 0000 0001 0010 +pad
+			0x36, 0x90, // (d) item 4: idents 3,6,9  -> 0011 0110 1001 +pad
+			0x57, 0xb0, // (e) item 5: nums 5,7,11   -> 0101 0111 1011 +pad
+			0x03, 0x60, // (f) item 6: deltas 0,3,6  -> 0000 0011 0110 +pad
+			0x04, 0x80, // (g) item 7: deltas 0,4,8  -> 0000 0100 1000 +pad
 		}
 		if !bytes.Equal(got, want) {
 			t.Fatalf("the page offset table was written as\n % x\nand the annex lays it out as\n % x",
@@ -714,9 +733,9 @@ func TestTheGroupsQpdfLeavesEmptyAreLaidOutFromTheAnnex(t *testing.T) {
 		//   (d) item 4: NObjects-1, so 2 and 0     -> 0010 0000
 		//
 		// ⛔ Group (d) is the ONLY witness in this package that item 4 stores
-		// one LESS than the count: 3 objects are written as 2. An encoder that
-		// stored the count itself would put 0x30 there and no fixture would
-		// notice.
+		// one LESS than the count: 3 objects are written as 2, and 1 as 0. An
+		// encoder that stored the counts themselves would put 0x31 there
+		// (3 -> 0011, 1 -> 0001) and no fixture in the corpus would notice.
 		want := sharedTableBytes(0, 0, 1, 2, 4, 100, 4, 0x05, 0x00, 0x20)
 		if !bytes.Equal(got, want) {
 			t.Fatalf("the shared object table was written as\n % x\nand the annex lays it out as\n % x",
