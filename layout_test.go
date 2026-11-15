@@ -223,6 +223,86 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 	}
 }
 
+// ⛔⛔⛔ THE PER-PAGE SETS, JUDGED BY QPDF'S OWN PAGE OFFSET TABLE. Table F.4
+// item 1 is "the number of objects in a page", so qpdf publishes exactly the
+// figure Partition.Pages has to produce — a foreign judge for the input the
+// hint tables need, available before any file is written.
+//
+// ⛔ Partition was already computing these sets, once per page, and throwing
+// them away: Of answers which PART an object is in, and part 7 says "belongs to
+// exactly one page that is not the first" without ever saying which page. A
+// writer holding only Of knows the order to emit objects in and nothing to say
+// about them.
+//
+// ⚠ COMPARED AS A COUNT AND NOT AS A SET, because that is all qpdf publishes.
+// Two different sets of the same size would agree here, so this is weaker than
+// the byte comparisons elsewhere in this package — and it is still the only
+// outside witness for this quantity. Said plainly rather than implied.
+func TestThePerPageObjectCountsAgreeWithQpdf(t *testing.T) {
+	for _, pages := range []int{1, 2, 5, 25} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			qpdf := qpdfOrSkip(t)
+			_, linear := linearizedFixture(t, pages)
+
+			d, err := Open(linear)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := d.Partition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(p.Pages) != pages {
+				t.Fatalf("Partition reported %d page(s) and the document has %d",
+					len(p.Pages), pages)
+			}
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "in.pdf")
+			if err := os.WriteFile(path, linear, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			want := qpdfPageEntries(t, qpdf, path)
+			if len(want) != pages {
+				t.Fatalf("qpdf reported %d page(s) for a %d-page file", len(want), pages)
+			}
+
+			for i := range want {
+				if got := len(p.Pages[i]); got != int(want[i].nobjects) {
+					t.Errorf("page %d: %d object(s), qpdf says %d (ours: %v)",
+						i+1, got, want[i].nobjects, p.Pages[i])
+				}
+			}
+
+			// ⛔ AND THE SETS ARE SORTED AND HOLD THE PAGE'S OWN OBJECT, which
+			// the count cannot show. A writer emitting in map order would give
+			// a different file every run from the same input.
+			for i, set := range p.Pages {
+				if len(set) == 0 {
+					t.Errorf("page %d has no objects at all", i+1)
+					continue
+				}
+				for j := 1; j < len(set); j++ {
+					if set[j-1] >= set[j] {
+						t.Errorf("page %d's objects are not ascending: %v", i+1, set)
+						break
+					}
+				}
+			}
+			own := false
+			for _, num := range p.Pages[0] {
+				if num == p.FirstPageObject {
+					own = true
+				}
+			}
+			if !own {
+				t.Errorf("the first page's set %v does not hold its own object %d, and Table "+
+					"F.4 item 1 counts it", p.Pages[0], p.FirstPageObject)
+			}
+		})
+	}
+}
+
 // ⛔⛔ AN OBJECT IN A PART THE LAYOUT DOES NOT PLACE IS REFUSED, AND IT USED TO
 // VANISH. Part is an open int and Partition.Of is an exported map, so nothing
 // stops a caller — or a future part 3, 5, 10 or 11 — from holding a value the
