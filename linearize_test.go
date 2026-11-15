@@ -285,6 +285,30 @@ func TestOrderPutsPartFourBeforePartSixContiguously(t *testing.T) {
 			if err != nil {
 				t.Fatalf("this package cannot read the file it just wrote: %v", err)
 			}
+			// ⛔⛔ AND THE CHECKER RUNS ON IT, which until now nothing did:
+			// CheckLinearized appeared in this whole file only inside a
+			// comment. It is the ONLY witness for a wrong firstPageCount, and
+			// the boundary loop below cannot stand in for it — that loop uses
+			// counts it derived itself, so an off-by-one moves exactly one
+			// object relative to /H and the loop still passes. Measured both
+			// ways on all three shapes: one too small gives "/E says 830 and
+			// the first page ends at 745", one too large "/E says 870 and the
+			// first page ends at 925".
+			//
+			// ⭐ THE TWO COUNTS HAVE TWO NON-OVERLAPPING WITNESSES, and neither
+			// covers the other — worth stating because the next reader will
+			// assume the boundary check covers both. /E is strong here because
+			// it is derived TWICE INDEPENDENTLY: the writer sets it from an
+			// object's PART, and checkFirstPageEnd recomputes it from the last
+			// object listed in the FRONT SECTION. A wrong firstPageCount moves
+			// one and not the other. Conversely a wrong catalogueCount leaves
+			// the file self-consistent — with every part-4 and part-6 object in
+			// the first loop, the last front-section object really does end
+			// where /E says, CheckLinearized returns nil, and only the boundary
+			// below can see it. Each check is the other's blind spot.
+			if _, err := CheckLinearized(out); err != nil {
+				t.Fatalf("our own checker refuses the file we just wrote: %v", err)
+			}
 			written, err := Open(out)
 			if err != nil {
 				t.Fatal(err)
