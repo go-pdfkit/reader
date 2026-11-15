@@ -40,13 +40,20 @@ func TestQpdfReservesAConstantSpanForTheParameters(t *testing.T) {
 		}
 		start := loc[0]
 
-		// ⛔ THE `xref` KEYWORD AND NOT A LATER MATCH. A file with an xref
-		// STREAM has no such keyword at the front at all, and searching the
-		// whole file would measure a span that does not exist —
+		// ⛔ THE `\nxref\n` SECTION AND NOT A BARE `xref`. A file with an xref
+		// STREAM has no such section at all, and searching for the four
+		// letters anywhere measures a span that does not exist —
 		// testdata/linearized-objstm.pdf did exactly that to the probe this
-		// test grew from, matching the letters inside an object stream's
-		// compressed data. Hence the search starts at the object and the two
-		// fixtures here are the classic-xref ones.
+		// test grew from, reporting a 1499-byte gap.
+		//
+		// ⛔⛔ AND THE REASON I FIRST WROTE HERE WAS FABRICATED. It said the
+		// probe had matched "the letters inside an object stream's compressed
+		// data", which sounded right because the gap printed as binary.
+		// Measured: that file holds ZERO occurrences of "\nxref\n" and exactly
+		// one "xref", at byte 1597 of 1612, inside the trailing `startxref`.
+		// The gap was binary because object streams lay between, not because
+		// the match was in them. The observation was real and the mechanism I
+		// inferred from it was invented.
 		rel := bytes.Index(b[start:], []byte("\nxref\n"))
 		if rel < 0 {
 			t.Fatalf("%s has no xref keyword after its first object", name)
@@ -71,8 +78,51 @@ func TestQpdfReservesAConstantSpanForTheParameters(t *testing.T) {
 		t.Errorf("both parameter objects are %d bytes, so this pair cannot show that the span "+
 			"absorbs a width change: %+v", a.object, got)
 	}
+	// ⛔⛔ AND THE SPAN IS 201 EXACTLY, which qpdf's source says it must be:
+	// libqpdf/QPDFWriter.cc's writeLinearized() holds `static int const pad =
+	// 200` and writes `pad` less the object's bytes as spaces, then a newline.
+	// Pinning the number and not just its constancy is what makes this test a
+	// witness to the MECHANISM rather than to a coincidence of two documents.
+	if a.span != 201 {
+		t.Errorf("qpdf reserved %d bytes and its source reserves 200 spaces plus a newline; "+
+			"either the constant moved or this measurement is wrong", a.span)
+	}
 	t.Logf("qpdf: span %d, objects %d and %d, padding %d and %d",
 		a.span, a.object, b.object, a.span-a.object, b.span-b.object)
+}
+
+// ⛔⛔ AND THE TWO PRODUCERS DISAGREE ABOUT THE SPAN, which is the third thing
+// the pair above needs and did not assert. Two files both saying 201 invite the
+// next reader to take 201 as normative — and then paramSpan's 256 looks
+// arbitrary rather than chosen. Ghostscript reserves 131 for the same part, so
+// the span is each producer's decision and this package is entitled to its own.
+func TestTheTwoProducersReserveDifferentSpans(t *testing.T) {
+	objStart := regexp.MustCompile(`(?m)^\d+ 0 obj\n`)
+
+	span := func(name string) int {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		loc := objStart.FindIndex(b)
+		if loc == nil {
+			t.Fatalf("%s has no leading indirect object", name)
+		}
+		rel := bytes.Index(b[loc[0]:], []byte("\nxref\n"))
+		if rel < 0 {
+			t.Fatalf("%s has no xref section after its first object", name)
+		}
+		return rel + 1
+	}
+
+	qpdf, gs := span("linearized.pdf"), span("linearized-gs.pdf")
+	if qpdf == gs {
+		t.Fatalf("both producers reserve %d bytes, so the span looks like a property of the "+
+			"FORMAT rather than a producer's choice — and this package's 256 would need a "+
+			"different justification", qpdf)
+	}
+	t.Logf("qpdf reserves %d, Ghostscript %d: the span is a producer's choice", qpdf, gs)
 }
 
 // ⛔⛔ AND THE SPAN THIS PACKAGE WRITES DOES NOT MOVE WITH THE NUMBERS, which is
@@ -222,5 +272,65 @@ func TestParametersTooWideForTheSpanAreRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "are reserved") {
 		t.Errorf("it was refused without saying what the span is: %v", err)
+	}
+}
+
+// ⛔⛔ A NEGATIVE VALUE IS REFUSED, AND THE FIRST VERSION ACCEPTED ONE. Every
+// one of Table F.1's values is a length, an offset or a count, so none can be
+// below zero — but the fields are int64 and nothing said so.
+//
+// ⛔ WHAT THAT BROKE WAS A CLAIM, not behaviour. Review measured all seven at
+// math.MinInt64: 209 bytes with a six-digit object number and 213 with a
+// ten-digit one, against the 202 this package calls its widest. Both fit 256,
+// so no file was ever wrong — but "202 is the widest this function can produce"
+// was true only of non-negative values, and the test pinning 202 used a
+// non-negative case, so it could not see its own gap. The refusal is what makes
+// the sentence true.
+func TestNegativeParametersAreRefused(t *testing.T) {
+	ok := linParams{L: 1367, H0: 550, H1: 127, O: 7, E: 902, N: 2, T: 1169}
+
+	for _, c := range []struct {
+		name string
+		mut  func(*linParams)
+		want string
+	}{
+		{"/L", func(p *linParams) { p.L = -1 }, "/L is -1"},
+		{"/H's offset", func(p *linParams) { p.H0 = -1 }, "/H's offset is -1"},
+		{"/H's length", func(p *linParams) { p.H1 = -1 }, "/H's length is -1"},
+		{"/O", func(p *linParams) { p.O = -1 }, "/O is -1"},
+		{"/E", func(p *linParams) { p.E = -1 }, "/E is -1"},
+		{"/N", func(p *linParams) { p.N = -1 }, "/N is -1"},
+		{"/T", func(p *linParams) { p.T = -1 }, "/T is -1"},
+		{"the widest negative, which review measured at 209 bytes",
+			func(p *linParams) { *p = linParams{L: -9223372036854775808} }, "/L is -9223372036854775808"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := ok
+			c.mut(&p)
+			out, err := p.object(4)
+			if !errors.Is(err, ErrLinearizationTooWide) {
+				t.Fatalf("it was accepted: %v, %d bytes", err, len(out))
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but not naming %s: %v", c.want, err)
+			}
+			if out != nil {
+				t.Errorf("it was refused AND returned %d bytes", len(out))
+			}
+		})
+	}
+
+	// ⛔ A negative OBJECT NUMBER too, which is the eighth way in and is not a
+	// Table F.1 value.
+	if _, err := ok.object(-1); !errors.Is(err, ErrLinearizationTooWide) {
+		t.Errorf("object number -1 was accepted: %v", err)
+	}
+
+	// ⛔ THE CONTROL: zero is not negative, and /H's offset legitimately could
+	// be nothing in a malformed-but-writable file; refusing it would be a
+	// ceiling in the wrong direction.
+	zero := linParams{}
+	if _, err := zero.object(0); err != nil {
+		t.Errorf("all-zero parameters were refused, and zero is not negative: %v", err)
 	}
 }

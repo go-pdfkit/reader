@@ -43,22 +43,38 @@ var ErrLinearizationTooWide = errors.New("reader: the linearization parameters d
 // fixed-width placeholders, which would need every value padded and would make
 // the dictionary's own text depend on the pass.
 //
-// ⚠ 256 IS THIS PACKAGE'S CHOICE, not either producer's, and the margin is
-// MEASURED rather than estimated: the widest object this function can produce —
-// seven int64 values at their maximum and a six-digit object number — is
-// **202 bytes**, asserted by TestTheParameterObjectIsAlwaysTheReservedWidth.
+// ⭐⭐ AND IT IS CONFIRMED FROM QPDF'S SOURCE, not only from its output. Review
+// read libqpdf/QPDFWriter.cc's writeLinearized():
 //
-// ⭐ So qpdf's 201 misses the worst case by exactly ONE byte. That is the whole
-// reason not to copy it, and it is a measurement rather than the "would not fit
-// a file at the top of the range" hand-wave that stood here first.
+//	static int const pad = 200;
+//	... write(QIntC::to_size(pos - pipeline->getCount() + pad), ' ').write("\n")
+//
+// 200 spaces less whatever the object took, then a newline: the span is exactly
+// 201, written after `endobj`. So 82+119 and 83+118 fall straight out, and the
+// reserved-span reading is a fact about the producer rather than an inference
+// from two files. Its own comment gives the budget: "200 characters is enough
+// space if all numerical values ... that contain offsets are 20 digits long
+// plus a few extra characters for safety" — the same reasoning reached here
+// independently, which is corroboration rather than coincidence.
+//
+// ⭐ qpdf ABORTS rather than writing a wrong file if its object exceeds 200:
+// the count goes negative and QIntC::to_size throws. That is the same choice as
+// the refusal below, arrived at by both producers of this code.
+//
+// ⚠ 256 IS THIS PACKAGE'S CHOICE, not qpdf's, and the margin is MEASURED: the
+// widest object this function can produce — seven int64 values at their maximum
+// and a six-digit object number — is **202 bytes**, asserted by
+// TestTheParameterObjectIsAlwaysTheReservedWidth. qpdf's own 201 would not hold
+// it, which is why its 20-digit budget needs the negative refusal below to be
+// true of this format too.
 //
 // ⚠ AND IT ALREADY ACCOMMODATES THE FORM THIS FUNCTION CANNOT YET WRITE. Table
 // F.1's /H is an array of two integers, or FOUR when the file carries an
 // overflow hint stream — which [Linearization] reads (HasOverflowHint) and
-// linParams has no field for. Two more int64 values at 19 digits plus a space
-// each is 40 bytes, so the widest four-value dictionary is about 242 and still
-// inside the span. Supporting it later will not need a wider reservation; it is
-// recorded here so that nobody re-derives the number when it does.
+// linParams has no field for. Measured, not estimated: the widest four-value
+// dictionary is **242 bytes**, so the margin is fourteen. An earlier note said
+// "about 242 and still inside the span", which was right about the number and
+// vague about the room; fourteen bytes is the room.
 //
 // ⛔ IT IS A var SO THAT A TEST CAN SHRINK IT, the same seam intMax and
 // maxDecodedSize already use in this package. Without that the refusal below
@@ -89,6 +105,34 @@ type linParams struct {
 // this whole arc exists to prevent, and it is worth a refusal rather than a
 // best effort.
 func (p linParams) object(num int) ([]byte, error) {
+	// ⛔⛔ A NEGATIVE IS REFUSED, AND THE FIRST VERSION ACCEPTED ONE. Every one
+	// of Table F.1's values is a length, an offset or a count, so none can be
+	// below zero — but the fields are int64 and nothing said so, and a minus
+	// sign costs a byte each. Review measured the gap: all seven at
+	// math.MinInt64 with a six-digit object number is 209 bytes, and 213 with
+	// a ten-digit one, against the 202 this file claims as its widest.
+	//
+	// ⛔ Both still fit 256, so nothing was broken — what was wrong is the
+	// CLAIM. "202 is the widest this function can produce" was true only of
+	// non-negative values, and the test pinned 202 against a non-negative case,
+	// so it could not see its own gap. Refusing a negative is what makes the
+	// sentence true rather than nearly true.
+	if num < 0 {
+		return nil, fmt.Errorf("%w: object number %d is negative", ErrLinearizationTooWide, num)
+	}
+	for _, c := range []struct {
+		name string
+		v    int64
+	}{
+		{"/L", p.L}, {"/H's offset", p.H0}, {"/H's length", p.H1},
+		{"/O", p.O}, {"/E", p.E}, {"/N", p.N}, {"/T", p.T},
+	} {
+		if c.v < 0 {
+			return nil, fmt.Errorf("%w: %s is %d, and every value of Table F.1 is a length, "+
+				"an offset or a count", ErrLinearizationTooWide, c.name, c.v)
+		}
+	}
+
 	body := fmt.Sprintf("%d 0 obj\n<< /Linearized 1 /L %d /H [ %d %d ] /O %d /E %d /N %d /T %d >>\nendobj\n",
 		num, p.L, p.H0, p.H1, p.O, p.E, p.N, p.T)
 	if len(body) > paramSpan {
