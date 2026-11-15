@@ -6,9 +6,11 @@
 package reader
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -26,19 +28,37 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 	for _, c := range []struct {
 		pages, fonts int
 		fixture      string
+		extra        []string
+		name         string
 	}{
 		{pages: 1}, {pages: 2}, {pages: 5}, {pages: 25},
 		{pages: 10, fonts: 4}, {pages: 25, fonts: 8},
 		// ⛔ THE ONLY PART 8 IN THE CORPUS. The shared-font shapes have the
 		// first page reference the shared dictionary too, and F.3.9 keeps such
-		// an object in part 6, so six of these seven cannot see part 8 at all.
+		// an object in part 6, so the others cannot see part 8 at all.
 		{fixture: "linearized-shared.pdf"},
+		// ⛔⛔ AND THE ONLY SHAPE WITH A COMPRESSED OBJECT. Review measured
+		// that NONE of the seven above uses object streams — zero
+		// compressed-or-absent objects each — so the `continue` for an object
+		// without an offset of its own never ran, and with it the
+		// carry-forward of the previous part's bound was dead. An object
+		// inside a stream has no offset to compare, and a part whose objects
+		// are ALL compressed must not reset the bound to -1.
+		{pages: 5, extra: []string{"--object-streams=generate"},
+			name: "5 pages in object streams"},
 	} {
-		name := fmt.Sprintf("%d pages %d fonts", c.pages, c.fonts)
-		if c.fixture != "" {
-			name = c.fixture
+		name := c.name
+		if name == "" {
+			name = fmt.Sprintf("%d pages %d fonts", c.pages, c.fonts)
+			if c.fixture != "" {
+				name = c.fixture
+			}
 		}
 		t.Run(name, func(t *testing.T) {
+			if c.extra != nil {
+				qpdfExtra = c.extra
+				defer func() { qpdfExtra = nil }()
+			}
 			var linear []byte
 			switch {
 			case c.fixture != "":
@@ -62,7 +82,10 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 				t.Fatalf("qpdf's own file cannot be partitioned: %v", err)
 			}
 
-			order := p.Order()
+			order, err := p.Order()
+			if err != nil {
+				t.Fatalf("qpdf's own file cannot be laid out: %v", err)
+			}
 			if len(order) != len(p.Of) {
 				t.Fatalf("Order() returned %d object(s) and the partition placed %d — "+
 					"a layout that drops an object writes a file missing it",
@@ -74,6 +97,7 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 			var lastPart Part
 			var maxBefore int64 = -1
 			var maxInPart int64 = -1
+			compressed := 0
 			seen := map[int]bool{}
 			for i, num := range order {
 				part := p.Of[num]
@@ -95,7 +119,10 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 
 				e, ok := d.xref[num]
 				if !ok || e.kind != 'n' {
-					continue // inside an object stream: no offset of its own
+					// Inside an object stream: no offset of its own, so it
+					// cannot be compared and must not reset the bound.
+					compressed++
+					continue
 				}
 				if e.offset <= maxBefore {
 					t.Errorf("object %d is in %v at byte %d, which is before the end of an "+
@@ -110,7 +137,28 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 			if len(order) == 0 {
 				t.Fatal("Order() returned nothing, so the walk above checked nothing")
 			}
-			t.Logf("%d object(s) in F.3.1's order, agreeing with qpdf's offsets", len(order))
+
+			// ⛔⛔ THE OBJECT-STREAM SHAPE MUST ACTUALLY HAVE ONE, asserted
+			// rather than hoped. Coverage cannot answer this: the branch it
+			// exercises is in THIS FILE, and test files are not instrumented,
+			// so a shape that quietly stopped producing compressed objects
+			// would leave the carry-forward dead again with every test green —
+			// which is how review found it dead in the first place.
+			if c.extra != nil && compressed == 0 {
+				t.Fatalf("this shape was added for objects with no offset of their own and "+
+					"has %d of them; --object-streams=generate is no longer doing what the "+
+					"case is named for", compressed)
+			}
+			// ⛔ AND THE CONTROL: the shapes NOT asking for object streams must
+			// have none, or the case above is not the only one reaching that
+			// branch and its name is a half-truth.
+			if c.extra == nil && compressed != 0 {
+				t.Errorf("a shape that did not ask for object streams has %d compressed "+
+					"object(s), so the dedicated case is not what covers that branch",
+					compressed)
+			}
+			t.Logf("%d object(s) in F.3.1's order, %d with no offset of their own, "+
+				"agreeing with qpdf's offsets", len(order), compressed)
 		})
 	}
 }
@@ -136,7 +184,10 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 		4: PartFirstPage,    // 6
 		5: PartCatalog,      // 4
 	}}
-	got := p.Order()
+	got, err := p.Order()
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []int{5, 4, 3, 2, 1}
 	if len(got) != len(want) {
 		t.Fatalf("Order() = %v, want %v", got, want)
@@ -153,12 +204,70 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 		9: PartFirstPage, 7: PartFirstPage, 8: PartFirstPage,
 		2: PartOther, 1: PartOther,
 	}}
-	got = p.Order()
+	got, err = p.Order()
+	if err != nil {
+		t.Fatal(err)
+	}
 	want = []int{7, 8, 9, 1, 2}
+	// ⛔ THE LENGTH IS ASSERTED HERE TOO, which review found missing: without
+	// it an Order() that DUPLICATED an object passed this block, since the loop
+	// below only indexes the first len(want) entries.
+	if len(got) != len(want) {
+		t.Fatalf("Order() = %v, want %v", got, want)
+	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("Order() = %v, want %v — the segment sort is wrong, or it sorted "+
 				"the whole slice and lost the parts", got, want)
 		}
+	}
+}
+
+// ⛔⛔ AN OBJECT IN A PART THE LAYOUT DOES NOT PLACE IS REFUSED, AND IT USED TO
+// VANISH. Part is an open int and Partition.Of is an exported map, so nothing
+// stops a caller — or a future part 3, 5, 10 or 11 — from holding a value the
+// five-part walk does not match. Measured by review on the first version:
+//
+//	Of: {1: PartCatalog, 2: Part(5), 3: PartOther}  ->  [1 3], no error
+//
+// Three objects in, two out. A layout that loses an object writes a file
+// missing it, and the file still OPENS: the cross-reference table simply never
+// mentions it, so a reader following a reference to it fails on a document that
+// looked written. Partition refuses rather than guesses; so does this.
+//
+// ⛔ THE LENGTH CHECK IN THE FIXTURE TEST COULD NOT CATCH THIS, which is why
+// the refusal is here and not left to it: its only partitions come from
+// Document.Partition, which assigns exactly the five, so the guard had no
+// input that could fire it.
+func TestAnObjectInAPartTheLayoutDoesNotPlaceIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		part Part
+	}{
+		{"a part this package never assigns", Part(5)},
+		{"the zero part, which is what an unset entry holds", Part(0)},
+		{"a part number past the eleven", Part(99)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := &Partition{Of: map[int]Part{1: PartCatalog, 2: c.part, 3: PartOther}}
+			got, err := p.Order()
+			if !errors.Is(err, ErrCannotLayOut) {
+				t.Fatalf("Order() = %v, %v — want ErrCannotLayOut", got, err)
+			}
+			if !strings.Contains(err.Error(), "object 2") {
+				t.Errorf("it was refused without naming the object: %v", err)
+			}
+			if got != nil {
+				t.Errorf("it was refused AND returned %v; a caller that ignores the error "+
+					"would write a file missing an object", got)
+			}
+		})
+	}
+
+	// ⛔ THE CONTROL: the same shape with every part known is accepted, so the
+	// refusal is about the unknown part and not about this partition.
+	p := &Partition{Of: map[int]Part{1: PartCatalog, 2: PartShared, 3: PartOther}}
+	if _, err := p.Order(); err != nil {
+		t.Errorf("a partition using only the five parts was refused: %v", err)
 	}
 }
