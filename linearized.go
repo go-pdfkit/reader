@@ -568,11 +568,27 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// predicate is "the dictionary DIRECTLY says this stream is not filtered",
 	// and every other answer — including "I cannot tell" — leaves the bound
 	// alone.
+	// ⛔⛔ AND THE TABLE'S OWN HEADER MUST FIT, which is 24 bytes and not one.
+	// Table F.5 gives the shared object hint table's header as seven items of
+	// 32, 32, 32, 32, 16, 32 and 16 bits = 192 bits, so a table beginning at
+	// /S occupies at least bytes [S, S+24). The earlier bound only required
+	// byte S itself to exist, which accepts a stream whose /S leaves room for
+	// a fifth of a header.
+	//
+	// ⛔ IT IS 24 AND NOT 25, DELIBERATELY. F.4.2 says the header is "followed
+	// by one or more shared object group entries", so strictly a conforming
+	// table has at least one group entry too — but those are BIT-PACKED, and
+	// Table F.6's items are sized by Table F.5's items 7 and 5, which may both
+	// be zero. A group entry can therefore be a single bit (item 2's signature
+	// flag alone), and demanding a whole further byte would refuse a file over
+	// one bit. The gain is a byte and the risk is refusing what conforms,
+	// which this check has already been corrected for once.
 	if rawIsTheData(s.Dict) {
-		if int64(pos) >= int64(len(s.Raw)) {
+		if int64(pos)+sharedTableHeaderBytes > int64(len(s.Raw)) {
 			return fmt.Errorf("%w: the primary hint stream's /S is %d and its data is %d bytes, "+
-				"so the shared object table starts outside the stream",
-				ErrLinearizationStale, int64(pos), len(s.Raw))
+				"so the shared object table's own %d-byte header (Table F.5, seven items of 192 bits) "+
+				"does not fit inside the stream",
+				ErrLinearizationStale, int64(pos), len(s.Raw), sharedTableHeaderBytes)
 		}
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
@@ -587,6 +603,16 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	}
 	return nil
 }
+
+// sharedTableHeaderBytes is the size of the shared object hint table's header
+// section: Table F.5's seven items of 32, 32, 32, 32, 16, 32 and 16 bits =
+// 192 bits. A table beginning at /S therefore occupies at least [S, S+24).
+//
+// ⛔ It is a package-level constant so that the test counting the boundary
+// counts with the SAME number the check uses. A test spelling 24 beside a
+// check spelling 24 stops testing the boundary the moment either is edited
+// alone, and the suite stays green — "judge and subject must count alike".
+const sharedTableHeaderBytes = 24
 
 // rawIsTheData says whether a stream dictionary DIRECTLY states that its
 // stream is not filtered, so that the raw bytes are the data and a position

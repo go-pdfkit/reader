@@ -199,9 +199,23 @@ writer is being developed, because an uncompressed hint stream is what somebody
 debugging one emits — Ghostscript writes one unfiltered, and qpdf does under
 `--compress-streams=n`.
 
-⛔ The question is "does the dictionary **directly state** that the raw bytes
-are the data", and it has three answers, not two. *Filtered*, *not filtered*
-and *cannot tell* are distinct, and only the second licenses the bound:
+⛔⛔ **And what must fit is 24 bytes, not one.** Table F.5 gives the shared
+object hint table's own header as seven items of 32, 32, 32, 32, 16, 32 and 16
+bits — 192 bits — so a table beginning at `/S` occupies at least bytes
+`[S, S+24)`. The first version of this bound required only byte `S` itself to
+exist, which accepts a stream leaving room for a fifth of a header.
+
+⛔ It is 24 and not 25, deliberately. F.4.2 says the header is "followed by one
+or more shared object group entries", so a conforming table has at least one
+entry too — but Table F.6's items are sized by Table F.5's items 7 and 5, which
+may both be zero, so a group entry can be a **single bit**. Demanding a whole
+further byte would refuse a conforming file over one bit, and this check has
+already been corrected once for refusing what it could not evaluate.
+
+⛔ The question of whether the bound applies at all is "does the dictionary
+**directly state** that the raw bytes are the data", and it has three answers,
+not two. *Filtered*, *not filtered* and *cannot tell* are distinct, and only
+the second licenses the bound:
 
 | the dictionary says | the bound |
 |---|---|
@@ -242,6 +256,38 @@ claim cannot quietly stop being tested.
 one — qpdf's own default output — with `/S` past the **decoded** data, qpdf
 still reports `offset is out of bounds` and this still accepts. That gap is the
 open limit above, not a disagreement about what `/S` means.
+
+### ⛔⛔ The Ghostscript fixture's hint tables are wrong, and it is still a positive here
+
+`testdata/linearized-gs.pdf` is committed as a file this checker **accepts**,
+and `qpdf --check` on that exact file exits 3 with five warnings:
+
+```
+shared object 0 length mismatch: hint table = 65536; computed = 115
+shared object 1 length mismatch: hint table = 65536; computed = 118
+shared object 2 length mismatch: hint table = 65536; computed = 19
+page length mismatch for page 0: hint table = 230; computed length = 252
+page length mismatch for page 1: hint table = 242; computed length = 248
+```
+
+It is a positive for the **parameters** and a negative for the **hint tables**,
+which is exactly the property #40 predicted in writing — "a file can pass this
+and still have hint tables that send a reader to the wrong offset" — now a
+named file in the corpus rather than a risk noted in an issue.
+
+⛔ **So Ghostscript is not the model for the writer's hint tables.**
+`min_group_length: 65536` is `0x10000`, a placeholder never filled in. On the
+same run qpdf's own fixture reports `min_group_length: 31` with group lengths
+96, 98 and 31, and exits **0 with no warnings**. When #40's step 3 writes hint
+tables, the shape to copy is qpdf's.
+
+⚠ This is recorded as a test (`TestTheGhostscriptFixtureHasHintTablesQpdfRefuses`),
+which is a **witness and not a guard**: nothing in this package can make it
+fail, because it asserts a fact about a fixture and an external tool. Its
+control — that qpdf's own output draws no `mismatch` — is what keeps it from
+being vacuous. It is also the todo marker: when hint-table checking lands,
+`CheckLinearized` should refuse this fixture, and that test is where the change
+will announce itself.
 
 ⛔⛔ The last three rows are there because an earlier version had only the first
 two, and refused what it could not evaluate. An indirect `/Filter` reported as
@@ -342,9 +388,11 @@ qpdf refuses. The end-of-line is now **read** rather than guessed, and every
 spelling of one (LF, CR, CRLF, none) has its own test — a tolerance wide
 enough to cover every line ending is wide enough to hide a wrong length.
 
-Still not checked, by either: the hint tables (F.4). `qpdf --check` remains the
-foreign judge, and it is run across 1/2/5/25 pages × plain, object-streams and
-uncompressed-streams.
+Still not checked **here**: the hint tables (F.4). ⛔ Not "by either" — qpdf
+does check them, which is how the Ghostscript fixture's five warnings above
+were found, and saying otherwise understated the foreign judge while this
+package was the one with the gap. `qpdf --check` remains that judge, and it is
+run across 1/2/5/25 pages × plain, object-streams and uncompressed-streams.
 
 The positives are **qpdf's** output, not fixtures written to agree with this
 reading of Annex F. On five real library scans linearized by qpdf and judged by

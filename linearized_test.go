@@ -986,7 +986,7 @@ func TestASharedTablePositionOutsideAnUnfilteredStreamIsRefused(t *testing.T) {
 	if !errors.Is(err, ErrLinearizationStale) {
 		t.Fatalf("error is %v, want ErrLinearizationStale", err)
 	}
-	if !strings.Contains(err.Error(), "starts outside the stream") {
+	if !strings.Contains(err.Error(), "does not fit inside the stream") {
 		t.Errorf("it was refused, but not for /S being past the data: %v", err)
 	}
 }
@@ -1006,38 +1006,41 @@ func TestTheUnfilteredFixtureItselfIsAccepted(t *testing.T) {
 }
 
 // ⛔⛔ AND THE BOUNDARY ITSELF, WHICH THE TEST ABOVE DOES NOT HOLD. Review
-// measured three mutations of `pos >= len(s.Raw)` that left the whole suite
-// GREEN: `>`, `>= len-1` and `>= len+1`. The reason is that the only values
-// the suite exercised were 99 against 67 bytes and 43 against 64 — both far
-// from the edge, so any comparison in the neighbourhood passes. A bound that
-// nothing holds at its edge is the recurring shape in this file: #43's
+// measured three mutations of the bound that left the whole suite GREEN: `>`,
+// `>= len-1` and `>= len+1`. The reason is that the only values the suite
+// exercised were 99 against 67 bytes and 43 against 64 — both far from the
+// edge, so any comparison in the neighbourhood passes. A bound that nothing
+// holds at its edge is the recurring shape in this file: #43's
 // `last >= len(b)` survived as `>` for exactly the same reason.
 //
-// ⛔ TWO CASES KILL ALL THREE, and a third would kill nothing. /S one byte
-// inside must be ACCEPTED (which refutes `>= len-1`); /S exactly at the end
-// must be REFUSED (which refutes both `>` and `>= len+1`). Adding /S above the
-// end would only repeat the second, so it is deliberately absent — an extra
-// case that cannot fail is a measurement that reports its own index.
+// ⛔ AND THE EDGE MOVED ONCE THE SPEC WAS READ. The first version of this
+// test asked for room for /S's own first BYTE. Table F.5 gives the shared
+// object hint table's header as seven items of 192 bits, so what must fit is
+// 24 bytes, and the boundary is at hintFixtureData-24 rather than at
+// hintFixtureData-1. The test that pinned the old edge was correct about a
+// weaker claim; reading F.4.2 is what made the stronger one available.
 //
-// ⛔ The claim being pinned is that the table needs room for its own first
-// byte: the shared object hint table opens with a Table F.5 header, so a table
-// starting AT the end of the data has nowhere to put it. /S == len is
-// unrepresentable in a conforming file, not merely unusual.
-func TestTheSharedTableMustLeaveRoomForItsOwnFirstByte(t *testing.T) {
+// ⛔ TWO CASES STILL KILL ALL THREE NEIGHBOURS. The header fitting EXACTLY
+// must be ACCEPTED (which refutes `+25` and `>=`), and one byte short must be
+// REFUSED (which refutes `+23`). A third case further out would kill nothing,
+// so it is deliberately absent — an extra case that cannot fail is a
+// measurement that reports its own index.
+func TestTheSharedTableHeaderMustFitInsideTheStream(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		s      int
 		refuse bool
 	}{
-		{"one byte inside the data", hintFixtureData - 1, false},
-		{"exactly at the end of the data", hintFixtureData, true},
+		{"the header fits exactly", hintFixtureData - sharedTableHeaderBytes, false},
+		{"the header is one byte short", hintFixtureData - sharedTableHeaderBytes + 1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			b, lin := hintFixture(t, strconv.Itoa(c.s))
 			err := checkHintStream(b, lin)
 			if !c.refuse {
 				if err != nil {
-					t.Fatalf("/S %d is inside %d bytes and was refused: %v", c.s, hintFixtureData, err)
+					t.Fatalf("/S %d leaves %d bytes of %d for a %d-byte header and was refused: %v",
+						c.s, hintFixtureData-c.s, hintFixtureData, sharedTableHeaderBytes, err)
 				}
 				return
 			}
@@ -1045,10 +1048,69 @@ func TestTheSharedTableMustLeaveRoomForItsOwnFirstByte(t *testing.T) {
 				t.Fatalf("/S %d against %d bytes was accepted (or refused oddly): %v",
 					c.s, hintFixtureData, err)
 			}
-			if !strings.Contains(err.Error(), "starts outside the stream") {
-				t.Errorf("it was refused, but not for /S being past the data: %v", err)
+			if !strings.Contains(err.Error(), "does not fit inside the stream") {
+				t.Errorf("it was refused, but not for the header not fitting: %v", err)
+			}
+			// ⛔ AND THE SIZE IS ASSERTED AS A LITERAL. The cases above are
+			// computed FROM sharedTableHeaderBytes so that they cannot drift
+			// from the fixture — but that makes them MOVE WITH the constant,
+			// so changing 24 to 23 left both of them green, measured. The
+			// 36-byte floor was already held against that by accident of
+			// style, through "cannot begin before byte 36" in its own message
+			// assertion; this bound was not.
+			//
+			// ⚠ FOR THE VALUE THIS LINE IS REDUNDANT, and review said so:
+			// TestTheSharedTableHeaderSizeIsTableF5sOwnArithmetic pins the
+			// constant against Table F.5's sum on its own, and kills the same
+			// mutations. It is kept for a DIFFERENT claim — that the refusal
+			// still names the size it is enforcing — because a reader handed
+			// "does not fit inside the stream" with no number cannot tell
+			// which of F.3's and F.5's two headers was meant.
+			if !strings.Contains(err.Error(), "24-byte header") {
+				t.Errorf("the refusal does not name a 24-byte header, so Table F.5's "+
+					"arithmetic has changed and nothing else would have said so: %v", err)
 			}
 		})
+	}
+}
+
+// ⛔⛔ AND WHERE 24 COMES FROM, BECAUSE A CONSTANT IS A CLAIM ABOUT THE SPEC
+// AND NOTHING WAS CHECKING IT. The literal in the message above refuses a
+// changed value; this refuses a changed REASON. Table F.5 gives the shared
+// object hint table's header as seven items, and 24 is their sum in bytes —
+// so the test spells the items out and does the arithmetic, which is the only
+// form in which the next reader can check it against the document rather than
+// against my word.
+//
+// ⛔ It also asserts the sum is a whole number of bytes. It is, at 192 bits,
+// and a bit-packed header that was not would make "the header occupies bytes
+// [S, S+n)" the wrong shape of claim rather than merely a wrong n.
+func TestTheSharedTableHeaderSizeIsTableF5sOwnArithmetic(t *testing.T) {
+	// Table F.5, items 1 to 7 in order, sizes in bits:
+	//   1  32  the object number of the first object in the shared objects section
+	//   2  32  the location of that object
+	//   3  32  the number of shared object entries for the first page
+	//   4  32  the number for the shared objects section, including item 3
+	//   5  16  bits needed for the greatest number of objects in a group
+	//   6  32  the least length of a shared object group in bytes
+	//   7  16  bits needed for the difference between greatest and least length
+	items := []int{32, 32, 32, 32, 16, 32, 16}
+
+	bits := 0
+	for _, n := range items {
+		bits += n
+	}
+	if bits != 192 {
+		t.Fatalf("Table F.5's seven items sum to %d bits, not 192 — the item list in this "+
+			"test disagrees with the one in the comment above sharedTableHeaderBytes", bits)
+	}
+	if bits%8 != 0 {
+		t.Fatalf("the header is %d bits, which is not a whole number of bytes, so bounding "+
+			"it in BYTES is the wrong shape of claim", bits)
+	}
+	if want := bits / 8; sharedTableHeaderBytes != want {
+		t.Errorf("sharedTableHeaderBytes = %d, but Table F.5's %d items give %d bits = %d bytes",
+			sharedTableHeaderBytes, len(items), bits, want)
 	}
 }
 
@@ -1074,7 +1136,7 @@ func TestAFilterThatFiltersNothingIsStillBounded(t *testing.T) {
 			if !errors.Is(err, ErrLinearizationStale) {
 				t.Fatalf("%s was treated as filtered, so /S went unbounded: %v", c.name, err)
 			}
-			if !strings.Contains(err.Error(), "starts outside the stream") {
+			if !strings.Contains(err.Error(), "does not fit inside the stream") {
 				t.Errorf("it was refused, but not for /S being past the data: %v", err)
 			}
 		})
@@ -1232,13 +1294,21 @@ func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
 	// cases above fail for their kind and not because this hand-built stream
 	// is unacceptable for some other reason.
 	//
-	// ⭐ AND IT EARNED ITS KEEP IMMEDIATELY. The first version of this fixture
+	// ⭐ AND IT EARNED ITS KEEP TWICE. The first version of this fixture
 	// carried `/Length 0` and no data, so when the unfiltered upper bound on
 	// /S arrived, this control went red — /S 43 does point outside zero bytes.
-	// The check was right and the fixture was not; without the control the
-	// seven cases above would have gone on passing for the wrong reason.
+	// Then reading Table F.5 raised the bound from "byte S exists" to "24
+	// bytes from S exist", and `/S 43` against 64 bytes went red AGAIN: 43+24
+	// is 67. Both times the check was right and the fixture was not, and both
+	// times the control is what said so rather than the seven cases above
+	// quietly starting to pass for the length instead of for the kind.
+	//
+	// ⛔ A conforming /S for this fixture now lives in [36, 40]: at least 36
+	// by Table F.3's header and at most hintFixtureData-24 by Table F.5's.
+	// The window is narrow because the fixture is minimal, and naming both
+	// ends here is what keeps the next edit of hintFixtureData honest.
 	t.Run("an integer is accepted", func(t *testing.T) {
-		b, lin := hintFixture(t, "43")
+		b, lin := hintFixture(t, strconv.Itoa(hintFixtureData-sharedTableHeaderBytes))
 		if err := checkHintStream(b, lin); err != nil {
 			t.Fatalf("an integer /S was refused, so these cases prove nothing: %v", err)
 		}
@@ -1397,6 +1467,79 @@ func TestQpdfAlsoRefusesASharedTablePositionOutsideTheStream(t *testing.T) {
 	}
 	if got := check("gs.pdf", intact); strings.Contains(got, outOfBounds) {
 		t.Errorf("qpdf says that about the UNEDITED fixture too, so the phrase decides nothing:\n%s", got)
+	}
+}
+
+// ⛔⛔ AND THE GHOSTSCRIPT FIXTURE'S HINT TABLES ARE WRONG, WHICH NOTHING HERE
+// SAID. testdata/linearized-gs.pdf is committed as a POSITIVE and
+// TestTheUnfilteredFixtureItselfIsAccepted asserts this package accepts it —
+// while `qpdf --check` on that exact file exits 3 with five warnings. The
+// fixture is a positive for the PARAMETERS and a negative for the HINT
+// TABLES, and a corpus that records only the first half invites the next
+// reader to treat Ghostscript as a model for the second.
+//
+// ⛔⛔ IT IS NOT A MODEL. qpdf reports `min_group_length: 65536` for it —
+// 0x10000, a placeholder never filled in — against computed group lengths of
+// 115, 118 and 19, plus page-length mismatches on both pages. On the same
+// run, qpdf's OWN fixture reports min_group_length 31 with group lengths 96,
+// 98 and 31, and exits 0 with no warnings. So when #40's step 3 writes hint
+// tables, the shape to copy is qpdf's.
+//
+// ⭐ AND THIS IS THE PROPERTY #40 PREDICTED IN WRITING: "a file can pass this
+// and still have hint tables that send a reader to the wrong offset". It is
+// now a file in the corpus that does exactly that, named, rather than a risk
+// noted in an issue. The test is the todo marker: when hint-table checking
+// lands, CheckLinearized should refuse this fixture and this test is where
+// that change announces itself.
+//
+// ⛔ IT IS A CHARACTERISATION TEST, AND "NOTHING IN OUR CODE CAN BREAK IT" IS
+// NOT THE WEAKNESS IT SOUNDS LIKE — which is a correction to how this comment
+// first read. The test is falsifiable by the things that actually drift here: a
+// qpdf upgrade that stops warning, a changed message, or this fixture being
+// replaced. Those are exactly what a README quoting qpdf's output needs guarded,
+// and none of them would be noticed otherwise.
+func TestTheGhostscriptFixtureHasHintTablesQpdfRefuses(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	check := func(name string) string {
+		t.Helper()
+		cmd := exec.Command(qpdf, "--check", filepath.Join("testdata", name))
+		cmd.Stdin = nil
+		// ⛔ The status is discarded as everywhere else here: qpdf calls these
+		// warnings and exits 3, and exits 0 for files it has refused in other
+		// ways. The verdict is in the text.
+		out, _ := cmd.CombinedOutput()
+		got := string(out)
+		if !strings.Contains(got, "PDF Version:") {
+			t.Fatalf("qpdf did not report on %s at all, so what it does not say proves nothing:\n%s", name, got)
+		}
+		return got
+	}
+
+	// ⛔ Both complaints are asserted, because they are about different halves
+	// of F.4: a page length belongs to the page offset hint table (Table F.4,
+	// item 2) and a group length to the shared object hint table (Table F.6,
+	// item 1). A test matching only one would keep passing if Ghostscript
+	// fixed the other.
+	gs := check("linearized-gs.pdf")
+	for _, want := range []string{
+		"page length mismatch",
+		"length mismatch: hint table = 65536",
+	} {
+		if !strings.Contains(gs, want) {
+			t.Errorf("qpdf did not report %q about the Ghostscript fixture, so this test's "+
+				"premise is gone and the README says something it cannot back:\n%s", want, gs)
+		}
+	}
+
+	// ⛔ THE CONTROL, and here it carries more than usual: without it,
+	// "mismatch" might be something qpdf says about every linearized file,
+	// and the asymmetry this test exists to record would be no asymmetry at
+	// all. qpdf's own output must be clean.
+	own := check("linearized.pdf")
+	if strings.Contains(own, "mismatch") {
+		t.Errorf("qpdf complains about its OWN output too, so a mismatch decides nothing "+
+			"and it cannot be the model for #40's hint tables:\n%s", own)
 	}
 }
 
