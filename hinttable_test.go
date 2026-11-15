@@ -6,6 +6,7 @@
 package reader
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -196,6 +197,550 @@ func TestEveryPageEntryAgreesWithQpdf(t *testing.T) {
 			})
 		}
 	}
+}
+
+// ⛔⛔ THE SHARED OBJECT HINT TABLE, WHICH TABLE F.2 MARKS Required AND WHICH
+// THE GHOSTSCRIPT FIXTURE GETS WRONG. qpdf prints all seven of Table F.5's
+// header fields and each group's length, so the comparison is field by field
+// against the reference implementation's reading of the same bytes.
+//
+// ⚠ EVERY FILE IN THIS CORPUS HAS nshared_total == nshared_first_page, so the
+// SECOND sequence F.4.2 describes — the groups for objects in part 8 — is
+// empty throughout, and nothing here exercises it. That is a fact about the
+// corpus and it is stated rather than left for someone to discover: these
+// fixtures have no object shared between later pages but not the first.
+func TestTheSharedObjectTableAgreesWithQpdf(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	for _, shape := range []struct {
+		name  string
+		extra []string
+	}{
+		{"as qpdf writes it", nil},
+		{"with object streams", []string{"--object-streams=generate"}},
+		{"with streams uncompressed", []string{"--compress-streams=n"}},
+	} {
+		for _, pages := range []int{1, 2, 5, 25} {
+			t.Run(shape.name+", "+strconv.Itoa(pages)+" pages", func(t *testing.T) {
+				qpdfExtra = shape.extra
+				defer func() { qpdfExtra = nil }()
+				_, linear := linearizedFixture(t, pages)
+
+				d, err := Open(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lin, err := Linearized(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := d.readHintTables(lin)
+				if err != nil {
+					t.Fatalf("the hint tables of a file qpdf linearized do not read: %v", err)
+				}
+
+				path := filepath.Join(t.TempDir(), "linear.pdf")
+				if err := os.WriteFile(path, linear, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				fields, lengths := qpdfSharedTable(t, qpdf, path)
+
+				h := got.shared
+				for _, c := range []struct {
+					field string
+					got   uint32
+				}{
+					{"first_shared_obj", h.FirstSharedObj},
+					{"first_shared_offset", h.FirstSharedOffset},
+					{"nshared_first_page", h.NSharedFirstPage},
+					{"nshared_total", h.NSharedTotal},
+					{"nbits_nobjects", uint32(h.NBitsNObjects)},
+					{"min_group_length", h.MinGroupLength},
+					{"nbits_delta_group_length", uint32(h.NBitsDeltaGroupLength)},
+				} {
+					w, ok := fields[c.field]
+					if !ok {
+						t.Errorf("qpdf printed no %s, so it is compared against nothing", c.field)
+						continue
+					}
+					if c.got != w {
+						t.Errorf("%s = %d, qpdf says %d", c.field, c.got, w)
+					}
+				}
+
+				if len(got.sharedGroups) != len(lengths) {
+					t.Fatalf("read %d group(s), qpdf prints %d", len(got.sharedGroups), len(lengths))
+				}
+				for i, g := range got.sharedGroups {
+					if g.Length != lengths[i] {
+						t.Errorf("group %d: length = %d, qpdf says %d", i, g.Length, lengths[i])
+					}
+				}
+			})
+		}
+	}
+}
+
+// ⛔⛔ AND THE THREE ITEMS QPDF DOES NOT PRINT, WHICH THE TEST ABOVE THEREFORE
+// DOES NOT CHECK. qpdf's shared-table output is the seven header fields and
+// one "group length" per group — nothing else. So Table F.6's item 2 (the
+// signature flag), item 3 (the 16-byte MD5) and item 4 (the object count) are
+// decoded and compared against NOTHING, and so is the byte alignment between
+// groups (b), (c) and (d).
+//
+// ⭐ ITEM 4 HAS A SECOND WITNESS IN THIS PACKAGE, and it is independent of the
+// decoder: F.4.2 says "All objects associated with the first page (part 6)
+// shall have entries in the shared object hint table, regardless of whether
+// they are actually shared", so the first nshared_first_page groups' object
+// counts must sum to the number of objects part 6 holds — and Partition
+// computes part 6 from the page tree without reading a hint table at all. Two
+// quantities derived by different routes agreeing is worth more than either
+// one agreeing with itself.
+//
+// ⚠ Items 2 and 3 have NO witness: see the test below, which records that no
+// fixture in this corpus sets the flag.
+func TestTheFirstPageGroupsAccountForEveryObjectInPartSix(t *testing.T) {
+	qpdfOrSkip(t)
+
+	for _, shape := range []struct {
+		name  string
+		extra []string
+	}{
+		{"as qpdf writes it", nil},
+		{"with streams uncompressed", []string{"--compress-streams=n"}},
+	} {
+		for _, pages := range []int{1, 2, 5, 25} {
+			t.Run(shape.name+", "+strconv.Itoa(pages)+" pages", func(t *testing.T) {
+				qpdfExtra = shape.extra
+				defer func() { qpdfExtra = nil }()
+				_, linear := linearizedFixture(t, pages)
+
+				d, err := Open(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lin, err := Linearized(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tables, err := d.readHintTables(lin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				p, err := d.Partition()
+				if err != nil {
+					t.Fatalf("the partition this is checked against refused the file: %v", err)
+				}
+
+				inPartSix := 0
+				for _, part := range p.Of {
+					if part == PartFirstPage {
+						inPartSix++
+					}
+				}
+
+				first := int(tables.shared.NSharedFirstPage)
+				if first > len(tables.sharedGroups) {
+					t.Fatalf("nshared_first_page is %d and only %d group(s) were read",
+						first, len(tables.sharedGroups))
+				}
+				sum := 0
+				for _, g := range tables.sharedGroups[:first] {
+					sum += int(g.NObjects)
+				}
+				if sum != inPartSix {
+					t.Errorf("the first %d shared group(s) account for %d object(s) and the "+
+						"partition puts %d in part 6 — Table F.6 item 4 (the object count, "+
+						"which qpdf does not print) or the partition is wrong",
+						first, sum, inPartSix)
+				}
+			})
+		}
+	}
+}
+
+// ⛔⛔ AND NO FIXTURE IN THIS CORPUS SETS THE SIGNATURE FLAG, which is recorded
+// here rather than left for someone to assume otherwise. Table F.6 item 2 is
+// one bit and item 3 is the 16-byte MD5 it guards; with the flag clear
+// throughout, item 3's read is never taken and the alignment after group (c)
+// is never exercised by a real file.
+//
+// ⛔ THE RISK IS SPECIFIC: a reader that always consumed 128 bits there, or
+// never did, would agree with every file here and be 16 bytes out of step on
+// the first signed group it met. This test is the marker for that gap — if it
+// ever fails because a producer started signing, the decoder has gained a
+// witness and this comment should go.
+func TestNoFixtureSetsASharedObjectSignature(t *testing.T) {
+	qpdfOrSkip(t)
+
+	signed := 0
+	for _, pages := range []int{1, 2, 5, 25} {
+		_, linear := linearizedFixture(t, pages)
+		d, err := Open(linear)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lin, err := Linearized(linear)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tables, err := d.readHintTables(lin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, g := range tables.sharedGroups {
+			if g.Signature != nil {
+				signed++
+			}
+		}
+	}
+	if signed != 0 {
+		t.Errorf("%d group(s) carry a signature, so Table F.6 item 3 now HAS a witness in "+
+			"the corpus — delete the comment that says it does not", signed)
+	}
+}
+
+// sharedTableBytes builds a Table F.5 header followed by whatever the caller
+// appends, so that a crafted shared object table can be handed to the reader
+// directly.
+//
+// ⛔ The header is written as the annex lays it out — four 32-bit items, a
+// 16-bit one, a 32-bit one, a 16-bit one — so a test reading it back is
+// checking the reader against the annex's layout rather than against another
+// copy of the reader's own idea of it.
+func sharedTableBytes(firstObj, firstOff, nFirstPage, nTotal uint32, nbitsNObjects uint16, minLen uint32, nbitsDelta uint16, rest ...byte) []byte {
+	be32 := func(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
+	be16 := func(v uint16) []byte { return []byte{byte(v >> 8), byte(v)} }
+
+	var b []byte
+	b = append(b, be32(firstObj)...)
+	b = append(b, be32(firstOff)...)
+	b = append(b, be32(nFirstPage)...)
+	b = append(b, be32(nTotal)...)
+	b = append(b, be16(nbitsNObjects)...)
+	b = append(b, be32(minLen)...)
+	b = append(b, be16(nbitsDelta)...)
+	return append(b, rest...)
+}
+
+// ⛔⛔ THE SIGNATURE PATH, WHICH NO FILE IN THE CORPUS EXERCISES. Table F.6 item
+// 2 is a one-bit flag and item 3 is the 16-byte MD5 it guards; every fixture
+// here leaves the flag clear, so this is the only thing that reads item 3 at
+// all. A synthetic witness is weaker than a real file and far better than
+// none: a reader that always consumed 128 bits there, or never did, would
+// agree with every fixture and be sixteen bytes out of step on the first
+// signed group it met.
+func TestASharedGroupsSignatureIsReadWhenItsFlagIsSet(t *testing.T) {
+	sig := []byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
+	// One group; no bits for its length or object count, so the only bits
+	// after the header are the flag byte and the signature.
+	body := append([]byte{0x80}, sig...)
+	b := sharedTableBytes(0, 0, 1, 1, 0, 0, 0, body...)
+
+	_, groups, err := readSharedTable(&bits{b: b}, 0, 100)
+	if err != nil {
+		t.Fatalf("a signed group was refused: %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("read %d group(s), want 1", len(groups))
+	}
+	if got := groups[0].Signature; !bytes.Equal(got, sig) {
+		t.Errorf("signature = % x, want % x", got, sig)
+	}
+	// ⛔ AND ITEM 4's +1: the stored count is 0 bits wide and therefore 0, and
+	// F.4.2 calls item 4 "1 less than the number of objects in the group", so
+	// the group holds ONE object. A reader that kept the raw value would
+	// report every group as holding one too few.
+	if got := groups[0].NObjects; got != 1 {
+		t.Errorf("NObjects = %d, want 1: item 4 is one LESS than the count", got)
+	}
+}
+
+// ⛔ AND AN UNSIGNED GROUP KEEPS NO SIGNATURE, which is the control: without it
+// the case above would hold against a reader that invented sixteen bytes for
+// every group.
+func TestAnUnsignedSharedGroupHasNoSignature(t *testing.T) {
+	b := sharedTableBytes(0, 0, 1, 1, 0, 0, 0, 0x00)
+	_, groups, err := readSharedTable(&bits{b: b}, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groups[0].Signature != nil {
+		t.Errorf("an unsigned group carries % x", groups[0].Signature)
+	}
+}
+
+// ⛔⛔ EVERY WAY THE SHARED OBJECT TABLE CAN BE REFUSED, each named for what is
+// wrong. The table is Required by Table F.2, so a reader that fell back to
+// "no shared objects" on a broken one would quietly report a document as
+// having none — which is indistinguishable from a conforming single-page file.
+func TestEveryWayTheSharedObjectTableIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		b    []byte
+		at   int
+		want string
+	}{
+		{
+			name: "/S points outside the stream",
+			b:    make([]byte, 24),
+			at:   99,
+			want: "a table was placed at byte 99",
+		},
+		{
+			name: "the header is short of Table F.5's 24 bytes",
+			b:    make([]byte, 23),
+			want: "Table F.5, item 7 of 7",
+		},
+		{
+			name: "nbits_nobjects is not a width",
+			b:    sharedTableBytes(0, 0, 1, 1, 65535, 0, 0),
+			want: "nbits_nobjects is 65535",
+		},
+		{
+			name: "nbits_delta_group_length is not a width",
+			b:    sharedTableBytes(0, 0, 1, 1, 0, 0, 65535),
+			want: "nbits_delta_group_length is 65535",
+		},
+		{
+			// ⛔ Table F.5 item 4 INCLUDES item 3, so a total below the
+			// first-page count is a contradiction rather than a small number.
+			name: "the total is below the first page's count",
+			b:    sharedTableBytes(0, 0, 5, 2, 0, 0, 0),
+			want: "item 4 includes item 3",
+		},
+		{
+			name: "more groups than the table has bits for",
+			b:    sharedTableBytes(0, 0, 0, 255, 0, 0, 8),
+			want: "255 shared object group(s)",
+		},
+		{
+			// ⛔ One byte beyond the header, and an eight-bit length delta:
+			// the bound passes (one group needs one bit of flag and eight
+			// remain) and group (a) then wants eight bits for the length and
+			// a ninth for the flag. That the bound counts only item 2's bit
+			// is what leaves this reachable.
+			name: "a group length runs out",
+			b:    sharedTableBytes(0, 0, 1, 1, 0, 0, 16, 0x00),
+			want: "Table F.6 item 1, the group length",
+		},
+		{
+			// ⛔ A one-bit length delta over one group: (a) reads one bit and
+			// ALIGNS to the next byte, leaving nothing for the flag. The
+			// alignment is why this differs from the case above.
+			name: "a signature flag runs out",
+			b:    sharedTableBytes(0, 0, 1, 1, 0, 0, 1, 0x00),
+			want: "Table F.6 item 2, the signature flag",
+		},
+		{
+			name: "a signature runs out",
+			b:    sharedTableBytes(0, 0, 1, 1, 0, 0, 0, 0x80, 0x01, 0x02),
+			want: "Table F.6 item 3, the signature",
+		},
+		{
+			name: "an object count runs out",
+			b:    sharedTableBytes(0, 0, 1, 1, 8, 0, 0, 0x00),
+			want: "Table F.6 item 4, the object count",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := readSharedTable(&bits{b: c.b}, c.at, 1000)
+			if !errors.Is(err, errHintTable) {
+				t.Fatalf("it was accepted (or refused oddly): %v", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but the message does not say %q: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// ⛔⛔⛔ ONE BIT OF INPUT MUST NOT BECOME A 32-BYTE STRUCT, which review found by
+// MEASURING rather than reading: the bit bound is satisfied by 16.7 million
+// groups in 2 MiB of zeros, and allocating them cost 656 MiB — a 256-fold
+// amplification that a 1 GiB decoded stream takes into the hundreds of
+// gigabytes. A trivial deflate bomb reaches that.
+//
+// ⛔ A BIT BOUND CANNOT CATCH IT, because the input is not lying: 2 MiB really
+// does hold 16.7 million one-bit flags. What is absurd is the CLAIM — F.4.2's
+// groups describe "a group of adjacent objects", so a table naming more groups
+// than the document has objects is describing objects the file does not have.
+//
+// ⚠ The numbers here are small on purpose: the defect is the RATIO, and
+// asserting a refusal needs no 2 MiB fixture. The real measurement is in the
+// comment where it can be read, rather than in a test that costs a second.
+func TestATableClaimingMoreGroupsThanTheDocumentHasObjectsIsRefused(t *testing.T) {
+	// Sixty-four bytes hold 512 bits, so 200 one-bit flags fit and the bit
+	// bound passes. A document of five objects cannot have 200 groups.
+	b := sharedTableBytes(0, 0, 200, 200, 0, 0, 0, make([]byte, 40)...)
+	_, _, err := readSharedTable(&bits{b: b}, 0, 5)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("200 groups in a 5-object document were accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the document has 5 object(s)") {
+		t.Errorf("it was refused, but not against the document's object count: %v", err)
+	}
+
+	// ⛔ THE CONTROL: the same table in a document large enough to hold those
+	// groups passes the cap, so the refusal is about the ratio and not about
+	// the table. It then fails further on for want of bits, which is the other
+	// bound doing its job.
+	_, _, err = readSharedTable(&bits{b: b}, 0, 1000)
+	if err != nil && strings.Contains(err.Error(), "the document has") {
+		t.Errorf("a document of 1000 objects was still refused by the object cap: %v", err)
+	}
+}
+
+// ⛔⛔⛔ AND F.4.2's SECOND SEQUENCE IS REFUSED RATHER THAN GUESSED AT, which is
+// the honest answer to a question the corpus cannot settle.
+//
+// F.4.2: "There shall be two sequences of shared object group entries: the
+// ones for objects located in the first page, followed by the ones for objects
+// located in the shared objects section", and then "The order of items in EACH
+// SEQUENCE shall be as follows". Read strictly, each sequence is column-major
+// and byte-aligned on its own — which differs from one run of nshared_total
+// entries whenever the first sequence's widths do not end on a byte.
+//
+// ⛔ EVERY FIXTURE HERE HAS nshared_total == nshared_first_page, so the second
+// sequence is empty and both readings agree. Decoding it under a guess would
+// produce group lengths and object counts that parse and are wrong, which is
+// the failure this whole arc exists to avoid. So it is refused by name until a
+// file that exercises it exists — and this test is where that refusal is
+// recorded, so lifting it is a deliberate act.
+func TestANonEmptySecondSequenceIsRefusedRatherThanGuessedAt(t *testing.T) {
+	// Three groups in all, one of them for the first page: two belong to the
+	// shared objects section.
+	b := sharedTableBytes(0, 0, 1, 3, 0, 0, 0, 0x00)
+	_, _, err := readSharedTable(&bits{b: b}, 0, 100)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("a non-empty second sequence was decoded: %v", err)
+	}
+	if !strings.Contains(err.Error(), "2 group(s) for the shared objects section") {
+		t.Errorf("it was refused, but without naming how many: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refused rather than decoded under a guess") {
+		t.Errorf("it was refused, but without saying the layout is unsettled: %v", err)
+	}
+
+	// ⛔ THE CONTROL: a table whose every group belongs to the first page is
+	// accepted, so the refusal is about the second sequence and not about
+	// having groups at all.
+	b = sharedTableBytes(0, 0, 1, 1, 0, 0, 0, 0x00)
+	if _, _, err := readSharedTable(&bits{b: b}, 0, 100); err != nil {
+		t.Errorf("a table with only first-page groups was refused: %v", err)
+	}
+}
+
+// ⛔ AND THE TWO WAYS /S CAN FAIL TO LOCATE THE TABLE AT ALL. checkHintStream
+// already requires /S to be a direct integer, so these are reached only by a
+// caller that skipped it — which is exactly why they are refusals rather than
+// assumptions.
+func TestAHintStreamWhoseSlashSCannotLocateTheTableIsRefused(t *testing.T) {
+	const head = "%PDF-1.7\n"
+	for _, c := range []struct {
+		name, body, want string
+	}{
+		{
+			name: "no /S at all",
+			body: "<< /Length 36 >>",
+			want: "has no /S",
+		},
+		{
+			name: "an /S that is not an integer",
+			body: "<< /S /x /Length 36 >>",
+			want: "not a direct integer",
+		},
+		{
+			// ⛔ The page offset table reads and the SHARED one does not, so
+			// the failure has to come out of readHintTables rather than be
+			// swallowed: a thirty-six byte stream is the header exactly, and
+			// /S 99 is past it. checkHintStream refuses such an /S before
+			// this is reached in normal use, which is why the propagation
+			// needs a test of its own.
+			name: "an /S past the end of the stream",
+			body: "<< /S 99 /Length 36 >>",
+			want: "a table was placed at byte 99",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := bareDoc(nil, nil, nil)
+			d.buf = []byte(head + "9 0 obj\n" + c.body + "\nstream\n" +
+				strings.Repeat("\x00", 36) + "\nendstream\nendobj\n")
+			_, err := d.readHintTables(&Linearization{HintOffset: len(head), PageCount: 1})
+			if !errors.Is(err, errHintTable) {
+				t.Fatalf("it was accepted: %v", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but not for %q: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// qpdfSharedTable reads the shared object hint table's header fields and each
+// group's length out of --show-linearization.
+//
+// ⛔ IT READS ONLY FROM THE SECTION HEADING ONWARDS, because the page offset
+// table above it prints a field named nbits_nobjects too — a parser taking the
+// whole output would compare one table's width against the other's.
+func qpdfSharedTable(t *testing.T, qpdf, path string) (map[string]uint32, []uint32) {
+	t.Helper()
+
+	cmd := exec.Command(qpdf, "--show-linearization", path)
+	cmd.Stdin = nil
+	out, _ := cmd.CombinedOutput()
+	text := string(out)
+
+	const start = "Shared Objects Hint Table"
+	from := strings.Index(text, start)
+	if from < 0 {
+		t.Fatalf("qpdf printed no %q section:\n%s", start, text)
+	}
+	section := text[from+len(start):]
+	if to := strings.Index(section, "Computed Linearization Part Assignments"); to >= 0 {
+		section = section[:to]
+	}
+
+	fields := map[string]uint32{}
+	var lengths []uint32
+	inGroup := false
+	for _, line := range strings.Split(section, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Shared Object ") && strings.HasSuffix(trimmed, ":") {
+			inGroup = true
+			continue
+		}
+		name, value, ok := strings.Cut(trimmed, ": ")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+		if err != nil {
+			continue
+		}
+		if inGroup {
+			if name == "group length" {
+				lengths = append(lengths, uint32(n))
+			}
+			continue
+		}
+		fields[name] = uint32(n)
+	}
+	// ⛔ SEVEN, ASSERTED, for the reason the page offset header's thirteen are:
+	// a parser that matched nothing hands back an empty map and every lookup
+	// misses, which reads as seven separate "compared against nothing" errors
+	// rather than naming the cause once.
+	if len(fields) != 7 {
+		t.Fatalf("read %d header field(s) from qpdf's shared object table, want Table F.5's "+
+			"seven: %v\n%s", len(fields), fields, text)
+	}
+	if len(lengths) == 0 {
+		t.Fatalf("qpdf printed no group lengths, so the group comparison would be vacuous:\n%s", text)
+	}
+	return fields, lengths
 }
 
 // qpdfPage is one page as qpdf prints it.
@@ -691,18 +1236,32 @@ func TestANonZeroSharedCountOnTheFirstPageIsRefused(t *testing.T) {
 // and each costs two reads; without this bound a twelve-byte table could ask
 // for billions of iterations and be refused only afterwards.
 func TestSharedReferencesThatCannotFitAreRefusedBeforeBeingRead(t *testing.T) {
-	// Page two claims 255 references at 8 + 8 bits each = 4080 bits, and the
-	// table has 96.
-	b := []byte{0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0}
-	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
-	if !errors.Is(err, errHintTable) {
-		t.Fatalf("255 references in a 12-byte table were accepted: %v", err)
-	}
-	if !strings.Contains(err.Error(), "255 shared object reference(s)") {
-		t.Errorf("it was refused, but without naming the count: %v", err)
-	}
-	if !strings.Contains(err.Error(), "bits, and") {
-		t.Errorf("it was refused, but without saying what was needed against what remains: %v", err)
+	// ⛔ THERE ARE TWO BOUNDS AND THEY CATCH DIFFERENT LIES, so each gets a
+	// case. The first caps the COUNT against the bits remaining, which is the
+	// only thing that stops a four-billion count whose fields are ZERO bits
+	// wide — a hole the shared object table's tests exposed in the original,
+	// which bounded the bit cost alone and so passed anything when that cost
+	// was nought. The second bounds the bit cost, for counts small enough to
+	// be plausible and still too expensive.
+	for _, c := range []struct {
+		name  string
+		count byte
+		want  string
+	}{
+		{"a count larger than the bits that remain", 255, "describe nothing"},
+		{"a count that is plausible and still too expensive", 6, "bits, and"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte{0, 0, 0, 0, 0, c.count, 0, 0, 0, 0, 0, 0}
+			_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
+			if !errors.Is(err, errHintTable) {
+				t.Fatalf("%d references in a 12-byte table were accepted: %v", c.count, err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but not by the bound this case is about (%q): %v",
+					c.want, err)
+			}
+		})
 	}
 }
 
