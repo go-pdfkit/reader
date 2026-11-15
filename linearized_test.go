@@ -938,6 +938,261 @@ func TestASharedTablePositionInsideThePageOffsetHeaderIsRefused(t *testing.T) {
 	})
 }
 
+// editedGS is editedFixture for the Ghostscript file. No padding arithmetic:
+// every edit here is same-width by construction, which the helper asserts, so
+// nothing in the file moves.
+func editedGS(t *testing.T, from, to string) []byte {
+	t.Helper()
+	if len(from) != len(to) {
+		t.Fatalf("%q and %q are not the same width, so this edit would move the file", from, to)
+	}
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if n := strings.Count(s, from); n != 1 {
+		t.Fatalf("%q appears %d times, so this edit is not the one it is named for", from, n)
+	}
+	return []byte(strings.Replace(s, from, to, 1))
+}
+
+// ⭐ THE UPPER BOUND ON /S, WHERE IT COSTS NOTHING. /S indexes the decoded
+// data, so bounding it above normally means decoding an attacker's bytes — the
+// reason it stayed open. But a stream with NO FILTER needs no decoding: its
+// raw bytes are its data.
+//
+// ⭐ GHOSTSCRIPT WRITES ONE UNFILTERED, which is why this is testable at all:
+// `<< /Length 67 /S 38 >>`, no /Filter, so the data is 67 bytes and /S 38 sits
+// inside it. qpdf's two fixtures are FlateDecode and are skipped by this
+// check, which is exactly the asymmetry being tested.
+//
+// ⛔ And it is the case that matters most while a writer is being developed,
+// since an uncompressed hint stream is what somebody debugging one emits.
+func TestASharedTablePositionOutsideAnUnfilteredStreamIsRefused(t *testing.T) {
+	// 99 >= 67, so the table would start past the end of the stream's data.
+	//
+	// ⛔ The anchor is `38>>` and not `/S 38`, because Ghostscript writes its
+	// integers space-padded — `<</Length         67\n/S         38>>` — which
+	// is the fixed-width placeholder technique a two-pass linearizing writer
+	// needs for /L, /H, /E and /T. Guessing the spacing is how the first
+	// version of this test failed, and the helper's uniqueness check is what
+	// said so.
+	b := editedGS(t, "38>>", "99>>")
+	if _, err := Linearized(b); err != nil {
+		t.Fatalf("the cheap check refused it, so this is not about /S: %v", err)
+	}
+	_, err := CheckLinearized(b)
+	if !errors.Is(err, ErrLinearizationStale) {
+		t.Fatalf("error is %v, want ErrLinearizationStale", err)
+	}
+	if !strings.Contains(err.Error(), "starts outside the stream") {
+		t.Errorf("it was refused, but not for /S being past the data: %v", err)
+	}
+}
+
+// ⛔ AND THE CONTROL THAT KEEPS THE ABOVE HONEST: the same fixture untouched
+// is accepted, so the refusal is about the edit and not about this checker
+// disliking Ghostscript's output — which it does not, and #43 depends on it
+// not doing so.
+func TestTheUnfilteredFixtureItselfIsAccepted(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckLinearized(b); err != nil {
+		t.Fatalf("the Ghostscript fixture was refused: %v", err)
+	}
+}
+
+// ⛔⛔ AND THE BOUNDARY ITSELF, WHICH THE TEST ABOVE DOES NOT HOLD. Review
+// measured three mutations of `pos >= len(s.Raw)` that left the whole suite
+// GREEN: `>`, `>= len-1` and `>= len+1`. The reason is that the only values
+// the suite exercised were 99 against 67 bytes and 43 against 64 — both far
+// from the edge, so any comparison in the neighbourhood passes. A bound that
+// nothing holds at its edge is the recurring shape in this file: #43's
+// `last >= len(b)` survived as `>` for exactly the same reason.
+//
+// ⛔ TWO CASES KILL ALL THREE, and a third would kill nothing. /S one byte
+// inside must be ACCEPTED (which refutes `>= len-1`); /S exactly at the end
+// must be REFUSED (which refutes both `>` and `>= len+1`). Adding /S above the
+// end would only repeat the second, so it is deliberately absent — an extra
+// case that cannot fail is a measurement that reports its own index.
+//
+// ⛔ The claim being pinned is that the table needs room for its own first
+// byte: the shared object hint table opens with a Table F.5 header, so a table
+// starting AT the end of the data has nowhere to put it. /S == len is
+// unrepresentable in a conforming file, not merely unusual.
+func TestTheSharedTableMustLeaveRoomForItsOwnFirstByte(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		s      int
+		refuse bool
+	}{
+		{"one byte inside the data", hintFixtureData - 1, false},
+		{"exactly at the end of the data", hintFixtureData, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b, lin := hintFixture(t, strconv.Itoa(c.s))
+			err := checkHintStream(b, lin)
+			if !c.refuse {
+				if err != nil {
+					t.Fatalf("/S %d is inside %d bytes and was refused: %v", c.s, hintFixtureData, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("/S %d against %d bytes was accepted (or refused oddly): %v",
+					c.s, hintFixtureData, err)
+			}
+			if !strings.Contains(err.Error(), "starts outside the stream") {
+				t.Errorf("it was refused, but not for /S being past the data: %v", err)
+			}
+		})
+	}
+}
+
+// ⛔⛔ AND A /Filter THAT FILTERS NOTHING IS STILL UNFILTERED, which was the
+// stated reason for asking filterChain rather than looking the key up — and
+// review measured that replacing the call with `_, ok := s.Dict["Filter"]`
+// left the suite GREEN, because no fixture had either spelling. The reason
+// written in the comment was the one thing no test held.
+//
+// ⛔ Both spellings mean no filtering per 7.3.9 and §7.3.8.2: a Null /Filter
+// is indistinguishable from an absent one, and an empty array is a chain of no
+// filters. filterChain returns len(names) == 0 for each, so the data IS the
+// raw bytes and /S is bounded by them. A key lookup would call these filtered
+// and skip the one check they are eligible for.
+func TestAFilterThatFiltersNothingIsStillBounded(t *testing.T) {
+	for _, c := range []struct{ name, extra string }{
+		{"a null /Filter", " /Filter null"},
+		{"an empty /Filter array", " /Filter [ ]"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b, lin := hintFixtureWith(t, strconv.Itoa(hintFixtureData*2), c.extra)
+			err := checkHintStream(b, lin)
+			if !errors.Is(err, ErrLinearizationStale) {
+				t.Fatalf("%s was treated as filtered, so /S went unbounded: %v", c.name, err)
+			}
+			if !strings.Contains(err.Error(), "starts outside the stream") {
+				t.Errorf("it was refused, but not for /S being past the data: %v", err)
+			}
+		})
+	}
+}
+
+// ⛔ AND THE OTHER SIDE OF THE ASYMMETRY, HERE RATHER THAN ONLY AT 25 PAGES. A
+// real filter means /S indexes DECODED data, which this check does not have,
+// so the bound must not apply. That condition was load-bearing and measured —
+// dropping it reddens the generated sweep's twenty-five page cases, where the
+// hint table compresses below /S — but a sweep is a slow and indirect witness
+// for a one-line condition. This states it directly: the same /S that the
+// cases above refuse is ACCEPTED once a filter is named, and nothing here
+// decodes anything.
+func TestARealFilterLeavesTheSharedTablePositionUnbounded(t *testing.T) {
+	b, lin := hintFixtureWith(t, strconv.Itoa(hintFixtureData*2), " /Filter /FlateDecode")
+	if err := checkHintStream(b, lin); err != nil {
+		t.Fatalf("/S past the RAW length was refused for a filtered stream, "+
+			"where it indexes the decoded data: %v", err)
+	}
+}
+
+// ⛔⛔ AND A /Filter THAT CANNOT BE READ AT ALL SKIPS THE BOUND, which is the
+// last thing the comment claimed and nothing held: review mutated the
+// condition to `(ferr == nil && len(names) == 0) || ferr != nil` — applying
+// the bound to a chain it could not read — and the suite stayed GREEN. Same
+// shape as the key lookup above: a documented reason with no case.
+//
+// ⛔ `/Filter 5` IS THE SPELLING THAT REACHES IT, and finding that out
+// corrected the review that asked for this test. Review proposed `/Filter 9 0
+// R` on the stated ground that an indirect filter makes filterChain error
+// under a nil resolver. It does not: Resolve returns `Null{}, nil` for a Ref
+// when the resolver is nil (object.go), so filterChain reports an indirect
+// /Filter as a chain of ZERO filters. That is why rawIsTheData checks for a
+// Ref itself before asking — see the test below. The error branch here is
+// reached only by a /Filter whose kind can never name a filter, which is
+// filterChain's `default:`.
+//
+// ⛔ AND THE BEHAVIOUR IS ACCEPTANCE, DELIBERATELY. An unreadable chain means
+// this check cannot know whether the raw bytes are the data, and refusing on
+// a bound it cannot evaluate would refuse for a reason it does not have. The
+// file is still non-conforming — F.3.6 requires direct entries, which is one
+// of the properties tabled on #40 — and it is #40 that should refuse it, by
+// name, rather than this bound refusing it as a side effect.
+func TestAFilterThatCannotBeReadLeavesTheBoundAlone(t *testing.T) {
+	b, lin := hintFixtureWith(t, strconv.Itoa(hintFixtureData*2), " /Filter 5")
+	if names, _, ferr := filterChain(Dict{"Filter": Integer(5)}, nil); ferr == nil {
+		t.Fatalf("the premise is gone: /Filter 5 now reads as a chain of %d filter(s), "+
+			"so this test no longer exercises the unreadable-chain branch", len(names))
+	}
+	if err := checkHintStream(b, lin); err != nil {
+		t.Fatalf("/S was bounded against a filter chain that cannot be read: %v", err)
+	}
+}
+
+// ⛔⛔ AND AN INDIRECT /Filter IS "CANNOT TELL", NOT "NO FILTER" — WHICH IS THE
+// INCOHERENCE REVIEW FOUND IN THE FIRST VERSION OF THIS CHANGE. filterChain
+// erases the difference: Resolve returns `Null{}, nil` for a Ref under a nil
+// resolver (object.go), so `/Filter 9 0 R` reported a chain of ZERO filters,
+// indistinguishable from an absent /Filter. The bound applied and the file was
+// refused.
+//
+// ⛔⛔ AND I PINNED THAT AS INTENDED BEHAVIOUR, which is worse than leaving it
+// unexamined: a test blessing it. Review supplied the input that breaks it —
+// if object 9 holds /FlateDecode then the stream really IS filtered, /S really
+// does index decoded data longer than the raw bytes, and the refusal is for a
+// reason the check cannot evaluate. That is precisely the argument used one
+// test above to ACCEPT an unreadable /Filter 5, so the two cases contradicted
+// each other and I had written the contradiction down as a feature.
+//
+// ⛔ The predicate is now rawIsTheData, which answers only when the dictionary
+// DIRECTLY says there is no filtering. The file is still non-conforming —
+// F.3.6 requires direct entries — but that refusal is a NAMED property tabled
+// on #40 and belongs there, not here with a message about the shared object
+// table.
+func TestAnIndirectFilterIsNotSomethingThisCheckCanRead(t *testing.T) {
+	b, lin := hintFixtureWith(t, strconv.Itoa(hintFixtureData*2), " /Filter 9 0 R")
+	if err := checkHintStream(b, lin); err != nil {
+		t.Fatalf("/S was bounded against a filter this check cannot resolve, "+
+			"so a genuinely filtered stream is refused for a reason it cannot evaluate: %v", err)
+	}
+}
+
+// ⛔ AND THE PREDICATE ITSELF, ASKED DIRECTLY FOR ITS THREE ANSWERS. The two
+// "cannot tell" cases above reach rawIsTheData through a fixture, which cannot
+// distinguish "answered false" from "never asked"; this states each answer as
+// the predicate's own, so a refactor that keeps checkHintStream passing while
+// changing what the predicate MEANS still goes red.
+func TestRawIsTheDataAnswersOnlyWhenItKnows(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		d    Dict
+		want bool
+	}{
+		{"no /Filter at all", Dict{}, true},
+		{"a null /Filter", Dict{"Filter": Null{}}, true},
+		{"an empty /Filter array", Dict{"Filter": Array{}}, true},
+		{"a real filter", Dict{"Filter": Name("FlateDecode")}, false},
+		{"a chain of filters", Dict{"Filter": Array{Name("ASCIIHexDecode"), Name("FlateDecode")}}, false},
+		{"an indirect /Filter", Dict{"Filter": Ref{Num: 9}}, false},
+		{"an array holding a reference", Dict{"Filter": Array{Ref{Num: 9}}}, false},
+		{"a /Filter of an impossible kind", Dict{"Filter": Integer(5)}, false},
+		// ⛔ /F puts the data in an external file (7.3.8.2, Table 5), so the
+		// bytes between `stream` and `endstream` are a placeholder and
+		// len(Raw) measures nothing the position is counted in — even with no
+		// /Filter at all, which is what makes this a case of its own rather
+		// than a variant of the ones above.
+		{"an external file stream", Dict{"F": String("hints.dat")}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rawIsTheData(c.d); got != c.want {
+				t.Errorf("rawIsTheData = %v, want %v — the bound would be %s",
+					got, c.want, map[bool]string{true: "applied", false: "skipped"}[got])
+			}
+		})
+	}
+}
+
 // ⛔⛔ AND EVERY OTHER WRONG KIND, WHICH THE FILE-LEVEL TEST CANNOT REACH.
 // Review measured the gap: narrowing the check to "refuse only a Name" left
 // the suite GREEN, because `/S /x` is the single case a same-width edit of
@@ -962,19 +1217,8 @@ func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
 		{"null", "null"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			const head = "%PDF-1.7\n"
-			b := []byte(head + "1 0 obj\n<< /S " + c.s + " /Length 0 >>\nstream\n\nendstream\nendobj\n")
-			_, _, n, err := ParseIndirectObject(b[len(head):], nil)
-			if err != nil {
-				t.Fatalf("the fixture itself does not parse: %v", err)
-			}
-			lin := &Linearization{
-				HintOffset: len(head),
-				// From the parse, so the length bound and spans both hold and
-				// cannot be what refuses this.
-				HintLength: n + eolAfter(b, len(head)+n),
-			}
-			err = checkHintStream(b, lin)
+			b, lin := hintFixture(t, c.s)
+			err := checkHintStream(b, lin)
 			if !errors.Is(err, ErrLinearizationStale) {
 				t.Fatalf("/S as %s was accepted (or refused oddly): %v", c.name, err)
 			}
@@ -987,18 +1231,62 @@ func TestEveryNonIntegerSharedTablePositionIsRefused(t *testing.T) {
 	// ⛔ THE CONTROL: the same fixture with an integer /S is ACCEPTED, so the
 	// cases above fail for their kind and not because this hand-built stream
 	// is unacceptable for some other reason.
+	//
+	// ⭐ AND IT EARNED ITS KEEP IMMEDIATELY. The first version of this fixture
+	// carried `/Length 0` and no data, so when the unfiltered upper bound on
+	// /S arrived, this control went red — /S 43 does point outside zero bytes.
+	// The check was right and the fixture was not; without the control the
+	// seven cases above would have gone on passing for the wrong reason.
 	t.Run("an integer is accepted", func(t *testing.T) {
-		const head = "%PDF-1.7\n"
-		b := []byte(head + "1 0 obj\n<< /S 43 /Length 0 >>\nstream\n\nendstream\nendobj\n")
-		_, _, n, err := ParseIndirectObject(b[len(head):], nil)
-		if err != nil {
-			t.Fatalf("the fixture itself does not parse: %v", err)
-		}
-		lin := &Linearization{HintOffset: len(head), HintLength: n + eolAfter(b, len(head)+n)}
+		b, lin := hintFixture(t, "43")
 		if err := checkHintStream(b, lin); err != nil {
 			t.Fatalf("an integer /S was refused, so these cases prove nothing: %v", err)
 		}
 	})
+}
+
+// hintFixtureData is the fixture's data length in bytes.
+//
+// ⛔ IT IS A CONSTANT BECAUSE THE BOUNDARY TESTS COUNT WITH IT. A test that
+// wrote `/S 64` beside a fixture that happened to hold 64 bytes would stop
+// testing the boundary the moment either number was edited alone, and the
+// suite would stay green — the shape this package has already paid for under
+// "judge and subject must count alike". The cases below spell /S as
+// hintFixtureData-1 and hintFixtureData, so they cannot drift apart.
+const hintFixtureData = 64
+
+// hintFixture builds a minimal unfiltered hint stream whose /S is the given
+// spelling, with /H's extent taken FROM THE PARSE so that nothing earlier in
+// checkHintStream can be what refuses it.
+//
+// ⛔ The data is hintFixtureData bytes because /S 43 has to be INSIDE it. An
+// empty stream made the control above fail the moment the upper bound existed,
+// which is the fixture being unrealistic rather than the bound being wrong: a
+// shared object table cannot start at byte 43 of nothing.
+func hintFixture(t *testing.T, s string) ([]byte, *Linearization) {
+	t.Helper()
+	return hintFixtureWith(t, s, "")
+}
+
+// hintFixtureWith is hintFixture with extra dictionary entries spliced in,
+// which is how the /Filter cases say what they are about: the upper bound on
+// /S is asked through filterChain, and only a dictionary can state the
+// difference between "no /Filter", "/Filter null" and "/Filter [ ]".
+func hintFixtureWith(t *testing.T, s, extra string) ([]byte, *Linearization) {
+	t.Helper()
+	const head = "%PDF-1.7\n"
+	data := strings.Repeat("h", hintFixtureData)
+	b := []byte(head + "1 0 obj\n<< /S " + s + extra +
+		" /Length " + strconv.Itoa(hintFixtureData) + " >>\nstream\n" +
+		data + "\nendstream\nendobj\n")
+	_, _, n, err := ParseIndirectObject(b[len(head):], nil)
+	if err != nil {
+		t.Fatalf("the fixture itself does not parse: %v", err)
+	}
+	return b, &Linearization{
+		HintOffset: len(head),
+		HintLength: n + eolAfter(b, len(head)+n),
+	}
 }
 
 // ⛔⛔ AND THE FOREIGN JUDGE REFUSES IT TOO, which is the half the negative

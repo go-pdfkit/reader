@@ -544,18 +544,36 @@ func checkHintStream(b []byte, lin *Linearization) error {
 	// stream", a symptom of seeking outside the data rather than a statement
 	// about /S.
 	//
-	// ⚠ THE UPPER BOUND IS STILL NOT CHECKED, and that is an open limit with
-	// a reason: /S indexes the DECODED data, so bounding it above means
-	// decoding an attacker's bytes in the cheap path — capped at 1 GiB by
-	// filter.go, which refuses a bomb but is three orders of magnitude more
-	// than any hint stream needs. That wants a size bound derived from /N and
-	// the object count, which wants F.4's layouts. #40 carries the ordering.
 	const pageOffsetHeaderBytes = 36
 	if pos < pageOffsetHeaderBytes {
 		return fmt.Errorf("%w: the primary hint stream's /S is %d, and the shared object table "+
 			"cannot begin before byte %d — the page offset table starts at 0 and its header alone "+
 			"is %d bytes (Table F.3, thirteen items of 288 bits)",
 			ErrLinearizationStale, int64(pos), pageOffsetHeaderBytes, pageOffsetHeaderBytes)
+	}
+	// ⭐ AND THE UPPER BOUND, FOR AN UNFILTERED STREAM, WHICH COSTS NOTHING.
+	// /S indexes the DECODED data, and decoding an attacker's bytes in the
+	// cheap path is what kept this open: filter.go caps expansion at 1 GiB,
+	// which refuses a bomb but is three orders of magnitude past anything a
+	// hint stream needs, so the bound wants a size limit derived from /N and
+	// the object count — F.4 work, ordered on #40.
+	//
+	// ⭐ But a stream with NO FILTER needs no decoding at all: its raw bytes
+	// ARE its data. That case is free, and it is the one that matters most
+	// while a writer is being developed, because an uncompressed hint stream
+	// is what somebody debugging one emits. Ghostscript writes one unfiltered
+	// already, and qpdf does under --compress-streams=n.
+	//
+	// ⛔ ASKED THROUGH rawIsTheData, WHICH ANSWERS ONLY WHEN IT KNOWS. The
+	// predicate is "the dictionary DIRECTLY says this stream is not filtered",
+	// and every other answer — including "I cannot tell" — leaves the bound
+	// alone.
+	if rawIsTheData(s.Dict) {
+		if int64(pos) >= int64(len(s.Raw)) {
+			return fmt.Errorf("%w: the primary hint stream's /S is %d and its data is %d bytes, "+
+				"so the shared object table starts outside the stream",
+				ErrLinearizationStale, int64(pos), len(s.Raw))
+		}
 	}
 	// ⛔ AND THE LENGTH IS COMPARED WITH THE OBJECT THAT IS ACTUALLY THERE,
 	// which review found it was not: the pair was bounds-checked against the
@@ -568,6 +586,66 @@ func checkHintStream(b []byte, lin *Linearization) error {
 			ErrLinearizationStale, lin.HintLength, lin.HintOffset, n)
 	}
 	return nil
+}
+
+// rawIsTheData says whether a stream dictionary DIRECTLY states that its
+// stream is not filtered, so that the raw bytes are the data and a position
+// counted in decoded bytes can be bounded by len(Raw) without decoding
+// anything.
+//
+// ⛔⛔ IT IS A THREE-WAY QUESTION ANSWERED AS TWO, AND THE MIDDLE ANSWER IS THE
+// POINT. "Filtered", "not filtered" and "cannot tell" are distinct, and only
+// the second licenses the bound. Review found the first version of this
+// incoherent: it accepted `/Filter 5` on the ground that an unreadable chain
+// is something this check cannot evaluate, while REFUSING `/Filter 9 0 R` —
+// which it also cannot evaluate — because filterChain erases the difference.
+//
+// ⛔ Resolve returns `Null{}, nil` for a Ref when the resolver is nil
+// (object.go), so filterChain reports an indirect /Filter as a chain of ZERO
+// filters, indistinguishable from an absent one. If object 9 holds
+// /FlateDecode then the stream really is filtered, /S really does index
+// decoded data longer than the raw bytes, and bounding it refuses a
+// conforming-in-this-respect position for a reason the check does not have.
+// That is the exact failure the unreadable-chain case was written to avoid.
+//
+// ⛔ So an indirect /Filter is "cannot tell" and not "no filter". The file is
+// still wrong — F.3.6 requires every hint-dictionary entry beyond the stream
+// Length to be direct — but refusing it is a NAMED property tabled on #40, and
+// #40 should refuse it as that, rather than this bound refusing it as a side
+// effect with a message about the shared object table.
+//
+// ⛔ An array holding a reference, `/Filter [ 9 0 R ]`, already lands in
+// "cannot tell" without a case of its own: filterChain resolves the element to
+// Null, ToName fails, and the error is the same middle answer.
+// ⛔⛔ AND /F MAKES THE RAW BYTES NOT THE DATA AT ALL, which is the same class
+// again and was found by looking for a SECOND instance rather than re-checking
+// the first. 7.3.8.2, Table 5: when a stream dictionary has /F its data lives
+// in an external file, and the bytes between `stream` and `endstream` are not
+// it — the parse still slices them into Raw, so len(Raw) measures the
+// placeholder and nothing else. Bounding a decoded position against that
+// refuses on a length belonging to different bytes.
+//
+// ⛔ No hint stream should carry /F, and this is not the check that says so —
+// but the predicate is named rawIsTheData, and with /F present that name would
+// be false. A predicate that is wrong in a case it was told about is worth one
+// line more than an issue describing it. It DECLINES TO BOUND rather than
+// refusing: a hint stream with /F is wrong, and saying so is #40's job.
+//
+// ⛔ AND THE BARE PRESENCE TEST IS ONLY ADEQUATE FOR A STREAM DICTIONARY. /F
+// means a file specification in Table 5, but the same name is an unrelated
+// flag field elsewhere in the format — an annotation's /F is an integer of bit
+// flags. Neither can appear in a hint stream, so presence is enough HERE;
+// reusing this predicate on dictionaries of another kind would need the key
+// read for what it means there, not merely counted.
+func rawIsTheData(d Dict) bool {
+	if _, external := d["F"]; external {
+		return false
+	}
+	if _, indirect := d["Filter"].(Ref); indirect {
+		return false
+	}
+	names, _, err := filterChain(d, nil)
+	return err == nil && len(names) == 0
 }
 
 // spans says whether a declared length describes the object at off, which the
