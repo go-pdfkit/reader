@@ -169,17 +169,87 @@ overflow hint stream shall not contain these entries", so the same
 requirement on the overflow half would refuse exactly the conforming file.
 The two halves of `/H` are not symmetric, and this is where they differ.
 
-`/S` must also be a **direct integer and not negative**: F.3.6 says these
-positions "shall be counted in bytes relative to the beginning of the stream
-data", so a name, an indirect reference or `-1` names no position at all. A
-reader that has fetched only the front of the file can resolve nothing, which
-is the whole point of the format.
+`/S` must also be a **direct integer**: F.3.6 says these positions "shall be
+counted in bytes relative to the beginning of the stream data", so a name, an
+indirect reference, an array, a real, a string, a boolean or null names no
+position at all. A reader that has fetched only the front of the file can
+resolve nothing, which is the whole point of the format. All seven wrong kinds
+have a case, asked of the function directly — a same-width edit of the fixture
+can only express `/S /x`, so a file-level test alone left "refuse only a name"
+passing.
 
-⚠ **The upper bound on `/S` is NOT checked, and that is an open limit.** It is
-an offset into the *decoded* stream data, so bounding it means decoding the
-hint stream — which is the first step of reading the tables themselves (F.4)
-and belongs with that work. `qpdf --check` reports `/S (shared object) offset
-is out of bounds` for a `/S` past the data and this does not. Tracked in #40.
+⛔⛔ **And it cannot be below 36**, which is arithmetic rather than a guess.
+F.3.6 puts the page offset hint table first and at offset 0, and Table F.3
+gives its header as thirteen items totalling 288 bits — so whatever follows it
+begins at byte 36 at the earliest. The floor subsumes the old "not negative"
+rule, and it is **36 and not more because the margin was measured**:
+Ghostscript writes `/S 38` where qpdf writes 43 for the same document, so a
+bound taken from qpdf alone would have refused every Ghostscript file.
+
+⛔⛔ **The upper bound is checked only where it costs nothing: an unfiltered
+hint stream.** `/S` indexes the *decoded* data, so bounding it in general means
+decoding an attacker's bytes in the cheap path — the expansion cap is 1 GiB,
+three orders of magnitude past anything a hint stream needs, so the real bound
+wants a size limit derived from `/N` and the object count. That is F.4 work,
+tracked in #40.
+
+But a stream with **no filter** needs no decoding at all: its raw bytes *are*
+its data, and that case is free. It is also the one that matters most while a
+writer is being developed, because an uncompressed hint stream is what somebody
+debugging one emits — Ghostscript writes one unfiltered, and qpdf does under
+`--compress-streams=n`.
+
+⛔ The question is "does the dictionary **directly state** that the raw bytes
+are the data", and it has three answers, not two. *Filtered*, *not filtered*
+and *cannot tell* are distinct, and only the second licenses the bound:
+
+| the dictionary says | the bound |
+|---|---|
+| no `/Filter`, `/Filter null`, `/Filter [ ]` | **applied** — raw is the data |
+| `/Filter /FlateDecode`, or a chain | skipped — `/S` indexes decoded bytes |
+| `/Filter 9 0 R`, or `[ 9 0 R ]` | skipped — a front-of-file reader resolves nothing |
+| `/Filter 5`, or any kind that cannot name one | skipped — the chain cannot be read |
+| `/F` present | skipped — the data is in an external file |
+
+⚠ The filter condition is **load-bearing and measured**, not defensive coding:
+applying the bound to filtered streams too turns the generated sweep's
+twenty-five page cases red, where the hint table compresses well below `/S`.
+No smaller document can see it.
+
+⭐ **On an unfiltered stream the two judges now agree, where only qpdf caught
+it before.** On the Ghostscript fixture with `/S` moved from 38 to 99 — same
+width, so `/L` still matches and nothing at the front of the file is wrong —
+this refuses it and `qpdf --check` reports
+
+```
+error encountered while checking linearization data:
+  (linearization hint table, offset 882): /S (shared object) offset is out of bounds
+```
+
+⚠ qpdf exits **3** there, not 0, because it calls this a warning: `operation
+succeeded with warnings`. And it prints `File is linearized` three lines
+earlier, from the parameter dictionary, before validating anything — so neither
+that line nor a zero exit is its approval.
+
+⛔ **That agreement is held by the suite, not by a terminal.** The test runs
+`qpdf --check` on the edited fixture and requires the message, *and* requires
+that the unedited fixture does **not** draw it — otherwise the phrase would be
+something qpdf says about every Ghostscript file and the positive would prove
+nothing. Under `REQUIRE_QPDF=1` a missing qpdf fails rather than skips, so the
+claim cannot quietly stop being tested.
+
+⚠ **And the agreement is specific to an unfiltered stream.** For a *filtered*
+one — qpdf's own default output — with `/S` past the **decoded** data, qpdf
+still reports `offset is out of bounds` and this still accepts. That gap is the
+open limit above, not a disagreement about what `/S` means.
+
+⛔⛔ The last three rows are there because an earlier version had only the first
+two, and refused what it could not evaluate. An indirect `/Filter` reported as
+*zero* filters — a reference resolves to null when there is no resolver, which
+is indistinguishable from an absent `/Filter` — so a stream that really was
+compressed got refused for a length belonging to different bytes. That is the
+same mistake as refusing on an unreadable chain, which the code already
+declined to make one line higher.
 
 ⚠ And `qpdf --check` prints `File is linearized` from the parameter
 dictionary **before** it validates the hint tables, then reports errors after

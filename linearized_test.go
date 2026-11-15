@@ -1341,6 +1341,65 @@ func TestQpdfAlsoRefusesAnOrdinaryFileFromThisWriter(t *testing.T) {
 	}
 }
 
+// ⛔⛔ AND THE FOREIGN JUDGE REFUSES THE /S EDIT TOO, which until now was a
+// claim held by one terminal run rather than by CI. The README says the two
+// judges agree on an unfiltered stream whose /S points past its data; review
+// pointed out that nothing here held it, because
+// TestASharedTablePositionOutsideAnUnfilteredStreamIsRefused asserts only this
+// package's own refusal. A README sentence backed by a measurement nobody can
+// re-run is the "published someone's claim as my measurement" shape, and the
+// cheap remedy is to make the suite the witness.
+//
+// ⛔ THE PAIR IS WHAT MAKES IT A TEST, as above: the UNEDITED fixture must not
+// draw the same complaint, or "offset is out of bounds" would be a phrase qpdf
+// prints about every Ghostscript file and the positive would hold against a
+// judge that judges nothing.
+//
+// ⚠ Only for an UNFILTERED stream, and that is the whole point. qpdf reports
+// the same error for a FILTERED stream whose /S is past the decoded data,
+// where this package still accepts — so the agreement is specific, and the
+// README says so rather than claiming the judges agree about /S in general.
+func TestQpdfAlsoRefusesASharedTablePositionOutsideTheStream(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	check := func(name string, b []byte) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(qpdf, "--check", p)
+		cmd.Stdin = nil
+		// ⛔ The status is discarded for the reason given above: qpdf exits 3
+		// for this, calling it a warning, and 0 for files it has refused in
+		// other ways. The verdict is in the TEXT.
+		out, _ := cmd.CombinedOutput()
+		got := string(out)
+		if !strings.Contains(got, "PDF Version:") {
+			t.Fatalf("qpdf did not report on %s at all, so what it does not say proves nothing:\n%s", name, got)
+		}
+		return got
+	}
+
+	// ⛔ The anchor is `38>>` because Ghostscript space-pads its integers;
+	// editedGS asserts it matches exactly once, so a silent miss cannot pass
+	// the untouched file off as the edited one.
+	const outOfBounds = "offset is out of bounds"
+
+	edited := editedGS(t, "38>>", "99>>")
+	if got := check("gs-S99.pdf", edited); !strings.Contains(got, outOfBounds) {
+		t.Errorf("qpdf did not complain that /S is outside the stream:\n%s", got)
+	}
+
+	intact, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := check("gs.pdf", intact); strings.Contains(got, outOfBounds) {
+		t.Errorf("qpdf says that about the UNEDITED fixture too, so the phrase decides nothing:\n%s", got)
+	}
+}
+
 // qpdfExtra lets a test ask qpdf for a different kind of linearized file; it
 // is reset by each subtest that sets it.
 var qpdfExtra []string
