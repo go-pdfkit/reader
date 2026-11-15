@@ -399,8 +399,68 @@ reading of Annex F. On five real library scans linearized by qpdf and judged by
 `qpdf --check` alongside: **5 agree, 0 disagree**, including a 68-page, 13 MB
 document.
 
-⛔ **Reading is all it does — there is no linearizing writer yet.** The checker
-came first on purpose: a writer cannot be trusted without one.
+### The partition, which is the writer's first step
+
+`d.Partition()` answers which section of Annex F.3.1's eleven-part layout every
+object of a document belongs to — part 4 (the catalogue and what opening the
+file needs), part 6 (the first page), part 7 (another page's private objects),
+part 8 (shared between later pages) and part 9 (everything a reader does not
+need to display a page). The numbers are F.3.1's own, so a `Part` compares with
+the annex and with qpdf without a translation table.
+
+⭐ **It has a foreign judge, which is why it is a step of its own.**
+`qpdf --show-linearization` prints its own *Computed Linearization Part
+Assignments* — the reference implementation's answer to exactly this question —
+so the partition is measured before a single byte of a linearized file is
+written. It agrees with qpdf across 1/2/5/25 pages × plain, object-streams and
+uncompressed-streams: **twelve shapes, no disagreements.**
+
+⛔⛔ **The two judges count different things, and that is not a defect in
+either.** qpdf names the objects it will *write*; `Partition` names the objects
+the document *has*. With object streams those differ — for the two-page
+`--object-streams=generate` fixture qpdf puts object 3 in part 9, and object 3
+is an `/ObjStm` whose one member is object 5, the page tree node, which is what
+F.3.10 actually places. The test expands qpdf's containers into their members
+rather than "correcting" the partition to name containers: an object stream is
+a packing decision that comes *after* the partition.
+
+⛔ **What it declines, by name.** Each of these changes which part an object
+belongs to, and none is exercised by any file in this corpus, so placing them
+would be writing untested rules into a format where a wrong placement is
+silent — the reader does not fail, it reads the wrong bytes:
+
+| refused | because |
+|---|---|
+| `/OpenAction` | F.3.7 makes the page it opens at the *first* page |
+| `/PageMode /UseOutlines` with `/Outlines` | F.3.7 then puts the whole outline hierarchy in part 6, not part 9 |
+| `/Threads` | F.3.5 puts thread dictionaries in part 4, F.3.10 their `/I` in part 9, beads with their pages |
+| `/AcroForm` | F.3.5 takes only the top-level form dictionary; F.3.10 takes the field hierarchy |
+| `/Encrypt` | F.3.5 requires the encryption dictionary *and every value in it* in part 4 |
+| a page with `/Thumb` | F.3.10 gives thumbnails and their shared objects two ordered categories of their own |
+
+⛔ **`/Thumb` and `/Parent` are skipped at the page**, which F.3.7 states
+outright: part 6 holds what "its Contents, Resources, Annots, and B entries"
+reach "but not the Thumb entry". A thumbnail in part 6 puts a picture nobody is
+looking at in front of the bytes that draw the page.
+
+⛔⛔ **And a page that names another page directly does not drag it in** — F.3.7
+excludes "page tree nodes **or other page objects**". A link annotation's
+`/Dest` and `/B` article beads are page-to-page references that do not pass
+through the tree, and without that exclusion one page with a link would pull
+the linked page, its contents and its resources into part 6. The generated
+corpus **cannot see this**: its only page-to-page route is `/Parent`, which is
+already skipped, so emptying that half of the boundary left all twelve qpdf
+shapes green. It was found by mutation and is now held by a test of its own.
+
+⚠ Part 8 has no witness in the generated corpus either — qpdf reports
+`part 8 (other pages, shared): none` for all twelve shapes, because the
+fixtures give every page its own resources. So F.3.9's whole subject is held by
+a hand-built document rather than by the sweep.
+
+⛔ **Reading and partitioning is all it does — there is no linearizing writer
+yet.** The checker came first on purpose: a writer cannot be trusted without
+one. What remains for #40 is the hint tables (F.4), the layout and the
+two-pass fixpoint for `/L`, `/H`, `/E` and `/T`.
 
 Next wave: the operations built on all of this.
 
