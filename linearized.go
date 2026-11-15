@@ -227,17 +227,31 @@ func Linearized(b []byte) (*Linearization, error) {
 //
 // This is the other question, for the other caller: not "may a reader trust
 // the front of this file" but "is this file actually what the front says".
-// It opens the document, so it costs what opening costs, and it is the
-// judgement a writer needs on bytes it has just produced.
+// It opens the document AND decodes the primary hint stream, so it costs what
+// opening costs plus one stream expansion — bounded by maxDecodedSize — and the
+// page entries it allocates. It is the judgement a writer needs on bytes it has
+// just produced, not something to call on untrusted input to decide cheaply
+// whether to proceed; [Linearized] is that.
 //
-// ⛔ It still does NOT validate the hint tables (F.4), which is a larger job
-// again. What it establishes is that every parameter POINTS AT WHAT IT CLAIMS
-// TO: the page count is the real one, /O is the real first page, /H begins at
-// a real stream object of the length it declares, /T reaches the main
-// cross-reference. A file can pass this and still send a reader to the wrong
-// offset inside a hint table — so the error says which claim failed, and a
-// caller that needs more must read F.4. qpdf's `--check` remains the foreign
-// judge the tests print by.
+// What it establishes is that every parameter POINTS AT WHAT IT CLAIMS TO: the
+// page count is the real one, /O is the real first page, /H begins at a real
+// stream object of the length it declares, /T reaches the main cross-reference.
+//
+// ⛔ AND THAT THE HINT TABLES READ AS F.4 DESCRIBES THEM, which is new and is
+// narrower than it sounds. Both tables must decode: every bit width in 0..32,
+// every entry inside the stream, the page offset table ending at or before /S,
+// and the counts bounded by the document's objects. Failure is
+// [ErrHintTablesInvalid].
+//
+// ⛔⛔ IT DOES NOT CHECK THE TABLES' VALUES, and the difference decides what a
+// pass here is worth. A table can decode perfectly and still give a page length
+// that is not the page's length — nothing in F.4's LAYOUT is violated, so this
+// cannot see it. On testdata/linearized-gs.pdf, `qpdf --check` reports five
+// such mismatches (three group lengths of 65536, two page lengths); this
+// package refuses that file for a SIXTH defect, its /S overrun, and detects
+// none of the five. Comparing values against the document needs the partition.
+// So: a pass means the tables are READABLE, not that they are RIGHT, and qpdf's
+// `--check` remains the foreign judge the tests print by.
 //
 // ⛔⛔ AND /E IS NOT GATED, SAID OUT LOUD BECAUSE A WRITER WILL BE TEMPTED TO
 // TRUST IT. Table F.1 calls /E the offset of the end of the first page, and
@@ -249,9 +263,12 @@ func Linearized(b []byte) (*Linearization, error) {
 // rather than being approximated now. Until then: do not read a pass from
 // this as evidence about /E.
 //
-// The error wraps the same sentinels [Linearized] uses: a dictionary that
-// disagrees with the document around it is [ErrLinearizationStale], which is
-// what Table F.1 says such a file is — ordinary PDF.
+// The error wraps [Linearized]'s sentinels and one of its own. A dictionary
+// that disagrees with the document around it is [ErrLinearizationStale], which
+// is what Table F.1 says such a file is — ordinary PDF. Tables that do not
+// read are [ErrHintTablesInvalid], which [Linearized] never returns: the
+// parameters are sound and only the optimisation is lost, so a caller may
+// reasonably open the file anyway.
 func CheckLinearized(b []byte) (*Linearization, error) {
 	lin, err := Linearized(b)
 	if err != nil {
@@ -297,7 +314,11 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	// and they need the partition. So this closes "the tables are unreadable"
 	// and not "the tables are wrong", and saying otherwise would overstate it.
 	if _, err := d.readHintTables(lin); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrHintTablesInvalid, err)
+		// ⛔ %w TWICE, so the inner error stays matchable. errHintTable is
+		// unexported today and hinttable.go plans to export it, at which point
+		// %v would have silently flattened the one sentinel a caller would
+		// then want to test for. It costs nothing to wrap both now.
+		return nil, fmt.Errorf("%w: %w", ErrHintTablesInvalid, err)
 	}
 	return lin, nil
 }

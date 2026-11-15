@@ -770,12 +770,20 @@ agreed with each other and with neither annex. Its control — an unsigned group
 writing one byte of flag and nothing else — is what makes the case able to
 fail at all.
 
-### ⭐⭐ The checker now reads the hint tables, and the gap #40 named is closed
+### ⭐ The checker now reads the hint tables — and refuses the fixture for a sixth defect, not for qpdf's five
+
+⛔ **The heading had to be rewritten, and the reason is the point.** It first
+read "the gap #40 named is closed", sitting beside "hint tables `qpdf --check`
+reports five problems in" — which implies this package now detects those five.
+**It detects none of them.** The refusal below is the `/S` overrun, which this
+repository's own notes call "a SIXTH thing wrong with that file, after the five
+qpdf warns about". All five mismatches remain undetected. The narrow paragraph
+further down was exact; the heading beside that sentence was not, and review
+caught the juxtaposition rather than the claim.
 
 #40 said in writing that "a file can pass this and still have hint tables that
 send a reader to the wrong offset", and `testdata/linearized-gs.pdf` was
-committed as the file that does exactly that: sound parameters, hint tables
-`qpdf --check` reports five problems in. For five merged pull requests this
+committed as the file that does exactly that. For five merged pull requests this
 package accepted it.
 
 `CheckLinearized` now decodes both tables as its last step and refuses the
