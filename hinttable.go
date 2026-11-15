@@ -261,6 +261,17 @@ type sharedRef struct {
 	Numerator  uint32 // item 5: where in the content stream it is first used
 }
 
+// sharedRefBytes is what one sharedRef costs, which readPageEntries' memory
+// budget is stated in.
+//
+// ⛔ IT IS ASSERTED, NOT ASSUMED: TestASharedRefCostsWhatTheBudgetThinks
+// compares it against unsafe.Sizeof. The budget is a number of BYTES per byte
+// of input, so if this struct gains a field the ceiling must stay put and the
+// number of references allowed must fall — and a constant nobody checks would
+// instead let the ceiling rise silently. unsafe lives in the test so that this
+// package does not import it.
+const sharedRefBytes = 8
+
 // pageEntry is one page's Table F.4 entry, with the header's minima already
 // added back.
 //
@@ -326,9 +337,39 @@ type pageEntry struct {
 // among the five things qpdf warns about on that file — so it is not a second
 // independent witness to the layout in general, and saying otherwise would be
 // borrowing confidence from a file that is wrong nearby.
-func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, error) {
+// ⛔⛔ maxObjects IS THE DOCUMENT'S OBJECT COUNT, AND IT IS A MEMORY BOUND, for
+// the same reason readSharedTable takes one (#55, #56). TWO terms here turn a
+// small stream into a large allocation, and the issue that asked for this fix
+// named only the second:
+//
+//	2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
+//	  the pageEntry slice alone   352.1 MiB   176x   <- /N, unnamed in #56
+//	  the shared references too   416.1 MiB   208x   <- +32x, the term #56 named
+//	  and no error either way
+//
+// MEASURED, not estimated, which is what the issue asked for — and measuring is
+// what found that the /N term is five and a half times the bigger one. #56
+// reasoned "8 bytes per sharedRef, so 64x" — and that term measures 32x, so
+// the issue was 2x HIGH about the half it named while being 5.5x LOW about the
+// total. Both errors come from reasoning instead of running it.
+// The dominant cost is the 40-byte
+// pageEntry per PAGE, and /N is as untrusted here as /S was.
+//
+// ⛔ Both ceilings are the same fact: a page is an indirect object and F.4.2's
+// identifiers index a table of objects, so neither the page count nor the
+// references of one page can exceed the objects the document has. The cap is
+// PASSED IN rather than derived here, so this function cannot disagree with the
+// document about what it holds.
+func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) ([]pageEntry, error) {
 	if pages <= 0 {
 		return nil, fmt.Errorf("%w: a hint table for %d pages", errHintTable, pages)
+	}
+	// ⛔ BEFORE make([]pageEntry, pages), which is the allocation itself. A
+	// bound applied after it is a comment.
+	if int64(pages) > maxObjects {
+		return nil, fmt.Errorf("%w: the hint table describes %d page(s) and the document has %d "+
+			"object(s), and every page is one — so it describes pages the file does not have",
+			errHintTable, pages, maxObjects)
 	}
 
 	read := func(n int, what string, i int) (uint32, error) {
@@ -423,6 +464,120 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, erro
 	// claiming four billion references of zero width would loop four billion
 	// times reading nothing. A reference is at most one per remaining bit
 	// before it is absurd, and that is all this cap claims.
+	// ⛔⛔ PER PAGE, AND NOT THE SUM — the first version of this bound compared
+	// the SUM of every page's count against the object count, and that refuses
+	// ordinary documents. One hundred pages each referencing fifty shared
+	// objects is a perfectly conforming file of about 255 objects, and its sum
+	// is 99 × 50 = 4950. The bound would have rejected it.
+	//
+	// ⛔ The claim that IS true is about one page: a single page cannot
+	// reference more distinct shared objects than the document has objects,
+	// because F.4.2's identifiers index a table whose entries describe objects.
+	// Sharing is the whole point of part 8, so the same object is referenced
+	// from many pages and the sum is bounded by pages × objects, not by
+	// objects.
+	//
+	// ⛔ This is #52's lesson repeating: a work budget there refused a
+	// 150 000-page file and had to be removed. A ceiling in the wrong units
+	// does not fail loudly on nonsense, it fails on somebody's real document.
+	//
+	// ⛔ What still bounds the TOTAL is the page ceiling above plus the two bit
+	// bounds below: with pages ≤ maxObjects and each count ≤ maxObjects the sum
+	// cannot exceed maxObjects², and the bits bound independently caps it at
+	// one reference per remaining bit. The 176× term — the pageEntry slice — is
+	// closed by the page ceiling, which is the unambiguous half.
+	for i, n := range counts {
+		if int64(n) > maxObjects {
+			return nil, fmt.Errorf("%w: page %d of %d claims %d shared object reference(s) and "+
+				"the document has %d object(s), so one page references more objects than the "+
+				"file has", errHintTable, i+1, pages, n, maxObjects)
+		}
+	}
+	// ⛔⛔⛔ AND A BUDGET IN BYTES OF ALLOCATION, which the two bit bounds do NOT
+	// provide. "total ≤ bits remaining" is literally true and useless: one
+	// reference per BIT at eight bytes each IS 64 bytes per input byte, so the
+	// proportionality constant is the amplification. Review measured it,
+	// accepted, on the code as first pushed:
+	//
+	//	4096 pages, 4096 objects, 16 380 000 references, widths 13/0/0
+	//	128.1 MiB allocated from a 2 MiB stream = 64x, no error
+	//
+	// The page ceiling above closes the 176x term; this is the 32x term #56 was
+	// actually filed about, and it needs only a 4096-object document.
+	//
+	// ⛔ THE INTERVAL IS MEASURED AND THE FIGURE IS CHOSEN INSIDE IT, which is
+	// the honest version of a sentence that stood here claiming "measured, not
+	// chosen" four lines above another admitting the choice. Review caught the
+	// contradiction; it was the third wrong sentence in this one block, after
+	// the two below. What measurement gives is the gap between real documents
+	// and the bomb; where in that gap to sit is a judgement, and saying
+	// otherwise borrows authority the numbers do not confer.
+	//
+	// Bytes of references per byte of decoded hint stream, over every fixture
+	// here including documents whose pages share a /Resources dictionary:
+	//
+	//	entry bytes per stream byte   0.6x  1.2x  3.1x  6.6x  9.4x  10.3x  11.2x
+	//	references per stream byte    0.00  0.01  0.05  0.43  0.67   0.85   0.85
+	//	the bomb above                                                     7.80
+	//
+	// ⛔⛔ AND THE TWO RATIOS ABOVE ARE NOT THE SAME NUMBER, which cost this
+	// comment a wrong sentence that a mutation caught. Entry BYTES per stream
+	// byte reach 11.2x; REFERENCES per stream byte reach 0.85. An earlier
+	// version of this note said "one reference per stream byte would refuse
+	// real files" — it would not, 0.85 < 1. Setting the budget to 1 and running
+	// the suite leaves the real-document cases GREEN, which is how the slip
+	// surfaced.
+	//
+	// ⚠ What review actually proposed was `total*8 > len(r.b)`, which is 0.125
+	// references per byte, and THAT does refuse real files — 0.85 is nearly
+	// seven times it. So the shape of the bound was right and the constant was
+	// not.
+	//
+	// 32 bytes per stream byte is chosen over 8 for headroom: 4.7x above the
+	// measured maximum for real documents and 1.95x below the bomb's 7.81
+	// references per byte. Eight would work today with 17.6% margin, which is
+	// too little for a number nobody will re-measure.
+	//
+	// ⛔⛔ AND IT IS STATED IN BYTES, NOT IN REFERENCES, which is review's point
+	// and not cosmetic. An earlier version held `sharedRefsPerStreamByte = 4`
+	// and compared `total*8`, hiding sizeof(sharedRef) in BOTH a constant and a
+	// literal. Add a field to sharedRef and the real ceiling rises by half
+	// again with no code change, no failing test, and a message that has
+	// started lying. The budget below is a number of BYTES and the conversion
+	// is named once.
+	// ⛔⛔⛔ AND THE CONSTANTS ARE DIVIDED, NOT `total` MULTIPLIED, which is the
+	// difference between a guard that cannot overflow and one whose safety is
+	// held by a variable in another file. `total*sharedRefBytes` is safe TODAY
+	// only because maxDecodedSize (filter.go:14) is 1<<30: that caps the stream
+	// at 2^30 bytes, so pages ≤ 2^28, total ≤ 2^60, and total*8 reaches
+	// 9223372034707292160 against MaxInt64 9223372036854775807 — ten digits of
+	// agreement, measured by review.
+	//
+	// ⛔ maxDecodedSize is a `var` whose comment says "Tests lower it". Nothing
+	// stops it being RAISED. At 1<<31 the multiply overflows, the comparison
+	// goes negative, and this budget SILENTLY ACCEPTS the bomb it exists to
+	// refuse. A guard that depends on a mutable constant in another package
+	// file is the overflow-before-the-guard defect this file has already
+	// produced three times (#42, #53, and #58's /S bit offset).
+	//
+	// Dividing folds to 4 at compile time, keeps sizeof named exactly once, and
+	// restores the full int64 range. ⚠ Integer division truncates, and that
+	// errs SAFE: a larger sharedRefBytes gives a smaller allowance, never a
+	// larger one, and TestASharedRefCostsWhatTheBudgetThinks fires anyway.
+	const sharedRefBytesPerStreamByte = 32
+	const refsPerStreamByte = sharedRefBytesPerStreamByte / sharedRefBytes
+	// ⛔ AND THE MESSAGE DOES NOT MULTIPLY `total` EITHER, which the first
+	// version of this refusal did to report a byte figure. That multiply is
+	// reached only when total is ABOVE the budget — the one case where it is
+	// large — so it is the likeliest place of all to wrap and print a negative
+	// number of bytes. The allowance is stated instead, which is the budget
+	// already computed and cannot overflow.
+	if allowed := int64(len(r.b)) * refsPerStreamByte; total > allowed {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) from a %d-byte "+
+			"hint stream, and this reader allows %d byte(s) of references per stream byte, so "+
+			"%d reference(s)", errHintTable, total, len(r.b),
+			int64(sharedRefBytesPerStreamByte), allowed)
+	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
 			"bits remain, so most of them describe nothing",
@@ -773,7 +928,7 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	// against the document, so by the time this runs the count is one the file
 	// agrees with — and a table written for a different number of pages is
 	// exactly what that comparison protects this from.
-	entries, err := readPageEntries(r, h, lin.PageCount)
+	entries, err := readPageEntries(r, h, lin.PageCount, int64(len(d.xref)))
 	if err != nil {
 		return nil, err
 	}

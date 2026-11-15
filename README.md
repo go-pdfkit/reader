@@ -597,6 +597,61 @@ ambiguous and the measurement does not — and the mutation confirms which test
 settles it: the two-sequence reading reddens the new fixture on both shapes and
 leaves the twelve older ones green.
 
+### ⛔⛔ Measuring #56 moved the answer: the term it named was the smaller one
+
+The page offset table's counts were bounded by the **bits** remaining, not by
+the document's objects, so a small stream became a large allocation. #56
+reasoned about it: a `sharedRef` is 8 bytes, so one bit in gives eight bytes
+out, 64×. Running it says otherwise:
+
+```text
+2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
+  the pageEntry slice alone   352.1 MiB   176x   <- /N, which #56 never names
+  with the shared references  416.1 MiB   208x   <- +32x, the term #56 named
+  and no error in either case
+after the bound                  3 064 B   0.0x, refused by name
+```
+
+⭐ **The dominant cost is the 40-byte `pageEntry` per page, driven by `/N`** —
+five and a half times the term the issue was filed about. And the term it *did*
+name measures 32×, not 64×: the issue was **2× high about the half it named
+while being 5.5× low about the total.** Both errors come from reasoning about
+the sizes instead of running it. The attribution came
+from a control that declared no references at all, so the two terms could be
+separated rather than guessed at. Estimating would have fixed the smaller half
+and left a 176× amplification in place.
+
+`/N` is as untrusted here as `/S` was, and for the same reason: nothing on this
+path calls `checkHintStream`. Both ceilings are now the document's object count
+— a page is an indirect object, and F.4.2's identifiers index a table of
+objects, so neither a page count nor **one page's** references can exceed what
+the file holds.
+
+⛔⛔ **"One page's" is doing real work there, and the first version of this bound
+got it wrong.** It compared the **sum** of every page's count against the object
+count, which refuses ordinary documents: a hundred pages each referencing fifty
+shared objects is about 255 objects and a sum of 99 × 50 = 4950. Sharing is the
+entire purpose of part 8 — the same object is referenced from many pages — so
+the sum is bounded by pages × objects and never by objects.
+
+This is #52's lesson repeating: a work budget there refused a 150,000-page file
+and had to be removed. **A ceiling in the wrong units does not fail loudly on
+nonsense; it fails on somebody's real document.** The counterexample is now a
+test, because the wrong bound looked right and passed every other case. What
+still bounds the total is the page ceiling plus the two bit bounds: with
+`pages ≤ objects` and each count `≤ objects` the sum cannot exceed `objects²`,
+and the bits bound independently caps it at one reference per remaining bit. The
+176× term is closed by the page ceiling, which is the unambiguous half.
+
+⛔⛔ **And the ceiling itself was untested, which a mutation found.** Both bounds
+take the cap as an argument, and both had tests passing it directly — so both
+were satisfied by a caller passing *any* number. Replacing `int64(len(d.xref))`
+with `1<<40` in `readHintTables` left the **entire suite green**, on the page
+side and the group side alike. A bound whose ceiling is untested is a bound
+against a number of its own choosing. Two cases now go through `readHintTables`
+so the document supplies the ceiling, and each reddens when its own call site is
+given a constant.
+
 ### ⭐⭐ The encoder's oracle: re-encode qpdf's own tables and compare bytes
 
 Every check above compares **numbers** against what `qpdf --json` prints, and a
