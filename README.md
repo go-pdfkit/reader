@@ -597,12 +597,56 @@ ambiguous and the measurement does not — and the mutation confirms which test
 settles it: the two-sequence reading reddens the new fixture on both shapes and
 leaves the twelve older ones green.
 
-⛔ **Reading, partitioning and both hint tables is all it does — there is no
-linearizing writer yet.** The checker came first on purpose: a writer cannot
-be trusted without one. What remains for #40 is the per-page entries (Table
-F.4), the shared object hint table (F.4.2), the layout, and the two-pass
-fixpoint for `/L`, `/H`, `/E` and `/T`. `CheckLinearized` does not yet consult
-any of this, so the Ghostscript fixture is still accepted.
+### ⭐⭐ The encoder's oracle: re-encode qpdf's own tables and compare bytes
+
+Every check above compares **numbers** against what `qpdf --json` prints, and a
+number cannot see the layout around it — the padding, the group order, the
+width of a field whose value happens to fit either way. So the hint table
+encoder is judged differently: decode qpdf's tables, re-encode from exactly
+those values, and compare the **bytes**, over fourteen shapes.
+
+That oracle earned its keep twice on the first run.
+
+⛔ **Table F.3's item 13 was being written as 32 bits.** It is 16. The header
+came out 304 bits instead of 288, so every shape differed — and a numbers-only
+comparison could never have seen it, because the value read back was right.
+
+⛔⛔ **And it found a missing check in the *reader*.** Ghostscript's fixture
+puts `/S` at byte 38 (bit 304) while its page offset entries run to bit 330:
+twenty-six bits of what the reader was decoding as "page lengths" are really
+the first bytes of the shared object table. The reader accepted that silently.
+It now refuses it, naming the overrun in bits — a defect found only because an
+encoder could not reproduce those bytes. ⛔ This is why Ghostscript is excluded
+from the round-trip list, with the reason written at the exclusion.
+
+### ⛔⛔ A pad that every fixture in the corpus is blind to
+
+Table F.6's item 2 is a one-bit signature flag and item 3 is the 16-byte MD5 it
+guards. **Not one file in the corpus sets that flag** — qpdf 12.4.2 and
+Ghostscript 10.08.0 both leave it clear everywhere. So the byte oracle, the
+strongest instrument here, is silent about sixteen bytes of Table F.6.
+
+Measured by mutation: deleting the `align()` after group (b) leaves **every**
+qpdf fixture byte-identical. Group (c) writes nothing when nothing is signed,
+and (c)'s own unconditional `align()` then restores the boundary the deleted
+one would have set. The two pads are redundant on every file that exists here,
+and separable only once item 3 is actually present.
+
+⭐ So the signed group is a **synthetic** witness whose expectation is built
+from F.4.2's item sizes rather than from a round trip: the reader turns those
+bytes into these values, the writer turns these values back into those bytes.
+A round trip through both of my own functions would pass on any pair that
+agreed with each other and with neither annex. Its control — an unsigned group
+writing one byte of flag and nothing else — is what makes the case able to
+fail at all.
+
+⛔ **Reading, partitioning, both hint tables and encoding them is all it does —
+there is no linearizing writer yet.** The checker came first on purpose: a
+writer cannot be trusted without one. What remains for #40 is the layout
+(F.3.1's eleven parts) and the two-pass fixpoint for `/L`, `/H`, `/E` and `/T`.
+`CheckLinearized` does not yet consult any of the decoded tables, so the
+Ghostscript fixture is still accepted by it — the overrun refusal above lives
+in `readHintTables`, which the checker does not call.
 
 Next wave: the operations built on all of this.
 

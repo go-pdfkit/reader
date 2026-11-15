@@ -790,6 +790,27 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: /S is %T, not a direct integer", errHintTable, sv)
 	}
+
+	// ⛔⛔ THE PAGE OFFSET TABLE MUST END AT OR BEFORE /S, which nothing checked
+	// until the encoder's byte comparison found it. F.3.6 puts the page offset
+	// table first and at offset 0, and /S names where the shared object table
+	// begins, so entries that run past /S are reading the NEXT TABLE'S BYTES
+	// and reporting them as page lengths.
+	//
+	// ⭐ MEASURED ON testdata/linearized-gs.pdf: its /S is 38 (bit 304) and its
+	// per-page entries end at bit 330 — an overrun of 26 bits. The reader
+	// consumed them without complaint because the widths allowed it, and every
+	// number after the overrun point came from the shared object table. This
+	// is a SIXTH thing wrong with that file, after the five qpdf warns about,
+	// and it was invisible to every test that compared numbers rather than
+	// bytes: the encoder could not reproduce those bytes, which is how it
+	// surfaced.
+	if r.pos > 8*int64(pos) {
+		return nil, fmt.Errorf("%w: the page offset table's entries end at bit %d and /S puts "+
+			"the shared object table at byte %d (bit %d), so %d bit(s) of the entries are "+
+			"really the next table", errHintTable, r.pos, int(pos), 8*int64(pos),
+			r.pos-8*int64(pos))
+	}
 	// ⛔ The object count is the cap on how many groups the table may claim;
 	// see readSharedTable's note on maxGroups. len(d.xref) is the document's
 	// own count, and a table naming more groups than that is describing

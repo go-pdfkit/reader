@@ -937,7 +937,42 @@ func qpdfHintFields(t *testing.T, qpdf, path string) map[string]uint32 {
 // SHARED OBJECT table and in the per-page lengths, neither of which this
 // change reads yet — so "qpdf complains" and "this cannot decode" are
 // different facts, and conflating them would make the next step look done.
-func TestTheGhostscriptFixturesPageOffsetHeaderStillReads(t *testing.T) {
+// readHeaderOnly decodes just Table F.3's header out of a file's hint stream,
+// so that "the header reads" can be asserted about a file whose ENTRIES are
+// refused.
+//
+// ⛔ It exists because readHintTables is all-or-nothing by design: a caller
+// wants both tables or neither. Taking the header alone is a test's business,
+// not an API's, which is why this lives here rather than in the package.
+func readHeaderOnly(t *testing.T, d *Document, lin *Linearization) (*pageOffsetHeader, error) {
+	t.Helper()
+	_, o, _, err := ParseIndirectObject(d.buf[lin.HintOffset:], d.Get)
+	if err != nil {
+		return nil, err
+	}
+	s, ok := o.(*Stream)
+	if !ok {
+		return nil, errHintTable
+	}
+	data, _, err := d.DecodeStream(s)
+	if err != nil {
+		return nil, err
+	}
+	return readPageOffsetHeader(&bits{b: data})
+}
+
+// ⛔⛔ AND ITS PER-PAGE ENTRIES OVERRUN ITS OWN /S, WHICH IS A SIXTH THING WRONG
+// WITH THAT FILE AND WAS FOUND BY THE ENCODER. qpdf warns about five things on
+// linearized-gs.pdf; this is not among them. Its /S is 38 — bit 304 — and its
+// per-page entries end at bit 330, so 26 bits of what this package read as
+// page lengths were really the shared object table's bytes.
+//
+// ⭐ EVERY TEST THAT COMPARED NUMBERS WAS BLIND TO IT. The header's thirteen
+// fields matched qpdf, the entries parsed, and nothing said the table had run
+// past where /S puts the next one. The encoder could not reproduce those bytes,
+// which is what surfaced it — a stronger oracle finding what a weaker one
+// cannot, rather than a new idea about the format.
+func TestTheGhostscriptFixturesEntriesOverrunItsOwnSharedTable(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
 	if err != nil {
 		t.Fatal(err)
@@ -950,17 +985,29 @@ func TestTheGhostscriptFixturesPageOffsetHeaderStillReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tables, err := d.readHintTables(lin)
+	_, err = d.readHintTables(lin)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("the Ghostscript fixture's tables were accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "really the next table") {
+		t.Errorf("it was refused, but not for the entries overrunning /S: %v", err)
+	}
+
+	// ⛔ AND THE HEADER ITSELF STILL READS, pinned separately so that "qpdf
+	// warns about this file" and "nothing in it can be decoded" stay
+	// different claims. The thirteen header fields are sound; what is wrong
+	// is where the entries end.
+	tables, err := readHeaderOnly(t, d, lin)
 	if err != nil {
-		t.Fatalf("the Ghostscript fixture's page offset header does not read, which is a "+
-			"stronger claim than qpdf's warnings support: %v", err)
+		t.Fatalf("the Ghostscript fixture's page offset HEADER does not read, which is a "+
+			"stronger claim than the overrun supports: %v", err)
 	}
 	// Measured from qpdf --show-linearization on that fixture: it reports
 	// min_nobjects 3 and first_page_offset 577.
-	if got := tables.pageOffset.MinNObjects; got != 3 {
+	if got := tables.MinNObjects; got != 3 {
 		t.Errorf("min_nobjects = %d, qpdf reads 3", got)
 	}
-	if got := tables.pageOffset.FirstPageOffset; got != 577 {
+	if got := tables.FirstPageOffset; got != 577 {
 		t.Errorf("first_page_offset = %d, qpdf reads 577", got)
 	}
 
@@ -970,7 +1017,7 @@ func TestTheGhostscriptFixturesPageOffsetHeaderStillReads(t *testing.T) {
 	// reports it unchanged at 577. On every qpdf fixture the hint stream comes
 	// first and the length IS added. Adding it unconditionally would have
 	// agreed with all twelve qpdf shapes and been wrong here.
-	got, err := tables.pageOffset.firstPageOffsetInFile(lin)
+	got, err := tables.firstPageOffsetInFile(lin)
 	if err != nil {
 		t.Fatal(err)
 	}
