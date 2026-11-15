@@ -415,6 +415,33 @@ so the partition is measured before a single byte of a linearized file is
 written. It agrees with qpdf across 1/2/5/25 pages × plain, object-streams and
 uncompressed-streams: **twelve shapes, no disagreements.**
 
+### ⭐ And the per-page sets, which `Partition` was computing and discarding
+
+`Partition.Pages[i]` is every object page *i+1* needs. The hint tables cannot be
+built without it: Table F.4 item 1 is "the number of objects in a page" and item
+2 is that page's length, both **per page**, while `Of` only answers which *part*
+an object is in — and part 7 is "belongs to exactly one page that is not the
+first" without ever saying which page.
+
+The walk already produced these sets, once per page, and threw them away.
+
+⛔ **They hold what is PRIVATE to the page, not its reach, and qpdf said so on
+the first run.** The first version kept each page's whole reach and disagreed
+with item 1 on every page but the first — ours `[1 2 15]` against qpdf's 2. The
+extra number is the same on every page of a document because it is a part-6
+object **the first page also reaches**, which qpdf hands to later pages as a
+first-page shared entry instead. Counting it in both places would make every
+page claim an object the layout puts at the front.
+
+⛔⛔ **The count is a weak judge and three invariants carry the rest.** On every
+fixture the cardinalities are *uniform* — page one is all of part 6, every other
+page exactly 2 — and the union of the sets is exactly parts 6 and 7. So swapping
+two pages' private objects keeps every count correct. qpdf publishes nothing
+per-page that attributes a part-7 object to a page, so that judge cannot pin
+membership **even in principle**. What does: every page holds its own object, the
+sets are pairwise disjoint, and their union is exactly the part-6 and part-7
+objects. A swap reddens eight shapes.
+
 ⛔⛔ **The two judges count different things, and that is not a defect in
 either.** qpdf names the objects it will *write*; `Partition` names the objects
 the document *has*. With object streams those differ — for the two-page
