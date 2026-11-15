@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -120,27 +121,12 @@ func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
 				t.Errorf("/H is %d, so the hint stream was never placed", lin.HintOffset)
 			}
 
-			// ⛔ THE OTHER SIDE OF THE BRACKET. The check above only says part 5
-			// does not follow part 6; it says nothing about part 5 landing in
-			// the MIDDLE of part 4. The emission slices `order` into
-			// order[:catalogueCount] and order[catalogueCount:firstPageCount],
-			// which is only the two parts if Order is part-major — and if that
-			// assumption broke, a catalogue object would be written after the
-			// hint stream with /H still ahead of the first page, so the check
-			// above would pass.
-			rootRef, ok := written.trailer["Root"].(Ref)
-			if !ok {
-				t.Fatalf("our own trailer's /Root is %T, not a reference", written.trailer["Root"])
-			}
-			rootEntry, ok := written.xref[rootRef.Num]
-			if !ok {
-				t.Fatalf("/Root names object %d and our own xref has no entry for it",
-					rootRef.Num)
-			}
-			if rootEntry.offset >= int64(lin.HintOffset) {
-				t.Errorf("the catalogue is at %d and the hint stream at %d, so part 5 was written "+
-					"inside part 4", rootEntry.offset, lin.HintOffset)
-			}
+			// ⛔ The other side of the bracket — part 5 must not land in the
+			// MIDDLE of part 4 either — is asserted by
+			// TestOrderPutsPartFourBeforePartSixContiguously, on the
+			// assumption itself rather than on a consequence of it. A /Root
+			// offset below /H was tried here first and is too weak: see that
+			// test.
 
 			base := qpdfComplaints(t, qpdf, dir, "in.pdf", plain)
 			ours := qpdfComplaints(t, qpdf, dir, "ours.pdf", out)
@@ -218,6 +204,69 @@ func isAboutHintTables(line string) bool {
 	return false
 }
 
+// ⛔⛔ ORDER IS PART-MAJOR, which the emission SLICES ON and which nothing
+// else states. It writes order[:catalogueCount] as part 4 and
+// order[catalogueCount:firstPageCount] as part 6, with the hint stream between
+// them, and those are the two parts only if every part-4 object precedes every
+// part-6 object in `order`.
+//
+// ⛔ A WEAKER WITNESS WAS TRIED FIRST AND REVIEW REFUTED IT. The qpdf test
+// asserted /Root's offset was below /H — "part 5 is not inside part 4". But
+// Partition assigns exactly ONE object to part 4 (partition.go: a single
+// `of[catNum] = PartCatalog`), so catalogueCount is 1 on every shape,
+// order[:catalogueCount] is always order[:1], and the check reduces to "the
+// catalogue is emitted first". A layout that interleaved parts 4 and 6 while
+// leaving the catalogue first would survive it.
+//
+// ⭐ So this asserts the PREFIX ITSELF, which no corpus coincidence can satisfy:
+// part 4's objects, then part 6's, with nothing else among them. Measured today
+// the prefix is [4 6 6 6] at one, two and five pages.
+func TestOrderPutsPartFourBeforePartSixContiguously(t *testing.T) {
+	for _, pages := range []int{1, 2, 5} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			d, err := Open(buildPages(t, pages))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := d.Partition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			order, err := p.Order()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			catalogueCount, firstPageCount := 0, 0
+			for _, old := range order {
+				part := p.Of[old]
+				if part != PartCatalog && part != PartFirstPage {
+					break
+				}
+				if part == PartCatalog {
+					catalogueCount++
+				}
+				firstPageCount++
+			}
+			if catalogueCount == 0 || firstPageCount == catalogueCount {
+				t.Fatalf("the prefix is %d part-4 and %d part-6 objects, so this test would "+
+					"pass on an empty assertion", catalogueCount, firstPageCount-catalogueCount)
+			}
+			for i, old := range order[:firstPageCount] {
+				want := PartFirstPage
+				if i < catalogueCount {
+					want = PartCatalog
+				}
+				if got := p.Of[old]; got != want {
+					t.Errorf("order[%d] is object %d in %v, and the emission will write it as "+
+						"%v — parts 4 and 6 are interleaved, so slicing on the counts is wrong",
+						i, old, got, want)
+				}
+			}
+		})
+	}
+}
+
 // ⛔⛔ THE EMISSION IS STABLE ACROSS PASSES, which the writer relies on and
 // which no guard inside it can state. The first version compared pass 1's
 // measurements against pass 0's and refused a mismatch; that branch is
@@ -271,15 +320,11 @@ func TestTheEmissionIsStableAcrossPasses(t *testing.T) {
 	}
 }
 
-// ⛔⛔ /Info AND /ID SURVIVE THE COPY, which no fixture could show: neither
-// buildPages nor any committed file carries either, which is exactly why the
-// first version dropped them in silence and no test noticed. Review found it by
-// reading what the trailer does NOT write.
-//
-// ⛔ A document information dictionary is metadata a reader shows a person, and
-// /ID is how a reader tells whether two files are the same document. Losing
-// either is not a crash; it is a quieter kind of wrong.
-func TestTheTrailerCarriesInfoAndID(t *testing.T) {
+// infoAndIDFixture writes a one-page document that carries both a document
+// information dictionary and an /ID, which buildPages does not — and whose
+// absence is why the first version of the writer dropped both in silence.
+func infoAndIDFixture(t *testing.T) []byte {
+	t.Helper()
 	w := NewWriter("1.7")
 	pagesRef := w.Reserve()
 	content := w.Add(&Stream{Dict: Dict{}, Raw: []byte("0 g")})
@@ -295,6 +340,19 @@ func TestTheTrailerCarriesInfoAndID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return plain
+}
+
+// ⛔⛔ /Info AND /ID SURVIVE THE COPY, which no fixture could show: neither
+// buildPages nor any committed file carries either, which is exactly why the
+// first version dropped them in silence and no test noticed. Review found it by
+// reading what the trailer does NOT write.
+//
+// ⛔ A document information dictionary is metadata a reader shows a person, and
+// /ID is how a reader tells whether two files are the same document. Losing
+// either is not a crash; it is a quieter kind of wrong.
+func TestTheTrailerCarriesInfoAndID(t *testing.T) {
+	plain := infoAndIDFixture(t)
 	d, err := Open(plain)
 	if err != nil {
 		t.Fatal(err)
@@ -332,6 +390,174 @@ func TestTheTrailerCarriesInfoAndID(t *testing.T) {
 	if s, _ := arr[0].(String); string(s) != "0123456789abcdef" {
 		t.Errorf("/ID's first string changed to %q — a reader uses it to tell two files "+
 			"apart, so a linearized copy must keep it", s)
+	}
+	// ⛔⛔ AND THE SECOND STRING MUST MOVE. The first version asserted only the
+	// line above and passed while BOTH strings were copied, which made the copy
+	// claim to be the same REVISION as its input. qpdf --linearize regenerates
+	// this element; see documentID for the measurement and for why Ghostscript
+	// is not the model here.
+	if s, _ := arr[1].(String); string(s) == "0123456789abcdef" {
+		t.Errorf("/ID's second string is unchanged, so the copy claims to be the same "+
+			"revision as its input: %q", s)
+	}
+	// ⛔ A derived identifier, not a random one: Linearize must be
+	// deterministic, which TestTheEmissionIsStableAcrossPasses relies on.
+	again, err := d.Linearize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, again) {
+		t.Error("two linearizations of one document differ, so /ID's second string is random")
+	}
+
+}
+
+// ⛔⛔ QPDF JUDGES THE /Info + /ID SHAPE TOO, which until now nothing did. Every
+// other qpdf measurement in this file runs on buildPages, and buildPages carries
+// neither key — so the two trailer entries added for them had no foreign oracle
+// at all. A rewritten /ID or a mispadded span is exactly what qpdf names.
+//
+// ⛔ A separate test and not a branch inside the one above, because the judge
+// must not be silently skipped: qpdfOrSkip fails when REQUIRE_QPDF is set, and
+// an inline `if qpdf is installed` would have reported success for an agreement
+// it never checked.
+func TestQpdfJudgesTheInfoAndIDFile(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	plain := infoAndIDFixture(t)
+	d, err := Open(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.Linearize()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	base := qpdfComplaints(t, qpdf, dir, "in.pdf", plain)
+	written := qpdfComplaints(t, qpdf, dir, "ours.pdf", out)
+	for l := range written {
+		if !base[l] && !isAboutHintTables(l) {
+			t.Errorf("qpdf says this about our /Info+/ID file and not about the input, "+
+				"and it is not about the hint tables: %q", l)
+		}
+	}
+}
+
+// ⛔ EVERY SHAPE OF /ID THIS WRITER WILL NOT REWRITE, because it copies
+// documents it did not produce. /ID is required to be two strings; a file that
+// breaks that is not this operation's business to refuse, and rewriting half of
+// a structure we cannot read is worse than carrying it.
+func TestDocumentIDLeavesWhatItCannotRead(t *testing.T) {
+	d := &Document{buf: []byte("%PDF-1.7\n")}
+	for _, tc := range []struct {
+		name string
+		in   Object
+	}{
+		{"not an array", Name("nope")},
+		{"one element", Array{String("only one")}},
+		{"empty", Array{}},
+		{"first element not a string", Array{Integer(1), String("second")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// ⛔ reflect.DeepEqual and not fmt.Sprint: comparing through
+			// String() would call every decorative Kind equal.
+			if got := d.documentID(tc.in); !reflect.DeepEqual(got, tc.in) {
+				t.Errorf("documentID rewrote %v into %v", tc.in, got)
+			}
+		})
+	}
+
+	t.Run("two strings", func(t *testing.T) {
+		in := Array{String("permanent-------"), String("revision--------")}
+		got, ok := d.documentID(in).(Array)
+		if !ok || len(got) != 2 {
+			t.Fatalf("documentID returned %v", got)
+		}
+		if s, _ := got[0].(String); string(s) != "permanent-------" {
+			t.Errorf("the permanent identifier changed to %q", s)
+		}
+		if s, _ := got[1].(String); string(s) == "revision--------" {
+			t.Error("the revision identifier was not replaced")
+		}
+		// ⛔ AND THE INPUT IS NOT MUTATED. documentID copies before writing;
+		// the caller's Array is the document's own trailer value, and the two
+		// passes would otherwise see different inputs.
+		if s, _ := in[1].(String); string(s) != "revision--------" {
+			t.Errorf("documentID mutated its caller's array: %q", s)
+		}
+	})
+}
+
+// ⛔⛔ AN /ID TOO LONG FOR THE OLD CONSTANT, which is the regression review
+// measured: frontTrailerSpan was derived from /Size, /Prev and the catalogue's
+// number alone, so 64-byte /ID strings made a conforming file REFUSED with "the
+// first-page trailer needs 212 bytes and 192 are reserved". The span is now the
+// base plus the bytes /Info and /ID actually take.
+//
+// ⛔ 64 is not a round number chosen for comfort: /ID strings have no bound in
+// 14.4, so this test fixes the case that broke and the span is computed rather
+// than guessed.
+func TestALongIDIsNotRefused(t *testing.T) {
+	for _, n := range []int{16, 32, 64, 256} {
+		t.Run(fmt.Sprintf("%d-byte /ID", n), func(t *testing.T) {
+			w := NewWriter("1.7")
+			pagesRef := w.Reserve()
+			content := w.Add(&Stream{Dict: Dict{}, Raw: []byte("0 g")})
+			page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": content})
+			w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page},
+				"Count":    Integer(1),
+				"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+			root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+			info := w.Add(Dict{"Producer": String("go-pdfkit/reader")})
+			long := String(bytes.Repeat([]byte("a"), n))
+
+			plain, err := w.Finish(Dict{"Root": root, "Info": info,
+				"ID": Array{long, long}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, err := Open(plain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := d.Linearize()
+			if err != nil {
+				t.Fatalf("a %d-byte /ID was refused: %v", n, err)
+			}
+			// ⛔ AND THE FILE IS STILL COHERENT, not merely produced: a span
+			// that padded wrongly would leave our own reader unable to find
+			// the cross-reference section.
+			if _, err := Linearized(out); err != nil {
+				t.Fatalf("the file written with a %d-byte /ID does not read: %v", n, err)
+			}
+			got, err := Open(out)
+			if err != nil {
+				t.Fatalf("the file written with a %d-byte /ID does not open: %v", n, err)
+			}
+			// ⛔⛔ AND THE LONG /ID IS ACTUALLY IN THERE, asserted because the
+			// mutation looked wrong: with the span fix reverted only the
+			// 256-byte case reddened, while review had measured a refusal at
+			// 64. A fixture that never carried the long /ID would look exactly
+			// like that, so it had to be ruled out rather than reasoned about.
+			//
+			// ⭐ It is carried, and the two numbers reconcile: review measured
+			// 212 bytes while /ID[1] was still a COPY of the 64-byte string,
+			// and documentID now replaces it with a 16-byte hash, so the same
+			// input needs 180 and fits the old 192. At 256 bytes it needs 372
+			// (312 of them /Info and /ID) and the reverted span refuses it.
+			// Both measurements were right; the operation changed between them.
+			arr, ok := got.trailer["ID"].(Array)
+			if !ok || len(arr) != 2 {
+				t.Fatalf("the output's /ID is %v, so this test did not exercise a long /ID",
+					got.trailer["ID"])
+			}
+			if s, _ := arr[0].(String); len(s) != n {
+				t.Fatalf("the output's /ID[0] is %d bytes and the input's was %d, so the "+
+					"span was never asked to hold one", len(s), n)
+			}
+		})
 	}
 }
 

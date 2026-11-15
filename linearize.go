@@ -7,6 +7,7 @@ package reader
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 )
@@ -29,11 +30,67 @@ const xrefEntryBytes = 20
 // frontTrailerSpan is the bytes reserved for part 3's trailer, which sits
 // BEFORE every object and so must not change width between the two passes.
 //
-// ⛔ IT HOLDS THREE VARIABLE-WIDTH NUMBERS: /Size, /Prev and the catalogue's
-// object number. Three int64 at 19 digits is 57, the fixed text is under 70,
-// and 192 clears both with room. ⛔ A var, like paramSpan, so that the refusal
-// is reachable from a test rather than being an untested claim.
+// ⛔ IT COVERS THE THREE VARIABLE-WIDTH NUMBERS ONLY: /Size, /Prev and the
+// catalogue's object number. Three int64 at 19 digits is 57, the fixed text is
+// under 70, and 192 clears both with room.
+//
+// ⛔⛔ /Info AND /ID ARE NOT IN THAT DERIVATION, AND MUST NOT BE: an /ID string
+// has no bound, so no constant can cover it. The emission adds len(extra) to
+// this base — the first version did not, and refused a conforming file whose
+// /ID held 64-byte strings. ⛔ A var, like paramSpan, so that the refusal is
+// reachable from a test rather than being an untested claim.
 var frontTrailerSpan = 192
+
+// documentID returns the /ID for the linearized copy: the first string kept and
+// the second replaced.
+//
+// ⛔⛔ THE FIRST VERSION PASSED BOTH STRINGS THROUGH, under the reason "a reader
+// uses /ID to tell whether two files are the same document". That reason is true
+// of the FIRST element and was applied to both. 14.4 gives /ID[0] as the
+// permanent identifier of the document and /ID[1] as the identifier of the
+// REVISION, so keeping both says the copy is the same revision as its input.
+//
+// ⛔ AND THE TWO PRODUCERS DISAGREE, so neither can be cited as "what producers
+// do". Measured here on 2026-11-15, with qpdf 12.4.2 and Ghostscript 10.08.0,
+// over a file whose /ID was <d415eddf...> twice:
+//
+//	qpdf --linearize   /ID [<d415eddf...> <a2949296...>]
+//	                   — first kept, second regenerated
+//	gs -sDEVICE=pdfwrite /ID [<b203ad36...> <b203ad36...>]
+//	                   — BOTH replaced, with a new pair equal to each other
+//
+// qpdf is the one to follow and the reason is the operation, not its authority:
+// `--linearize` re-lays-out the SAME document, which is what this function
+// does, while pdfwrite rewrites the content into a NEW document and is entitled
+// to a new permanent identifier. ⚠ ISO 32000-1 14.4 itself was not reachable
+// from this machine, so the clause is cited from the two implementations'
+// behaviour and not from the text.
+//
+// ⛔ The replacement is DERIVED, not random, because Linearize must be
+// deterministic: the same document linearized twice has to give the same bytes,
+// which is what TestTheEmissionIsStableAcrossPasses asserts. A random /ID[1]
+// would redden it, and a reader cannot tell a derived identifier from a random
+// one.
+func (d *Document) documentID(v Object) Object {
+	a, ok := v.(Array)
+	// ⛔ ANYTHING THAT IS NOT THE SHAPE 14.4 DESCRIBES PASSES THROUGH UNTOUCHED.
+	// /ID is required to be a two-element array of strings, but this writer
+	// copies documents it did not produce: a one-element array, a name, a
+	// reference. Rewriting half of a structure we cannot read is worse than
+	// carrying it, and refusing the file would make a malformed /ID fatal to an
+	// operation that has nothing to do with it.
+	if !ok || len(a) < 2 {
+		return v
+	}
+	if _, ok := a[0].(String); !ok {
+		return v
+	}
+	sum := sha256.Sum256(d.buf)
+	out := make(Array, len(a))
+	copy(out, a)
+	out[1] = String(sum[:16])
+	return out
+}
 
 // Linearize writes a linearized copy of the document: ISO 32000-1 Annex F's
 // eleven parts, with the parameter dictionary at the front and the first-page
@@ -244,24 +301,42 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// nothing said so — no fixture here has either, which is why no test
 	// noticed. Review found it by reading what the trailer does NOT write.
 	//
-	// ⛔ /Info is renumbered like any other reference; /ID is two strings and
-	// passes through. A reader uses /ID to tell whether two files are the same
-	// document, so changing it would make a linearized copy look like a
-	// different file.
+	// ⛔ /Info is renumbered like any other reference. /ID is NOT passed through
+	// whole — see documentID, and the measurement that corrected it.
 	extra := ""
 	for _, key := range []Name{"Info", "ID"} {
-		if v, has := d.trailer[key]; has {
-			extra += fmt.Sprintf(" /%s %s", key, AppendObject(nil, renumber(v, num)))
+		v, has := d.trailer[key]
+		if !has {
+			continue
 		}
+		if key == "ID" {
+			v = d.documentID(v)
+		}
+		extra += fmt.Sprintf(" /%s %s", key, AppendObject(nil, renumber(v, num)))
 	}
+
+	// ⛔⛔ THE SPAN IS THE BASE PLUS len(extra), AND THE FIRST VERSION FORGOT
+	// THAT. frontTrailerSpan was derived from /Size, /Prev and the catalogue's
+	// object number alone, so a document with a 64-byte /ID was REFUSED — "the
+	// first-page trailer needs 212 bytes and 192 are reserved" — on a file
+	// nothing is wrong with. Measured by review: 16-byte /ID plus /Info gives a
+	// 112-byte trailer, 32-byte gives 144, 64-byte needs 212.
+	//
+	// ⭐ Adding len(extra) is sound for the fixpoint because `extra` is
+	// PASS-INVARIANT: /ID comes from the input and the hash of the input, and
+	// /Info's new object number comes from `num`, which is final before the
+	// first pass. Only /Size, /Prev and the catalogue's number can change width
+	// between passes, and the base is what covers them.
+	span := frontTrailerSpan + len(extra)
 	trailer := fmt.Sprintf("trailer\n<< /Size %d /Prev %d /Root %d 0 R%s >>\nstartxref\n0\n%%%%EOF\n",
 		paramNum+2, prev.mainXrefAt, catalogue, extra)
-	if len(trailer) > frontTrailerSpan {
+	if len(trailer) > span {
 		return nil, linMeasured{}, fmt.Errorf("%w: the first-page trailer needs %d bytes and %d "+
-			"are reserved", ErrCannotLinearize, len(trailer), frontTrailerSpan)
+			"are reserved (%d of them for /Info and /ID)",
+			ErrCannotLinearize, len(trailer), span, len(extra))
 	}
 	buf.WriteString(trailer)
-	buf.Write(bytes.Repeat([]byte(" "), frontTrailerSpan-len(trailer)))
+	buf.Write(bytes.Repeat([]byte(" "), span-len(trailer)))
 
 	// Parts 4 and 6 through 9, in Order's sequence, with part 5 — the primary
 	// hint stream — between them.
