@@ -545,12 +545,38 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 	// again with no code change, no failing test, and a message that has
 	// started lying. The budget below is a number of BYTES and the conversion
 	// is named once.
+	// ⛔⛔⛔ AND THE CONSTANTS ARE DIVIDED, NOT `total` MULTIPLIED, which is the
+	// difference between a guard that cannot overflow and one whose safety is
+	// held by a variable in another file. `total*sharedRefBytes` is safe TODAY
+	// only because maxDecodedSize (filter.go:14) is 1<<30: that caps the stream
+	// at 2^30 bytes, so pages ≤ 2^28, total ≤ 2^60, and total*8 reaches
+	// 9223372034707292160 against MaxInt64 9223372036854775807 — ten digits of
+	// agreement, measured by review.
+	//
+	// ⛔ maxDecodedSize is a `var` whose comment says "Tests lower it". Nothing
+	// stops it being RAISED. At 1<<31 the multiply overflows, the comparison
+	// goes negative, and this budget SILENTLY ACCEPTS the bomb it exists to
+	// refuse. A guard that depends on a mutable constant in another package
+	// file is the overflow-before-the-guard defect this file has already
+	// produced three times (#42, #53, and #58's /S bit offset).
+	//
+	// Dividing folds to 4 at compile time, keeps sizeof named exactly once, and
+	// restores the full int64 range. ⚠ Integer division truncates, and that
+	// errs SAFE: a larger sharedRefBytes gives a smaller allowance, never a
+	// larger one, and TestASharedRefCostsWhatTheBudgetThinks fires anyway.
 	const sharedRefBytesPerStreamByte = 32
-	if budget := int64(len(r.b)) * sharedRefBytesPerStreamByte; total*sharedRefBytes > budget {
-		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s), which would "+
-			"hold %d bytes from a %d-byte hint stream, and this reader allows %d byte(s) of "+
-			"references per stream byte", errHintTable, total, total*sharedRefBytes, len(r.b),
-			int64(sharedRefBytesPerStreamByte))
+	const refsPerStreamByte = sharedRefBytesPerStreamByte / sharedRefBytes
+	// ⛔ AND THE MESSAGE DOES NOT MULTIPLY `total` EITHER, which the first
+	// version of this refusal did to report a byte figure. That multiply is
+	// reached only when total is ABOVE the budget — the one case where it is
+	// large — so it is the likeliest place of all to wrap and print a negative
+	// number of bytes. The allowance is stated instead, which is the budget
+	// already computed and cannot overflow.
+	if allowed := int64(len(r.b)) * refsPerStreamByte; total > allowed {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) from a %d-byte "+
+			"hint stream, and this reader allows %d byte(s) of references per stream byte, so "+
+			"%d reference(s)", errHintTable, total, len(r.b),
+			int64(sharedRefBytesPerStreamByte), allowed)
 	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
