@@ -111,6 +111,162 @@ func TestThePageOffsetHeaderAgreesWithQpdfFieldByField(t *testing.T) {
 	}
 }
 
+// ⛔⛔ AND EVERY PAGE'S ENTRY, FIELD BY FIELD, WHICH IS WHAT THE COLUMN-MAJOR
+// READING HAD TO GET RIGHT. qpdf prints each page's nobjects, length,
+// content_offset, content_length and nshared_objects, plus an identifier and a
+// numerator per shared reference — so a reading that mixed one page's bits
+// with another's is caught per page rather than in aggregate.
+//
+// ⭐ This is the test that found the byte alignment. Without the per-page
+// comparison the header test stayed green while the entries were nonsense.
+func TestEveryPageEntryAgreesWithQpdf(t *testing.T) {
+	qpdf := qpdfOrSkip(t)
+
+	for _, shape := range []struct {
+		name  string
+		extra []string
+	}{
+		{"as qpdf writes it", nil},
+		{"with object streams", []string{"--object-streams=generate"}},
+		{"with streams uncompressed", []string{"--compress-streams=n"}},
+	} {
+		for _, pages := range []int{1, 2, 5, 25} {
+			t.Run(shape.name+", "+strconv.Itoa(pages)+" pages", func(t *testing.T) {
+				qpdfExtra = shape.extra
+				defer func() { qpdfExtra = nil }()
+				_, linear := linearizedFixture(t, pages)
+
+				d, err := Open(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lin, err := Linearized(linear)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := d.readHintTables(lin)
+				if err != nil {
+					t.Fatalf("the hint tables of a file qpdf linearized do not read: %v", err)
+				}
+
+				path := filepath.Join(t.TempDir(), "linear.pdf")
+				if err := os.WriteFile(path, linear, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				want := qpdfPageEntries(t, qpdf, path)
+
+				if len(got.pages) != len(want) {
+					t.Fatalf("read %d page entr(ies), qpdf prints %d", len(got.pages), len(want))
+				}
+				for i, g := range got.pages {
+					w := want[i]
+					for _, c := range []struct {
+						field    string
+						got, exp uint32
+					}{
+						{"nobjects", g.NObjects, w.nobjects},
+						{"length", g.Length, w.length},
+						{"content_offset", g.ContentOffset, w.contentOffset},
+						{"content_length", g.ContentLength, w.contentLength},
+						{"nshared_objects", uint32(len(g.Shared)), w.nshared},
+					} {
+						if c.got != c.exp {
+							t.Errorf("page %d: %s = %d, qpdf says %d", i, c.field, c.got, c.exp)
+						}
+					}
+					// ⛔ The identifiers and numerators are compared in ORDER,
+					// which Table F.4 item 5 requires ("in the same order as
+					// the preceding item"). A set comparison would accept a
+					// decoder that paired the right values with the wrong
+					// references.
+					for j, s := range g.Shared {
+						if j >= len(w.identifiers) {
+							break
+						}
+						if s.Identifier != w.identifiers[j] {
+							t.Errorf("page %d: identifier %d = %d, qpdf says %d",
+								i, j, s.Identifier, w.identifiers[j])
+						}
+						if s.Numerator != w.numerators[j] {
+							t.Errorf("page %d: numerator %d = %d, qpdf says %d",
+								i, j, s.Numerator, w.numerators[j])
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// qpdfPage is one page as qpdf prints it.
+type qpdfPage struct {
+	nobjects, length, contentOffset, contentLength, nshared uint32
+	identifiers, numerators                                 []uint32
+}
+
+// qpdfPageEntries reads qpdf's per-page block out of --show-linearization.
+//
+// ⛔ IT ASSERTS IT FOUND PAGES, because an empty slice compares equal to an
+// empty slice and would read as agreement — the shape "a scan that could not
+// read reported zero" is named for.
+func qpdfPageEntries(t *testing.T, qpdf, path string) []qpdfPage {
+	t.Helper()
+
+	cmd := exec.Command(qpdf, "--show-linearization", path)
+	cmd.Stdin = nil
+	out, _ := cmd.CombinedOutput()
+	text := string(out)
+
+	const stop = "Shared Objects Hint Table"
+	section := text
+	if to := strings.Index(section, stop); to >= 0 {
+		section = section[:to]
+	} else {
+		t.Fatalf("qpdf printed no %q, so the page entries have no end:\n%s", stop, text)
+	}
+
+	var pages []qpdfPage
+	for _, line := range strings.Split(section, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Page ") && strings.HasSuffix(trimmed, ":") {
+			pages = append(pages, qpdfPage{})
+			continue
+		}
+		if len(pages) == 0 {
+			continue
+		}
+		name, value, ok := strings.Cut(trimmed, ": ")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+		if err != nil {
+			continue
+		}
+		p := &pages[len(pages)-1]
+		switch {
+		case name == "nobjects":
+			p.nobjects = uint32(n)
+		case name == "length":
+			p.length = uint32(n)
+		case name == "content_offset":
+			p.contentOffset = uint32(n)
+		case name == "content_length":
+			p.contentLength = uint32(n)
+		case name == "nshared_objects":
+			p.nshared = uint32(n)
+		case strings.HasPrefix(name, "identifier "):
+			p.identifiers = append(p.identifiers, uint32(n))
+		case strings.HasPrefix(name, "numerator "):
+			p.numerators = append(p.numerators, uint32(n))
+		}
+	}
+	if len(pages) == 0 {
+		t.Fatalf("qpdf printed no page entries, so the comparison would be vacuous:\n%s", text)
+	}
+	return pages
+}
+
 // qpdfHintFields reads the `name: number` lines qpdf prints for the page
 // offset hint table.
 //
@@ -413,6 +569,23 @@ func TestEveryWayTheHintStreamFailsToYieldATableIsNamed(t *testing.T) {
 			buf:  "%PDF-1.7\n9 0 obj\n<< /Length 4 >>\nstream\nabcd\nendstream\nendobj\n",
 			want: "bits were asked for",
 		},
+		{
+			// ⛔ THE HEADER READS AND THE ENTRIES DO NOT, which is a different
+			// failure from a short stream and must come out of readHintTables
+			// rather than be swallowed: thirty-six bytes is exactly Table
+			// F.3's header, so the first stage succeeds and the second has
+			// nothing. This fixture's /N is 0, which readPageEntries refuses.
+			//
+			// ⛔ THE FILLER IS NUL AND NOT '0'. The first version used ASCII
+			// zeros, and 0x3030 is 12336 — so the width check refused the
+			// table before the entries were ever reached, and the test was
+			// measuring the wrong refusal. An all-zero header is the one whose
+			// thirteen items are all valid.
+			name: "the header reads but there are no entries behind it",
+			buf: "%PDF-1.7\n9 0 obj\n<< /Length 36 >>\nstream\n" +
+				strings.Repeat("\x00", 36) + "\nendstream\nendobj\n",
+			want: "hint table for 0 pages",
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			const head = "%PDF-1.7\n"
@@ -426,6 +599,198 @@ func TestEveryWayTheHintStreamFailsToYieldATableIsNamed(t *testing.T) {
 				t.Errorf("it was refused, but the message does not say %q: %v", c.want, err)
 			}
 		})
+	}
+}
+
+// entriesHeader is a header whose every width is 8 bits, so that one page's
+// item is exactly one byte and a truncation can be aimed at a chosen group.
+//
+// ⛔ The widths are all equal ON PURPOSE. With real widths the group boundaries
+// land mid-byte and a test aiming at group (e) would be aiming at arithmetic
+// rather than at a group.
+func entriesHeader() *pageOffsetHeader {
+	return &pageOffsetHeader{
+		NBitsDeltaNObjects:   8,
+		NBitsDeltaPageLength: 8,
+		NBitsNSharedObjects:  8,
+		NBitsSharedIdent:     8,
+		NBitsSharedNumerator: 8,
+		NBitsDeltaContentOff: 8,
+		NBitsDeltaContentLen: 8,
+	}
+}
+
+// ⛔⛔ A TRUNCATION IN EVERY ONE OF F.4.1'S SEVEN GROUPS, each refused with the
+// item that ran out. The item number is the whole value of the message: told
+// only "the hint table cannot be read", nobody can tell a truncated table from
+// a decoder whose widths are wrong — and those are the two things that go wrong
+// here.
+//
+// ⛔ The layout for two pages, all widths 8 bits: group (a) takes bytes 0-1,
+// (b) 2-3, (c) 4-5, (d) 6, (e) 7, (f) 8-9, (g) 10-11. The counts in byte 4 and
+// 5 are 0 and 1, so page two has one shared reference and groups (d) and (e)
+// are one byte each.
+func TestATruncationInEveryPerPageGroupNamesItsItem(t *testing.T) {
+	full := []byte{
+		0, 0, // (a) object count deltas
+		0, 0, // (b) page length deltas
+		0, 1, // (c) shared counts: the first page MUST be 0
+		0,    // (d) page two's one identifier
+		0,    // (e) page two's one numerator
+		0, 0, // (f) content offset deltas
+		0, 0, // (g) content length deltas
+	}
+	// The control: the whole thing reads.
+	if _, err := readPageEntries(&bits{b: full}, entriesHeader(), 2); err != nil {
+		t.Fatalf("the untruncated table does not read, so no case below is about its cut: %v", err)
+	}
+
+	for _, c := range []struct {
+		name string
+		keep int
+		want string
+	}{
+		{"group (a), the object count", 1, "item 1, the object count"},
+		{"group (b), the page length", 3, "item 2, the page length"},
+		{"group (c), the shared count", 5, "item 3, the shared object count"},
+		{"groups (d) and (e), the references", 6, "shared object reference(s)"},
+		{"group (f), the content offset", 9, "item 6, the content stream offset"},
+		{"group (g), the content length", 11, "item 7, the content stream length"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := readPageEntries(&bits{b: full[:c.keep]}, entriesHeader(), 2)
+			if !errors.Is(err, errHintTable) {
+				t.Fatalf("a table cut to %d byte(s) was accepted: %v", c.keep, err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("it was refused, but not naming %q: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// ⛔⛔ AND THE FIRST PAGE'S SHARED COUNT MUST BE ZERO, which Table F.4 item 3
+// states — "For the first page, this number shall be 0; the next two items
+// start with the second page". A non-zero one is not merely non-conforming: it
+// would make groups (d) and (e) consume bits belonging to the pages after it,
+// so every later value would be wrong while the table still parsed.
+func TestANonZeroSharedCountOnTheFirstPageIsRefused(t *testing.T) {
+	b := []byte{0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0}
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("a first page claiming shared objects was accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the first page claims 3 shared object(s)") {
+		t.Errorf("it was refused, but without naming the count: %v", err)
+	}
+}
+
+// ⛔⛔ AND A COUNT THAT CANNOT FIT IS REFUSED BEFORE ANY OF IT IS READ, which is
+// what makes discarding the errors in groups (d) and (e) sound.
+// nbits_nshared_objects can be 32, so a page can claim four billion references
+// and each costs two reads; without this bound a twelve-byte table could ask
+// for billions of iterations and be refused only afterwards.
+func TestSharedReferencesThatCannotFitAreRefusedBeforeBeingRead(t *testing.T) {
+	// Page two claims 255 references at 8 + 8 bits each = 4080 bits, and the
+	// table has 96.
+	b := []byte{0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0}
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("255 references in a 12-byte table were accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "255 shared object reference(s)") {
+		t.Errorf("it was refused, but without naming the count: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bits, and") {
+		t.Errorf("it was refused, but without saying what was needed against what remains: %v", err)
+	}
+}
+
+// ⛔⛔⛔ THE COUNTEREXAMPLE TO A PROOF THIS FILE ONCE CARRIED, which review ran
+// and which decoded SILENTLY with a fabricated value.
+//
+// An earlier version discarded the read errors in groups (d) and (e), on the
+// stated ground that the count bound above proved the bits were there. The
+// proof forgot the r.align() BETWEEN those two groups: real consumption is
+// ceil(total*identBits/8)*8 + total*numeratorBits, up to seven bits more than
+// the bound allows.
+//
+// ⛔ With one-bit widths for the count, the identifier and the numerator, two
+// pages, and the two bytes 0x40 0x80: the counts read as 0 and 1, the bound
+// passes (two bits needed, eight remain), group (d) reads one bit and then
+// ALIGNS TO THE NEXT BYTE, and group (e) has nothing left. The old code
+// returned err == nil with Numerator 0 — a number no byte of the file ever
+// held.
+//
+// ⭐ The lesson is not "check the arithmetic again". It is that a justification
+// for discarding an error is worth less than the returned error, because the
+// justification is the thing that silently stops being true.
+func TestTheTruncationThatOnceDecodedSilently(t *testing.T) {
+	h := &pageOffsetHeader{
+		NBitsDeltaNObjects:   0,
+		NBitsDeltaPageLength: 0,
+		NBitsNSharedObjects:  1,
+		NBitsSharedIdent:     1,
+		NBitsSharedNumerator: 1,
+		NBitsDeltaContentOff: 0,
+		NBitsDeltaContentLen: 0,
+	}
+	// 0x40 = 0100_0000: the two count bits are 0 (first page) and 1 (second).
+	_, err := readPageEntries(&bits{b: []byte{0x40, 0x80}}, h, 2)
+	if err == nil {
+		t.Fatal("it decoded, which is the defect: group (e) has no bits and the numerator " +
+			"would be invented")
+	}
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("it failed, but not as a hint table refusal: %v", err)
+	}
+	if !strings.Contains(err.Error(), "item 5, a fractional position") {
+		t.Errorf("it was refused, but not at group (e), which is where the bits run out: %v", err)
+	}
+}
+
+// ⛔⛔ AND GROUP (d)'s OWN READ ERROR, which needs a header the uniform-width
+// fixture cannot produce. The bound is measured BEFORE group (c)'s alignment,
+// so it over-estimates what remains by the slack; with every width a multiple
+// of eight there is no slack and the bound always fires first. Reaching (d)'s
+// error therefore takes a count width that leaves group (c) mid-byte.
+//
+// ⛔ Three-bit counts over two pages consume six bits, so two bits of slack.
+// The buffer is two bytes: after the counts, ten bits remain by the bound's
+// reckoning and only eight after the alignment. One nine-bit identifier passes
+// the bound (9 <= 10) and then cannot be read (9 > 8).
+//
+// ⭐ That this case exists at all is the argument for the bound being
+// conservative rather than exact: an exact bound makes this line unreachable,
+// and an unreachable line is one claiming to be tested that is not.
+func TestAnIdentifierThatTheAlignmentLeavesNoRoomForIsRefused(t *testing.T) {
+	h := &pageOffsetHeader{
+		NBitsNSharedObjects: 3,
+		NBitsSharedIdent:    9,
+	}
+	// 0x04 = 000_001_00: page one's count is 0, page two's is 1, then slack.
+	_, err := readPageEntries(&bits{b: []byte{0x04, 0x00}}, h, 2)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("an identifier with no room was accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "item 4, a shared object identifier") {
+		t.Errorf("it was refused, but not at group (d): %v", err)
+	}
+}
+
+// ⛔ A hint table for no pages is refused rather than returning an empty
+// slice: /N is checked against the document before this runs, so zero pages
+// here means the caller is wrong, and an empty result would be mistaken for a
+// table that holds nothing.
+func TestAHintTableForNoPagesIsRefused(t *testing.T) {
+	for _, pages := range []int{0, -1} {
+		_, err := readPageEntries(&bits{b: make([]byte, 12)}, entriesHeader(), pages)
+		if !errors.Is(err, errHintTable) {
+			t.Fatalf("a table for %d pages was accepted: %v", pages, err)
+		}
+		if !strings.Contains(err.Error(), "pages") {
+			t.Errorf("it was refused, but not for the page count: %v", err)
+		}
 	}
 }
 

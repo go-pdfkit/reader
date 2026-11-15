@@ -520,8 +520,49 @@ Ghostscript one.
 it is paid here because reading the tables *is* the purpose. The expansion cap
 in `filter.go` bounds it.
 
-⛔ **Reading, partitioning and the page offset header is all it does — there is
-no linearizing writer yet.** The checker came first on purpose: a writer cannot
+⛔⛔⛔ **Each of F.4.1's seven lettered groups is padded to a byte boundary, and
+the specification does not say so anywhere.** F.4.1 gives the order (a)–(g) and
+the widths and says nothing about alignment between groups; "byte boundary"
+appears in the whole of ISO 32000-1 only in the filter and image-sample
+clauses, never in Annex F. A decoder written from the text alone is wrong on
+every real file.
+
+It was found by the *refusal firing on files qpdf had produced* — "the first
+page claims 1 shared object" where Table F.4 item 3 requires 0 and qpdf itself
+reports 0 — which is the shape of a decoder error, not a producer error. Then
+measured by hand from the bytes of the two-page fixture, after the 36-byte
+header:
+
+```text
+byte 36: 10000000   item 1: page 0 delta 1, page 1 delta 0, SIX BITS PADDING
+byte 37: 11111000   item 2: page 0 delta 31, then
+byte 38: 00000000     page 1 delta 0, then padding
+byte 39: 01000000   item 3: page 0 count 0, page 1 count 1, padding
+byte 40: 10000000   item 4: page 1's identifier 2, padding
+byte 41: 11111000   item 7: page 0 delta 31, then
+byte 42: 00000000     page 1 delta 0, padding
+```
+
+Item 3 landing on byte 39 is the proof: without the padding page 0's count
+reads as 1, with it as 0, and 0 is what qpdf says.
+
+⚠ So it is a **producer convention this package follows rather than a rule it
+can cite.** Two independent producers agree — qpdf across twelve shapes and the
+Ghostscript fixture — which is the most this format offers.
+
+⛔⛔ **The entries are column-major**, which is the other thing a page-at-a-time
+reading gets wrong: F.4.1 says "the items making up each per-page entry are not
+contiguous; they are broken up with items from entries for other pages". Items
+4 and 5 sit between items 3 and 6, which no per-page loop would produce.
+
+⛔ **Item 3 is read for the first page too and must be zero there** (Table F.4
+item 3). The count is present for every page — skipping it for page one shifts
+every later count — and a non-zero first-page count makes groups (d) and (e)
+consume bits belonging to the pages after it, so every later value is wrong
+while the table still parses.
+
+⛔ **Reading, partitioning, the page offset header and its per-page entries is
+all it does — there is no linearizing writer yet.** The checker came first on purpose: a writer cannot
 be trusted without one. What remains for #40 is the per-page entries (Table
 F.4), the shared object hint table (F.4.2), the layout, and the two-pass
 fixpoint for `/L`, `/H`, `/E` and `/T`. `CheckLinearized` does not yet consult

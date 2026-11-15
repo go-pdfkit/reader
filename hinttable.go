@@ -254,9 +254,235 @@ func readPageOffsetHeader(r *bits) (*pageOffsetHeader, error) {
 	return h, nil
 }
 
+// sharedRef is one page's reference to a shared object: Table F.4's items 4
+// and 5, which come in step.
+type sharedRef struct {
+	Identifier uint32 // item 4: an index into the shared object hint table
+	Numerator  uint32 // item 5: where in the content stream it is first used
+}
+
+// pageEntry is one page's Table F.4 entry, with the header's minima already
+// added back.
+//
+// ⛔ THE DELTAS ARE NOT KEPT. Every item of Table F.4 is "a number that, when
+// added to" one of Table F.3's minima "shall give" the real value, so a delta
+// on its own means nothing and a caller holding one would have to remember
+// which minimum to add. The decoder does the addition once; what it returns is
+// the quantity the annex names.
+type pageEntry struct {
+	NObjects      uint32 // item 1 + Table F.3 item 1
+	Length        uint32 // item 2 + Table F.3 item 4
+	ContentOffset uint32 // item 6 + Table F.3 item 6
+	ContentLength uint32 // item 7 + Table F.3 item 8
+	Shared        []sharedRef
+}
+
+// readPageEntries reads Table F.4's per-page entries, which follow the header.
+//
+// ⛔⛔ THE ENTRIES ARE COLUMN-MAJOR AND THIS IS THE WHOLE DIFFICULTY. F.4.1 says
+// it outright — "The items making up each per-page entry are not contiguous;
+// they are broken up with items from entries for other pages" — and then gives
+// the order as (a) to (g): item 1 for ALL pages, then item 2 for all pages, and
+// so on. A decoder that read one page's seven items together would parse
+// without complaint and return numbers belonging to other pages.
+//
+// ⛔ So the reads below are in F.4.1's lettered order, with each letter named,
+// because that order IS the format and a reordering of these statements is a
+// silent defect. Items 4 and 5 sit between items 3 and 6, which no
+// page-at-a-time reading would produce.
+//
+// ⛔⛔⛔ AND EACH LETTERED GROUP IS PADDED TO A BYTE BOUNDARY, WHICH ISO 32000-1
+// DOES NOT SAY ANYWHERE. F.4.1 gives the order (a) to (g) and the widths, and
+// says nothing about alignment between groups; a search of the whole of
+// 32000-1 finds "byte boundary" only in the filter and image-sample clauses,
+// never in Annex F or G. A decoder written from the text alone — which is what
+// the first version of this function was — is wrong on every real file.
+//
+// ⚠ ISO 32000-2 WAS NOT SEARCHED, because no copy is on this machine. Its
+// Annex F may state the alignment outright, so "the specification does not say
+// so" above means 32000-1 specifically.
+//
+// ⭐ MEASURED, BY HAND, FROM THE BYTES. For the two-page qpdf fixture the bits
+// after the 36-byte header are:
+//
+//	byte 36: 10000000   item 1: page 0 delta 1, page 1 delta 0, SIX BITS PADDING
+//	byte 37: 11111000   item 2: page 0 delta 31 (5 bits), then
+//	byte 38: 00000000     page 1 delta 0, then padding
+//	byte 39: 01000000   item 3: page 0 count 0, page 1 count 1, padding
+//	byte 40: 10000000   item 4: page 1's identifier 2 (2 bits), padding
+//	byte 41: 11111000   item 7: page 0 delta 31, then
+//	byte 42: 00000000     page 1 delta 0, padding
+//
+// Item 3 landing on byte 39 is what proves it: read without the padding, page
+// 0's count comes out as 1, and qpdf reports 0. That mismatch is how this was
+// found — the refusal of a non-zero first-page count fired on five of twelve
+// files qpdf had produced, which is the shape of a decoder error rather than a
+// producer error.
+//
+// ⚠ So the alignment is a PRODUCER CONVENTION this package follows rather than
+// a rule it can cite, and it is written down here as such. qpdf agrees across
+// twelve shapes, which is the evidence. The Ghostscript fixture corroborates
+// only the items whose values it and qpdf agree on — its per-page LENGTHS are
+// among the five things qpdf warns about on that file — so it is not a second
+// independent witness to the layout in general, and saying otherwise would be
+// borrowing confidence from a file that is wrong nearby.
+func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, error) {
+	if pages <= 0 {
+		return nil, fmt.Errorf("%w: a hint table for %d pages", errHintTable, pages)
+	}
+
+	read := func(n int, what string, i int) (uint32, error) {
+		v, err := r.read(n)
+		if err != nil {
+			return 0, fmt.Errorf("%w (%s for page %d of %d)", err, what, i+1, pages)
+		}
+		return v, nil
+	}
+
+	out := make([]pageEntry, pages)
+
+	// (a) Item 1 for all pages: the object count, as a delta on Table F.3's
+	// least.
+	for i := range out {
+		d, err := read(h.NBitsDeltaNObjects, "item 1, the object count", i)
+		if err != nil {
+			return nil, err
+		}
+		out[i].NObjects = h.MinNObjects + d
+	}
+	r.align()
+
+	// (b) Item 2 for all pages: the page's length in bytes.
+	for i := range out {
+		d, err := read(h.NBitsDeltaPageLength, "item 2, the page length", i)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Length = h.MinPageLength + d
+	}
+	r.align()
+
+	// (c) Item 3 for all pages: how many shared objects the page references.
+	//
+	// ⛔ IT IS READ FOR THE FIRST PAGE TOO, AND MUST BE ZERO THERE. Table F.4
+	// item 3: "For the first page, this number shall be 0; the next two items
+	// start with the second page." So the count is present for every page —
+	// skipping it for page one would shift every later count — and the first
+	// page's value is a `shall` worth refusing, because a non-zero one would
+	// make the identifier reads below consume somebody else's bits.
+	counts := make([]uint32, pages)
+	for i := range out {
+		n, err := read(h.NBitsNSharedObjects, "item 3, the shared object count", i)
+		if err != nil {
+			return nil, err
+		}
+		counts[i] = n
+	}
+	if counts[0] != 0 {
+		return nil, fmt.Errorf("%w: the first page claims %d shared object(s), and Table F.4 "+
+			"item 3 requires 0 there — items 4 and 5 start at the second page",
+			errHintTable, counts[0])
+	}
+
+	// ⛔ AND THE COUNTS ARE BOUNDED BEFORE ANY OF THEM IS USED, BECAUSE
+	// nbits_nshared_objects CAN BE 32. A count can therefore be four billion,
+	// and each reference costs two reads below, so without this a twelve-byte
+	// table could ask for billions of iterations and be refused only after the
+	// loops had run.
+	//
+	// ⛔⛔ IT IS A GUARD AGAINST AN ABSURD COUNT AND NOT A PROOF THAT THE READS
+	// CANNOT FAIL, which is the correction this comment exists for. An earlier
+	// version claimed exactly that proof and used it to DISCARD the errors in
+	// groups (d) and (e) — and the proof was false, because r.align() sits
+	// between those groups, so real consumption is
+	// ceil(total*identBits/8)*8 + total*numeratorBits, up to seven bits more
+	// than this bound allows. Review ran the counterexample: widths of 1 for
+	// the count, the identifier and the numerator, two pages, bytes 40 80. The
+	// bound passes with two bits needed and eight remaining, (d) reads one bit
+	// and aligns to the next byte, and (e) has nothing left — and the discarded
+	// error made that decode SILENTLY, with a fabricated numerator.
+	//
+	// ⛔ So the reads below return their errors, and this bound only has to be
+	// cheap and conservative rather than exact. Nothing here rests on
+	// arithmetic I could get wrong a second time.
+	var total int64
+	for _, n := range counts {
+		total += int64(n)
+	}
+	// ⛔⛔ AND IT IS MEASURED BEFORE THE ALIGNMENT, DELIBERATELY, so that it
+	// over-estimates what remains by up to seven bits and is therefore NOT a
+	// proof about either group. An exact bound would make group (d)'s read
+	// error unreachable — a branch no input can take, which this package's
+	// exact coverage gate rightly refuses to carry. Conservative here, errors
+	// returned below: that combination has no unreachable line and no
+	// justification to be wrong about.
+	if want := total * int64(h.NBitsSharedIdent+h.NBitsSharedNumerator); want > r.left() {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s), which need "+
+			"%d bits, and %d remain", errHintTable, total, want, r.left())
+	}
+	r.align()
+
+	// (d) Item 4 for all shared objects in the second page, then the third,
+	// and so on.
+	//
+	// ⛔⛔ THESE READS RETURN THEIR ERRORS, and an earlier version discarded
+	// them on a proof that was WRONG. See the bound above: the alignment
+	// between this group and the next makes real consumption up to seven bits
+	// more than the bound allows, so a read here CAN fail — and discarding the
+	// error made a truncated table decode silently with a fabricated
+	// numerator. A justification is worth less than a returned error.
+	for i := 1; i < pages; i++ {
+		out[i].Shared = make([]sharedRef, counts[i])
+		for j := range out[i].Shared {
+			v, err := read(h.NBitsSharedIdent, "item 4, a shared object identifier", i)
+			if err != nil {
+				return nil, err
+			}
+			out[i].Shared[j].Identifier = v
+		}
+	}
+	r.align()
+
+	// (e) Item 5 for the same, in the same order — "which shall be in the same
+	// order as the preceding item".
+	for i := 1; i < pages; i++ {
+		for j := range out[i].Shared {
+			v, err := read(h.NBitsSharedNumerator, "item 5, a fractional position", i)
+			if err != nil {
+				return nil, err
+			}
+			out[i].Shared[j].Numerator = v
+		}
+	}
+	r.align()
+
+	// (f) Item 6 for all pages: where the content stream starts within the
+	// page.
+	for i := range out {
+		d, err := read(h.NBitsDeltaContentOff, "item 6, the content stream offset", i)
+		if err != nil {
+			return nil, err
+		}
+		out[i].ContentOffset = h.MinContentOffset + d
+	}
+	r.align()
+
+	// (g) Item 7 for all pages: the content stream's length.
+	for i := range out {
+		d, err := read(h.NBitsDeltaContentLen, "item 7, the content stream length", i)
+		if err != nil {
+			return nil, err
+		}
+		out[i].ContentLength = h.MinContentLength + d
+	}
+
+	return out, nil
+}
+
 // hintTables is what this package reads out of a primary hint stream.
 type hintTables struct {
 	pageOffset *pageOffsetHeader
+	pages      []pageEntry
 }
 
 // readHintTables decodes the hint stream at /H and returns what it holds.
@@ -301,5 +527,15 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &hintTables{pageOffset: h}, nil
+	// ⛔ THE PAGE COUNT COMES FROM /N AND NOT FROM THE TABLE, because the table
+	// does not carry one: Table F.4's entries are a sequence whose length only
+	// the parameter dictionary states. CheckLinearized has already compared /N
+	// against the document, so by the time this runs the count is one the file
+	// agrees with — and a table written for a different number of pages is
+	// exactly what that comparison protects this from.
+	entries, err := readPageEntries(r, h, lin.PageCount)
+	if err != nil {
+		return nil, err
+	}
+	return &hintTables{pageOffset: h, pages: entries}, nil
 }
