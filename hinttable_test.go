@@ -8,6 +8,7 @@ package reader
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1306,7 +1307,8 @@ func TestEveryWayTheHintStreamFailsToYieldATableIsNamed(t *testing.T) {
 // land mid-byte and a test aiming at group (e) would be aiming at arithmetic
 // rather than at a group.
 // ⛔⛔ #56's BOUND, AND MEASURING IT MOVED THE ANSWER. The issue reasoned "a
-// sharedRef is 8 bytes, so 1 bit in gives 8 bytes out, 64x". Run on a 2 MiB
+// sharedRef is 8 bytes, so 1 bit in gives 8 bytes out, 64x" — which is 2x HIGH
+// for that term (it measures 32x) and 5.5x LOW for the total. Run on a 2 MiB
 // stream whose widths are all 0 but for a one-bit count:
 //
 //	pages 8 388 608, no error either way
@@ -1379,6 +1381,123 @@ func TestOnePagesSharedReferencesCannotExceedTheDocumentsObjects(t *testing.T) {
 		t.Errorf("a document of %d objects was still refused by the object cap: %v",
 			manyObjects, err)
 	}
+}
+
+// ⛔⛔⛔ AND THE SAME THING ON REAL QPDF OUTPUT, which is what the suite could
+// not reach. Review's finding, independently of the synthetic case below:
+// buildPages gives its pages no /Resources at all, so every fixture in this
+// package has at most ONE shared reference per page and the largest sum
+// anywhere is 24 against an xref of 56. The sum bound was therefore
+// unreachable by construction — a wrong bound with a green suite.
+//
+// ⭐ Measured by review on documents whose pages share k fonts, linearized by
+// qpdf 12.4.2, against the sum bound as committed in 2a2a467:
+//
+//	10 pages, 4 fonts: len(xref)=30, sum(refs)=45   REFUSED
+//	20 pages, 5 fonts: len(xref)=51, sum(refs)=114  REFUSED
+//	25 pages, 8 fonts: len(xref)=64, sum(refs)=216  REFUSED
+//	40 pages, 6 fonts: len(xref)=92, sum(refs)=273  REFUSED
+//
+// The crossover is about three references per page, so a book sharing three
+// fonts is the normal case. All four decode correctly at the base commit: the
+// bound was a REGRESSION on valid input, which is the #52 class exactly.
+func TestRealSharedResourceDocumentsDecodeThroughTheBounds(t *testing.T) {
+	for _, c := range []struct{ pages, fonts int }{
+		{10, 4}, {20, 5}, {25, 8},
+	} {
+		t.Run(fmt.Sprintf("%d pages sharing %d fonts", c.pages, c.fonts), func(t *testing.T) {
+			_, linear := sharedResourceFixture(t, c.pages, c.fonts)
+
+			d, err := Open(linear)
+			if err != nil {
+				t.Fatalf("qpdf linearized it and Open says %v", err)
+			}
+			lin, err := Linearized(linear)
+			if err != nil {
+				t.Fatalf("qpdf linearized it and Linearized says %v", err)
+			}
+			tables, err := d.readHintTables(lin)
+			if err != nil {
+				t.Fatalf("a conforming %d-page document sharing %d fonts was refused: %v",
+					c.pages, c.fonts, err)
+			}
+
+			// ⛔ AND THE SHAPE IS ASSERTED, not just the absence of an error:
+			// without this the case would pass on a document whose pages
+			// share nothing, which is the fixture problem it exists to fix.
+			sum := 0
+			for _, p := range tables.pages {
+				sum += len(p.Shared)
+			}
+			if sum <= len(d.xref) {
+				t.Fatalf("this fixture does not exercise the bound: sum of references %d, "+
+					"objects %d — it must EXCEED the object count to witness anything",
+					sum, len(d.xref))
+			}
+			t.Logf("%d pages, %d fonts: objects %d, sum of references %d",
+				c.pages, c.fonts, len(d.xref), sum)
+		})
+	}
+}
+
+// sharedResourceFixture builds a document whose pages all point at ONE
+// /Resources dictionary holding several fonts, then has qpdf linearize it. The
+// shared dictionary is what F.3.9 calls a part 8 object, and referencing it
+// from every page is what makes the sum of per-page counts exceed the object
+// count.
+func sharedResourceFixture(t *testing.T, pages, fonts int) (plain, linear []byte) {
+	t.Helper()
+	qpdf := qpdfOrSkip(t)
+
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+
+	// One /Resources dictionary, shared by every page.
+	res := Dict{}
+	for i := 0; i < fonts; i++ {
+		res[Name(fmt.Sprintf("F%d", i))] = w.Add(Dict{
+			"Type": Name("Font"), "Subtype": Name("Type1"),
+			"BaseFont": Name("Helvetica"),
+		})
+	}
+	shared := w.Add(Dict{"Font": res})
+
+	kids := make(Array, 0, pages)
+	for i := 1; i <= pages; i++ {
+		content := w.Add(&Stream{Dict: Dict{}, Raw: []byte("0 g 72 700 100 20 re f")})
+		kids = append(kids, w.Add(Dict{
+			"Type": Name("Page"), "Parent": pagesRef,
+			"Contents": content, "Resources": shared,
+		}))
+	}
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": kids,
+		"Count":    Integer(pages),
+		"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.pdf")
+	out := filepath.Join(dir, "out.pdf")
+	if err := os.WriteFile(in, plain, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(qpdf, append([]string{"--linearize"}, append(qpdfExtra, in, out)...)...)
+	cmd.Stdin = nil
+	if b, err := cmd.CombinedOutput(); err != nil {
+		if _, statErr := os.Stat(out); statErr != nil {
+			t.Fatalf("qpdf --linearize: %v: %s", err, b)
+		}
+	}
+	linear, err = os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain, linear
 }
 
 // ⛔⛔⛔ THE COUNTEREXAMPLE THAT KILLED THE FIRST VERSION OF THAT BOUND, kept as

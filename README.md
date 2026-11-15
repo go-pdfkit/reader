@@ -607,13 +607,16 @@ out, 64×. Running it says otherwise:
 ```text
 2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
   the pageEntry slice alone   352.1 MiB   176x   <- /N, which #56 never names
-  with the shared references  416.1 MiB   208x   <- the 32x #56 describes
+  with the shared references  416.1 MiB   208x   <- +32x, the term #56 named
   and no error in either case
 after the bound                  3 064 B   0.0x, refused by name
 ```
 
 ⭐ **The dominant cost is the 40-byte `pageEntry` per page, driven by `/N`** —
-five and a half times the term the issue was filed about. The attribution came
+five and a half times the term the issue was filed about. And the term it *did*
+name measures 32×, not 64×: the issue was **2× high about the half it named
+while being 5.5× low about the total.** Both errors come from reasoning about
+the sizes instead of running it. The attribution came
 from a control that declared no references at all, so the two terms could be
 separated rather than guessed at. Estimating would have fixed the smaller half
 and left a 176× amplification in place.

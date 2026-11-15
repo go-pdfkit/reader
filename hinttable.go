@@ -333,12 +333,15 @@ type pageEntry struct {
 //
 //	2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
 //	  the pageEntry slice alone   352.1 MiB   176x   <- /N, unnamed in #56
-//	  the shared references too   416.1 MiB   208x   <- the 32x #56 describes
+//	  the shared references too   416.1 MiB   208x   <- +32x, the term #56 named
 //	  and no error either way
 //
 // MEASURED, not estimated, which is what the issue asked for — and measuring is
 // what found that the /N term is five and a half times the bigger one. #56
-// reasoned "8 bytes per sharedRef, so 64x"; the dominant cost is the 40-byte
+// reasoned "8 bytes per sharedRef, so 64x" — and that term measures 32x, so
+// the issue was 2x HIGH about the half it named while being 5.5x LOW about the
+// total. Both errors come from reasoning instead of running it.
+// The dominant cost is the 40-byte
 // pageEntry per PAGE, and /N is as untrusted here as /S was.
 //
 // ⛔ Both ceilings are the same fact: a page is an indirect object and F.4.2's
