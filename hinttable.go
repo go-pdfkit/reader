@@ -326,9 +326,36 @@ type pageEntry struct {
 // among the five things qpdf warns about on that file — so it is not a second
 // independent witness to the layout in general, and saying otherwise would be
 // borrowing confidence from a file that is wrong nearby.
-func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, error) {
+// ⛔⛔ maxObjects IS THE DOCUMENT'S OBJECT COUNT, AND IT IS A MEMORY BOUND, for
+// the same reason readSharedTable takes one (#55, #56). TWO terms here turn a
+// small stream into a large allocation, and the issue that asked for this fix
+// named only the second:
+//
+//	2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
+//	  the pageEntry slice alone   352.1 MiB   176x   <- /N, unnamed in #56
+//	  the shared references too   416.1 MiB   208x   <- the 32x #56 describes
+//	  and no error either way
+//
+// MEASURED, not estimated, which is what the issue asked for — and measuring is
+// what found that the /N term is five and a half times the bigger one. #56
+// reasoned "8 bytes per sharedRef, so 64x"; the dominant cost is the 40-byte
+// pageEntry per PAGE, and /N is as untrusted here as /S was.
+//
+// ⛔ Both ceilings are the same fact: a page is an indirect object and F.4.2's
+// identifiers index a table of objects, so neither the page count nor the
+// references of one page can exceed the objects the document has. The cap is
+// PASSED IN rather than derived here, so this function cannot disagree with the
+// document about what it holds.
+func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) ([]pageEntry, error) {
 	if pages <= 0 {
 		return nil, fmt.Errorf("%w: a hint table for %d pages", errHintTable, pages)
+	}
+	// ⛔ BEFORE make([]pageEntry, pages), which is the allocation itself. A
+	// bound applied after it is a comment.
+	if int64(pages) > maxObjects {
+		return nil, fmt.Errorf("%w: the hint table describes %d page(s) and the document has %d "+
+			"object(s), and every page is one — so it describes pages the file does not have",
+			errHintTable, pages, maxObjects)
 	}
 
 	read := func(n int, what string, i int) (uint32, error) {
@@ -423,6 +450,19 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, erro
 	// claiming four billion references of zero width would loop four billion
 	// times reading nothing. A reference is at most one per remaining bit
 	// before it is absurd, and that is all this cap claims.
+	// ⛔⛔ AND THE OBJECT COUNT IS THE BOUND THAT ACTUALLY HOLDS, because the two
+	// below are about BITS and a bit is not a byte. Measured above: with the
+	// identifier and numerator widths both 0 the bit-cost bound is vacuous, and
+	// the bits-remaining bound is satisfied by one reference per remaining bit —
+	// 8 388 607 references, 64 MiB, out of 2 MiB of input, with no error. The
+	// input is not lying: a 2 MiB stream really does hold 16.7 million one-bit
+	// fields. "Does it fit in the bits?" is the wrong question, which is the
+	// lesson #55 paid for on the groups side.
+	if total > maxObjects {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) in all and the "+
+			"document has %d object(s), so they reference more objects than there are",
+			errHintTable, total, maxObjects)
+	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
 			"bits remain, so most of them describe nothing",
@@ -773,7 +813,7 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	// against the document, so by the time this runs the count is one the file
 	// agrees with — and a table written for a different number of pages is
 	// exactly what that comparison protects this from.
-	entries, err := readPageEntries(r, h, lin.PageCount)
+	entries, err := readPageEntries(r, h, lin.PageCount, int64(len(d.xref)))
 	if err != nil {
 		return nil, err
 	}

@@ -597,6 +597,42 @@ ambiguous and the measurement does not — and the mutation confirms which test
 settles it: the two-sequence reading reddens the new fixture on both shapes and
 leaves the twelve older ones green.
 
+### ⛔⛔ Measuring #56 moved the answer: the term it named was the smaller one
+
+The page offset table's counts were bounded by the **bits** remaining, not by
+the document's objects, so a small stream became a large allocation. #56
+reasoned about it: a `sharedRef` is 8 bytes, so one bit in gives eight bytes
+out, 64×. Running it says otherwise:
+
+```text
+2 MiB stream, every width 0 but a one-bit count, 8 388 608 pages
+  the pageEntry slice alone   352.1 MiB   176x   <- /N, which #56 never names
+  with the shared references  416.1 MiB   208x   <- the 32x #56 describes
+  and no error in either case
+after the bound                  3 064 B   0.0x, refused by name
+```
+
+⭐ **The dominant cost is the 40-byte `pageEntry` per page, driven by `/N`** —
+five and a half times the term the issue was filed about. The attribution came
+from a control that declared no references at all, so the two terms could be
+separated rather than guessed at. Estimating would have fixed the smaller half
+and left a 176× amplification in place.
+
+`/N` is as untrusted here as `/S` was, and for the same reason: nothing on this
+path calls `checkHintStream`. Both ceilings are now the document's object count
+— a page is an indirect object, and F.4.2's identifiers index a table of
+objects, so neither a page count nor one page's references can exceed what the
+file holds.
+
+⛔⛔ **And the ceiling itself was untested, which a mutation found.** Both bounds
+take the cap as an argument, and both had tests passing it directly — so both
+were satisfied by a caller passing *any* number. Replacing `int64(len(d.xref))`
+with `1<<40` in `readHintTables` left the **entire suite green**, on the page
+side and the group side alike. A bound whose ceiling is untested is a bound
+against a number of its own choosing. Two cases now go through `readHintTables`
+so the document supplies the ceiling, and each reddens when its own call site is
+given a constant.
+
 ### ⭐⭐ The encoder's oracle: re-encode qpdf's own tables and compare bytes
 
 Every check above compares **numbers** against what `qpdf --json` prints, and a

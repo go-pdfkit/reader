@@ -762,6 +762,16 @@ func TestAHintStreamWhoseSlashSCannotLocateTheTableIsRefused(t *testing.T) {
 				n = 36
 			}
 			d := bareDoc(nil, nil, nil)
+			// ⛔ THE DOCUMENT NEEDS OBJECTS, or #56's page bound refuses
+			// every table before /S is ever looked at: maxObjects is
+			// len(d.xref), bareDoc leaves it empty, and a document of no
+			// objects cannot have a page. Without this the six cases below
+			// all "pass" against the wrong refusal — which is how I found
+			// that the bound masks them, since their messages changed
+			// together.
+			for num := 1; num <= 16; num++ {
+				d.xref[num] = xrefEntry{}
+			}
 			d.buf = []byte(head + "9 0 obj\n" + c.body + "\nstream\n" +
 				strings.Repeat("\x00", n) + "\nendstream\nendobj\n")
 			_, err := d.readHintTables(&Linearization{HintOffset: len(head), PageCount: 1})
@@ -1295,6 +1305,145 @@ func TestEveryWayTheHintStreamFailsToYieldATableIsNamed(t *testing.T) {
 // ⛔ The widths are all equal ON PURPOSE. With real widths the group boundaries
 // land mid-byte and a test aiming at group (e) would be aiming at arithmetic
 // rather than at a group.
+// ⛔⛔ #56's BOUND, AND MEASURING IT MOVED THE ANSWER. The issue reasoned "a
+// sharedRef is 8 bytes, so 1 bit in gives 8 bytes out, 64x". Run on a 2 MiB
+// stream whose widths are all 0 but for a one-bit count:
+//
+//	pages 8 388 608, no error either way
+//	  the pageEntry slice alone   352.1 MiB   176x   <- /N, which #56 never names
+//	  with the shared references  416.1 MiB   208x
+//	  after this bound                3 064 B   0.0x, refused by name
+//
+// So the term the issue described is the SMALLER of two, and the dominant one
+// is the 40-byte pageEntry per page driven by /N — untrusted here for exactly
+// the reason /S was, since nothing on this path calls checkHintStream.
+//
+// ⚠ NO GOMEMLIMIT HARNESS, deliberately, and the reason belongs here rather
+// than in anyone's head: when the bound holds these cases allocate three
+// kilobytes, so there is no bomb to contain. If one regressed it would allocate
+// 416 MiB — survivable, and it shows up as a failing assertion rather than as
+// an OOM that tells nobody which case did it. The fleet rule exists to stop a
+// test being run against the host's whole memory; nothing here approaches that.
+func TestAPageCountAboveTheDocumentsObjectCountIsRefused(t *testing.T) {
+	// Twelve bytes is enough for two pages at the eight-bit widths, so the
+	// table itself is well formed; only the page count is absurd.
+	b := make([]byte, 12)
+
+	// ⛔ A page is an indirect object, so three objects cannot be 200 pages.
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 200, 3)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("200 pages in a 3-object document were accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the document has 3 object(s)") {
+		t.Errorf("it was refused, but not against the document's object count: %v", err)
+	}
+
+	// ⛔ THE CONTROL: the same 200 pages in a document big enough to hold them
+	// passes this cap, so the refusal is about the ratio and not about the
+	// table. It then fails for want of bits, which is the other bound working.
+	_, err = readPageEntries(&bits{b: b}, entriesHeader(), 200, manyObjects)
+	if err != nil && strings.Contains(err.Error(), "the document has") {
+		t.Errorf("a document of %d objects was still refused by the object cap: %v",
+			manyObjects, err)
+	}
+}
+
+// ⛔⛔ AND THE REFERENCE COUNTS, which is the half #56 does name. This needs a
+// page count the cap above ACCEPTS, or that one fires first and this bound is
+// never reached — the two refusals would then be indistinguishable and one of
+// them untested.
+func TestSharedReferencesBeyondTheDocumentsObjectCountAreRefused(t *testing.T) {
+	// Two pages at eight-bit widths. Page one's count must be 0; page two's is
+	// the second byte of group (c), which sits after groups (a) and (b).
+	//
+	//	byte 0,1 = group (a), item 1 for two pages
+	//	byte 2,3 = group (b), item 2
+	//	byte 4,5 = group (c), item 3: page one 0, page two 200
+	b := make([]byte, 64)
+	b[5] = 200
+
+	// ⛔ Ten objects, two pages: the page cap passes, so what refuses is the
+	// reference count.
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, 10)
+	if !errors.Is(err, errHintTable) {
+		t.Fatalf("200 references in a 10-object document were accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reference more objects than there are") {
+		t.Errorf("it was refused, but not against the document's object count: %v", err)
+	}
+
+	// ⛔ THE CONTROL, same shape as the page one's: generous object count, so
+	// this cap lets it through and only the bit bounds can still object.
+	_, err = readPageEntries(&bits{b: b}, entriesHeader(), 2, manyObjects)
+	if err != nil && strings.Contains(err.Error(), "than there are") {
+		t.Errorf("a document of %d objects was still refused by the object cap: %v",
+			manyObjects, err)
+	}
+}
+
+// ⛔⛔ AND THE CEILING MUST BE THE DOCUMENT'S OWN COUNT, WHICH NOTHING CHECKED.
+// Both bounds above take maxObjects as an argument, and both have tests that
+// pass it directly — so both were satisfied by a caller passing ANY number.
+// Measured: replacing `int64(len(d.xref))` with `1<<40` in readHintTables left
+// the ENTIRE suite green, on the page side and the group side alike.
+//
+// ⛔ A bound whose ceiling is untested is a bound against a number of its own
+// choosing. These two cases go through readHintTables, so the document is what
+// supplies the ceiling, and a guessed constant reddens them.
+func TestTheCeilingComesFromTheDocumentAndNotFromTheCaller(t *testing.T) {
+	const head = "%PDF-1.7\n"
+
+	// A stream of zeroes: Table F.3's header is 36 bytes of zero, so every
+	// width is 0 and the per-page entries consume no bits at all. Table F.5's
+	// header follows at /S = 36, and sharedTableBytes writes it from the
+	// annex's item sizes.
+	doc := func(objects int, body string, stream []byte) *Document {
+		d := bareDoc(nil, nil, nil)
+		for num := 1; num <= objects; num++ {
+			d.xref[num] = xrefEntry{}
+		}
+		d.buf = []byte(head + "9 0 obj\n" + body + "\nstream\n" +
+			string(stream) + "\nendstream\nendobj\n")
+		return d
+	}
+
+	t.Run("the page count is measured against the document's objects", func(t *testing.T) {
+		stream := make([]byte, 36)
+		d := doc(5, "<< /S 36 /Length 36 >>", stream)
+
+		// /N says a hundred pages; the document has five objects.
+		_, err := d.readHintTables(&Linearization{HintOffset: len(head), PageCount: 100})
+		if !errors.Is(err, errHintTable) {
+			t.Fatalf("100 pages in a 5-object document were accepted: %v", err)
+		}
+		if !strings.Contains(err.Error(), "the document has 5 object(s)") {
+			t.Errorf("refused, but not against the document's own object count: %v", err)
+		}
+	})
+
+	t.Run("the group count is measured against the document's objects", func(t *testing.T) {
+		// One page passes the page ceiling, so what is left to refuse is the
+		// shared object table's group count: 200 groups, five objects.
+		shared := sharedTableBytes(0, 0, 200, 200, 0, 0, 0, make([]byte, 40)...)
+		stream := append(make([]byte, 36), shared...)
+		d := doc(5, "<< /S 36 /Length "+strconv.Itoa(len(stream))+" >>", stream)
+
+		_, err := d.readHintTables(&Linearization{HintOffset: len(head), PageCount: 1})
+		if !errors.Is(err, errHintTable) {
+			t.Fatalf("200 groups in a 5-object document were accepted: %v", err)
+		}
+		if !strings.Contains(err.Error(), "the document has 5 object(s)") {
+			t.Errorf("refused, but not against the document's own object count: %v", err)
+		}
+	})
+}
+
+// manyObjects is a page/reference ceiling generous enough to be out of the way,
+// for the tests that are about something other than the ceiling itself. The
+// ceiling has its own tests, which state their numbers inline so that passing
+// this constant can never be what makes them pass.
+const manyObjects = 1 << 20
+
 func entriesHeader() *pageOffsetHeader {
 	return &pageOffsetHeader{
 		NBitsDeltaNObjects:   8,
@@ -1328,7 +1477,7 @@ func TestATruncationInEveryPerPageGroupNamesItsItem(t *testing.T) {
 		0, 0, // (g) content length deltas
 	}
 	// The control: the whole thing reads.
-	if _, err := readPageEntries(&bits{b: full}, entriesHeader(), 2); err != nil {
+	if _, err := readPageEntries(&bits{b: full}, entriesHeader(), 2, manyObjects); err != nil {
 		t.Fatalf("the untruncated table does not read, so no case below is about its cut: %v", err)
 	}
 
@@ -1345,7 +1494,7 @@ func TestATruncationInEveryPerPageGroupNamesItsItem(t *testing.T) {
 		{"group (g), the content length", 11, "item 7, the content stream length"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := readPageEntries(&bits{b: full[:c.keep]}, entriesHeader(), 2)
+			_, err := readPageEntries(&bits{b: full[:c.keep]}, entriesHeader(), 2, manyObjects)
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("a table cut to %d byte(s) was accepted: %v", c.keep, err)
 			}
@@ -1363,7 +1512,7 @@ func TestATruncationInEveryPerPageGroupNamesItsItem(t *testing.T) {
 // so every later value would be wrong while the table still parsed.
 func TestANonZeroSharedCountOnTheFirstPageIsRefused(t *testing.T) {
 	b := []byte{0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0}
-	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, manyObjects)
 	if !errors.Is(err, errHintTable) {
 		t.Fatalf("a first page claiming shared objects was accepted: %v", err)
 	}
@@ -1395,7 +1544,7 @@ func TestSharedReferencesThatCannotFitAreRefusedBeforeBeingRead(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			b := []byte{0, 0, 0, 0, 0, c.count, 0, 0, 0, 0, 0, 0}
-			_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2)
+			_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, manyObjects)
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("%d references in a 12-byte table were accepted: %v", c.count, err)
 			}
@@ -1437,7 +1586,7 @@ func TestTheTruncationThatOnceDecodedSilently(t *testing.T) {
 		NBitsDeltaContentLen: 0,
 	}
 	// 0x40 = 0100_0000: the two count bits are 0 (first page) and 1 (second).
-	_, err := readPageEntries(&bits{b: []byte{0x40, 0x80}}, h, 2)
+	_, err := readPageEntries(&bits{b: []byte{0x40, 0x80}}, h, 2, manyObjects)
 	if err == nil {
 		t.Fatal("it decoded, which is the defect: group (e) has no bits and the numerator " +
 			"would be invented")
@@ -1470,7 +1619,7 @@ func TestAnIdentifierThatTheAlignmentLeavesNoRoomForIsRefused(t *testing.T) {
 		NBitsSharedIdent:    9,
 	}
 	// 0x04 = 000_001_00: page one's count is 0, page two's is 1, then slack.
-	_, err := readPageEntries(&bits{b: []byte{0x04, 0x00}}, h, 2)
+	_, err := readPageEntries(&bits{b: []byte{0x04, 0x00}}, h, 2, manyObjects)
 	if !errors.Is(err, errHintTable) {
 		t.Fatalf("an identifier with no room was accepted: %v", err)
 	}
@@ -1485,7 +1634,7 @@ func TestAnIdentifierThatTheAlignmentLeavesNoRoomForIsRefused(t *testing.T) {
 // table that holds nothing.
 func TestAHintTableForNoPagesIsRefused(t *testing.T) {
 	for _, pages := range []int{0, -1} {
-		_, err := readPageEntries(&bits{b: make([]byte, 12)}, entriesHeader(), pages)
+		_, err := readPageEntries(&bits{b: make([]byte, 12)}, entriesHeader(), pages, manyObjects)
 		if !errors.Is(err, errHintTable) {
 			t.Fatalf("a table for %d pages was accepted: %v", pages, err)
 		}
