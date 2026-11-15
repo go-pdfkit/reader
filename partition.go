@@ -8,6 +8,7 @@ package reader
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // Part names a section of the eleven-part layout ISO 32000-1 Annex F.3.1
@@ -70,6 +71,21 @@ type Partition struct {
 	// FirstPageObject is the object number of that page's page object, which
 	// becomes /O in the linearization parameter dictionary.
 	FirstPageObject int
+
+	// Pages[i] is every object page i+1 needs, including its own page object,
+	// in ascending object number.
+	//
+	// ⛔⛔ THE HINT TABLES CANNOT BE BUILT WITHOUT THIS, and this function was
+	// computing it and throwing it away. Table F.4 item 1 is "the number of
+	// objects in a page" and item 2 is that page's length in bytes: both are
+	// PER PAGE, and Of answers only which PART an object is in. Part 7 says
+	// "belongs to exactly one page that is not the first" and never says which
+	// page, so a writer holding only Of knows the order to emit objects in and
+	// not what to say about them.
+	//
+	// ⛔ A page's own object is included, because item 1 counts it: qpdf
+	// reports 4 objects for a page whose reach is 3.
+	Pages [][]int
 }
 
 // ErrCannotPartition reports a document this package declines to place.
@@ -168,6 +184,11 @@ func (d *Document) Partition() (*Partition, error) {
 		of[num] = PartFirstPage
 	}
 
+	// ⛔ The per-page reach sets are KEPT now, in page order. They are filtered
+	// into Partition.Pages at the end, once `of` is final: see the note there.
+	reaches := make([]map[int]bool, len(pages))
+	reaches[0] = firstReach
+
 	// ⛔ Parts 7 and 8 are decided by HOW MANY PAGES reach an object, which is
 	// why the other pages' reach sets are counted rather than merged. F.3.9
 	// defines part 8 as "referenced from more than one page but ... not
@@ -175,11 +196,12 @@ func (d *Document) Partition() (*Partition, error) {
 	// the first page reaches stays in part 6 however many other pages want
 	// it.
 	readers := map[int]int{}
-	for _, ref := range pages[1:] {
+	for i, ref := range pages[1:] {
 		reach, err := d.reachFromPage(ref, boundary)
 		if err != nil {
 			return nil, err
 		}
+		reaches[i+1] = reach
 		// The page's own object is private to it by definition.
 		if _, placed := of[ref.Num]; !placed || of[ref.Num] == PartOther {
 			of[ref.Num] = PartOtherPrivate
@@ -221,7 +243,63 @@ func (d *Document) Partition() (*Partition, error) {
 		}
 	}
 
-	return &Partition{Of: of, FirstPage: 1, FirstPageObject: first.Num}, nil
+	// ⛔⛔ THE PER-PAGE SETS HOLD WHAT IS PRIVATE TO THE PAGE, NOT ITS REACH,
+	// and qpdf said so on the first run. The first version kept the whole reach
+	// and disagreed with Table F.4 item 1 on every page but the first:
+	//
+	//	5 pages, page 2: ours [1 2 15] = 3 objects, qpdf says 2
+	//	25 pages, page 2: ours [1 2 55] = 3 objects, qpdf says 2
+	//
+	// ⛔⛔⛔ AND THE REASON FIRST WRITTEN HERE WAS INVENTED. It said the extra
+	// number "is a SHARED object, which F.3.9 puts in part 8". Measured: in the
+	// five-page fixture object 15 is in PART 6 and part 8 holds ZERO objects;
+	// in the twenty-five-page one object 55 is likewise part 6, part 8 again
+	// empty. Part 8 cannot be why qpdf excluded it.
+	//
+	// What it actually is: a part-6 object THE FIRST PAGE ALSO REACHES, which
+	// qpdf hands to page 2 as a first-page shared entry — nshared 1,
+	// identifier [2]. So item 1 counts the objects private to the page, and an
+	// object already placed in part 6 arrives through items 3, 4 and 5 instead.
+	// Counting it in both places would make every page claim an object the
+	// layout puts at the front.
+	//
+	// ⛔ The filter below is unchanged and still right, because object 15 is
+	// part 6 and pages after the first want part 7. Only the explanation was
+	// wrong — which is the harder failure to catch: the rule passed every test
+	// while the comment taught the next reader something false.
+	//
+	// ⛔ SO THE FILTER IS `of`, AND IT HAS TO RUN HERE rather than in the loop
+	// above: part 4 and the part 9 sweep are decided after it, so an object's
+	// part is not final until this point. Filtering early would have kept the
+	// catalogue in page one's set.
+	perPage := make([][]int, len(pages))
+	for i, reach := range reaches {
+		want := PartOtherPrivate
+		if i == 0 {
+			want = PartFirstPage
+		}
+		// The page's own object first: Table F.4 item 1 counts it, and
+		// reachFromPage never returns it because the page objects are the
+		// walk's boundary.
+		set := []int{pages[i].Num}
+		for num := range reach {
+			if num != pages[i].Num && of[num] == want {
+				set = append(set, num)
+			}
+		}
+		// ⛔ SORTED, so two runs over one document give the same slice: a reach
+		// is a map, and a writer emitting in map order would produce different
+		// bytes every time from the same input.
+		sort.Ints(set)
+		perPage[i] = set
+	}
+
+	return &Partition{
+		Of:              of,
+		FirstPage:       1,
+		FirstPageObject: first.Num,
+		Pages:           perPage,
+	}, nil
 }
 
 // refuseUnplaceable declines the constructs whose part this function would
