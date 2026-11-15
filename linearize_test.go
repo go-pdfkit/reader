@@ -263,6 +263,49 @@ func TestOrderPutsPartFourBeforePartSixContiguously(t *testing.T) {
 						i, old, got, want)
 				}
 			}
+
+			// ⛔⛔ AND THE BOUNDARY IN THE EMITTED FILE, because everything
+			// above re-derives the counts in this test's own body and so
+			// exercises Order, NOT linearizeFrom's slicing. Review measured
+			// the hole: with catalogueCount forced to 0, /H moves from 579 to
+			// 532, ahead of the catalogue at 647, and CheckLinearized returns
+			// nil on all three shapes — qpdf accepts it too. Removing the weak
+			// /Root-before-/H check left NO witness at all, which is worse than
+			// the weak one it replaced.
+			//
+			// ⭐ This asserts the boundary rather than a consequence of it:
+			// renumbering follows order position, so the front section is
+			// objects 1..firstPageCount, and part 4 is exactly 1..catalogueCount.
+			// A count wrong in EITHER direction moves an object across /H.
+			out, err := d.Linearize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lin, err := Linearized(out)
+			if err != nil {
+				t.Fatalf("this package cannot read the file it just wrote: %v", err)
+			}
+			written, err := Open(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for n := 1; n <= firstPageCount; n++ {
+				entry, ok := written.xref[n]
+				if !ok {
+					t.Fatalf("object %d is in the front section and our own xref has no "+
+						"entry for it", n)
+				}
+				below := entry.offset < int64(lin.HintOffset)
+				if wantBelow := n <= catalogueCount; below != wantBelow {
+					side, want := "after", "before"
+					if below {
+						side, want = "before", "after"
+					}
+					t.Errorf("object %d is in %v at offset %d, which is %s the hint stream "+
+						"at %d — it must come %s it",
+						n, p.Of[order[n-1]], entry.offset, side, lin.HintOffset, want)
+				}
+			}
 		})
 	}
 }
@@ -500,7 +543,24 @@ func TestDocumentIDLeavesWhatItCannotRead(t *testing.T) {
 // 14.4, so this test fixes the case that broke and the span is computed rather
 // than guessed.
 func TestALongIDIsNotRefused(t *testing.T) {
-	for _, n := range []int{16, 32, 64, 256} {
+	// ⛔⛔ 76 IS THE BOUNDARY AND IT IS WHY THIS LIST IS NOT ROUND NUMBERS. With
+	// the span fix reverted, 64 and 74 pass and 76 is the first refusal — "needs
+	// 194 bytes and 192 are reserved" — so a list of 16/32/64 pins nothing and
+	// 256 alone pins it far from where it breaks.
+	//
+	// ⛔ 76 AND NOT 74, WHICH IS REVIEW'S NUMBER FOR REVIEW'S FIXTURE. Measuring
+	// it here moved it: their table (135 at 16 bytes, 183 at 64, 193 at 74, 375
+	// at 256) was taken on a document whose object numbering differs from this
+	// one's, which reads 372 at 256 rather than 375. A boundary is a property of
+	// the fixture, not of the format, so taking theirs on faith would have put a
+	// passing case where the breaking one belongs.
+	//
+	// ⚠ And the length is NOT monotonic in n: 76 needs 194, 77 needs 193, 78
+	// needs 194. /ID[1] is a hash of the input, so its escaped literal and the
+	// object offsets after it move by a byte or two with n. That is harmless
+	// here — every value is pass-invariant — but it is why this reads as a
+	// measured list and not a formula.
+	for _, n := range []int{16, 32, 64, 74, 76, 256} {
 		t.Run(fmt.Sprintf("%d-byte /ID", n), func(t *testing.T) {
 			w := NewWriter("1.7")
 			pagesRef := w.Reserve()
@@ -542,12 +602,16 @@ func TestALongIDIsNotRefused(t *testing.T) {
 			// 64. A fixture that never carried the long /ID would look exactly
 			// like that, so it had to be ruled out rather than reasoned about.
 			//
-			// ⭐ It is carried, and the two numbers reconcile: review measured
-			// 212 bytes while /ID[1] was still a COPY of the 64-byte string,
-			// and documentID now replaces it with a 16-byte hash, so the same
-			// input needs 180 and fits the old 192. At 256 bytes it needs 372
-			// (312 of them /Info and /ID) and the reverted span refuses it.
-			// Both measurements were right; the operation changed between them.
+			// ⭐ It is carried, and the numbers reconcile: the 212 was measured
+			// while /ID[1] was still a COPY of the 64-byte string, and
+			// documentID now replaces it with a 16-byte hash, so the same input
+			// fits the old 192 and the first refusal moves out to 76 bytes.
+			//
+			// ⛔ TWO OF MY OWN FIGURES WERE WRONG ON THE WAY HERE, both from
+			// arithmetic instead of measurement: 180 for the 64-byte trailer
+			// (computed with /Prev 0, while the file carries a three-digit
+			// /Prev) and 74 for the boundary (review's number, for review's
+			// fixture). The list above is measured.
 			arr, ok := got.trailer["ID"].(Array)
 			if !ok || len(arr) != 2 {
 				t.Fatalf("the output's /ID is %v, so this test did not exercise a long /ID",

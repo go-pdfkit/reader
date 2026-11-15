@@ -27,18 +27,25 @@ var ErrCannotLinearize = errors.New("reader: this document cannot be linearized"
 // on the offsets it encodes is the hint stream.
 const xrefEntryBytes = 20
 
-// frontTrailerSpan is the bytes reserved for part 3's trailer, which sits
-// BEFORE every object and so must not change width between the two passes.
+// frontTrailerSpan is the BASE of the space reserved for part 3's trailer, which
+// sits BEFORE every object and so must not change width between the two passes.
+// ⛔ It is not the reserved amount: the emission reserves this plus len(extra),
+// and calling it "the bytes reserved" is what the first version's doc did while
+// the arithmetic had already moved on.
 //
-// ⛔ IT COVERS THE THREE VARIABLE-WIDTH NUMBERS ONLY: /Size, /Prev and the
+// ⛔ THE BASE COVERS THE THREE VARIABLE-WIDTH NUMBERS ONLY: /Size, /Prev and the
 // catalogue's object number. Three int64 at 19 digits is 57, the fixed text is
 // under 70, and 192 clears both with room.
 //
 // ⛔⛔ /Info AND /ID ARE NOT IN THAT DERIVATION, AND MUST NOT BE: an /ID string
-// has no bound, so no constant can cover it. The emission adds len(extra) to
-// this base — the first version did not, and refused a conforming file whose
-// /ID held 64-byte strings. ⛔ A var, like paramSpan, so that the refusal is
-// reachable from a test rather than being an untested claim.
+// has no bound, so no constant can cover it. The first version did not add
+// len(extra) and refused a conforming file: measured on this package's own
+// fixture, 192 accepts a 74-byte /ID[0] and refuses a 76-byte one, and a
+// 256-byte one needs 372. ⛔ The exact boundary belongs to the FIXTURE and not
+// to the format — review measured 74 on a differently numbered document — which
+// is the reason the span is computed rather than tuned.
+// ⛔ A var, like paramSpan, so that the refusal is reachable from a test
+// rather than being an untested claim.
 var frontTrailerSpan = 192
 
 // documentID returns the /ID for the linearized copy: the first string kept and
@@ -71,6 +78,15 @@ var frontTrailerSpan = 192
 // which is what TestTheEmissionIsStableAcrossPasses asserts. A random /ID[1]
 // would redden it, and a reader cannot tell a derived identifier from a random
 // one.
+//
+// ⚠ AND IT IS DERIVED FROM THE INPUT, NOT FROM THE FILE IT LABELS — stated here
+// because a reader would otherwise assume it identifies the output's bytes.
+// sha256 of the output is impossible without breaking the fixpoint: the /ID sits
+// in a trailer that precedes every object, so hashing what follows it would
+// change what precedes it. The consequence is real and accepted: two outputs
+// that differ while sharing an input — a later change to this writer, a
+// different paramSpan — carry the same revision identifier. Input-derived is the
+// only deterministic choice available, not the ideal one.
 func (d *Document) documentID(v Object) Object {
 	a, ok := v.(Array)
 	// ⛔ ANYTHING THAT IS NOT THE SHAPE 14.4 DESCRIBES PASSES THROUGH UNTOUCHED.
@@ -327,6 +343,14 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// /Info's new object number comes from `num`, which is final before the
 	// first pass. Only /Size, /Prev and the catalogue's number can change width
 	// between passes, and the base is what covers them.
+	//
+	// ⭐ AND THE WRITER BOUNDS IT ANYWAY, which is the stronger guarantee and
+	// the one to rely on: AppendObject switches a string to hex whenever the
+	// literal form would exceed 2n+2, so a 16-byte /ID[1] costs AT MOST 34
+	// bytes however binary the hash is. Measured over 2000 distinct hashes, and
+	// on the adversarial cases (sixteen 0x80 bytes, sixteen bytes of `()\`):
+	// 34 every time. There is no escape blow-up to budget for, so the earlier
+	// argument from pass-invariance alone was weaker than it needed to be.
 	span := frontTrailerSpan + len(extra)
 	trailer := fmt.Sprintf("trailer\n<< /Size %d /Prev %d /Root %d 0 R%s >>\nstartxref\n0\n%%%%EOF\n",
 		paramNum+2, prev.mainXrefAt, catalogue, extra)
