@@ -99,6 +99,25 @@ var (
 	// that is an indirect reference where "all values in this dictionary
 	// shall be direct objects".
 	ErrLinearizationMalformed = errors.New("reader: the linearization parameter dictionary is malformed")
+
+	// ErrHintTablesInvalid says the parameter dictionary agrees with the file
+	// and the hint tables /H names do not read as Annex F's F.4 describes
+	// them.
+	//
+	// ⛔⛔ IT IS A SEPARATE ERROR BECAUSE THE HINT TABLES ARE AN OPTIMISATION
+	// AND THE PARAMETERS ARE NOT. F.3.6: the tables let a reader fetch and
+	// display page one before the rest arrives. A file whose tables are wrong
+	// is still a correct PDF that any reader can open by the ordinary route —
+	// what it has lost is the fast path. A caller that cannot tell this from
+	// ErrLinearizationStale must either reject readable files or accept
+	// parameters that lie, and neither is what Table F.1 asks for.
+	//
+	// ⭐ testdata/linearized-gs.pdf is exactly this case and is committed for
+	// it: Ghostscript 10.08.0 writes sound parameters and hint tables that
+	// qpdf reports five problems in. Before this error existed the fixture had
+	// to be described in prose as "a positive for the parameters and a
+	// negative for the tables"; now the distinction is in the type.
+	ErrHintTablesInvalid = errors.New("reader: the hint tables do not describe this file")
 )
 
 // linearizationWindow is the first 1024 bytes, which F.3.3 says the parameter
@@ -208,17 +227,31 @@ func Linearized(b []byte) (*Linearization, error) {
 //
 // This is the other question, for the other caller: not "may a reader trust
 // the front of this file" but "is this file actually what the front says".
-// It opens the document, so it costs what opening costs, and it is the
-// judgement a writer needs on bytes it has just produced.
+// It opens the document AND decodes the primary hint stream, so it costs what
+// opening costs plus one stream expansion — bounded by maxDecodedSize — and the
+// page entries it allocates. It is the judgement a writer needs on bytes it has
+// just produced, not something to call on untrusted input to decide cheaply
+// whether to proceed; [Linearized] is that.
 //
-// ⛔ It still does NOT validate the hint tables (F.4), which is a larger job
-// again. What it establishes is that every parameter POINTS AT WHAT IT CLAIMS
-// TO: the page count is the real one, /O is the real first page, /H begins at
-// a real stream object of the length it declares, /T reaches the main
-// cross-reference. A file can pass this and still send a reader to the wrong
-// offset inside a hint table — so the error says which claim failed, and a
-// caller that needs more must read F.4. qpdf's `--check` remains the foreign
-// judge the tests print by.
+// What it establishes is that every parameter POINTS AT WHAT IT CLAIMS TO: the
+// page count is the real one, /O is the real first page, /H begins at a real
+// stream object of the length it declares, /T reaches the main cross-reference.
+//
+// ⛔ AND THAT THE HINT TABLES READ AS F.4 DESCRIBES THEM, which is new and is
+// narrower than it sounds. Both tables must decode: every bit width in 0..32,
+// every entry inside the stream, the page offset table ending at or before /S,
+// and the counts bounded by the document's objects. Failure is
+// [ErrHintTablesInvalid].
+//
+// ⛔⛔ IT DOES NOT CHECK THE TABLES' VALUES, and the difference decides what a
+// pass here is worth. A table can decode perfectly and still give a page length
+// that is not the page's length — nothing in F.4's LAYOUT is violated, so this
+// cannot see it. On testdata/linearized-gs.pdf, `qpdf --check` reports five
+// such mismatches (three group lengths of 65536, two page lengths); this
+// package refuses that file for a SIXTH defect, its /S overrun, and detects
+// none of the five. Comparing values against the document needs the partition.
+// So: a pass means the tables are READABLE, not that they are RIGHT, and qpdf's
+// `--check` remains the foreign judge the tests print by.
 //
 // ⛔⛔ AND /E IS NOT GATED, SAID OUT LOUD BECAUSE A WRITER WILL BE TEMPTED TO
 // TRUST IT. Table F.1 calls /E the offset of the end of the first page, and
@@ -230,9 +263,12 @@ func Linearized(b []byte) (*Linearization, error) {
 // rather than being approximated now. Until then: do not read a pass from
 // this as evidence about /E.
 //
-// The error wraps the same sentinels [Linearized] uses: a dictionary that
-// disagrees with the document around it is [ErrLinearizationStale], which is
-// what Table F.1 says such a file is — ordinary PDF.
+// The error wraps [Linearized]'s sentinels and one of its own. A dictionary
+// that disagrees with the document around it is [ErrLinearizationStale], which
+// is what Table F.1 says such a file is — ordinary PDF. Tables that do not
+// read are [ErrHintTablesInvalid], which [Linearized] never returns: the
+// parameters are sound and only the optimisation is lost, so a caller may
+// reasonably open the file anyway.
 func CheckLinearized(b []byte) (*Linearization, error) {
 	lin, err := Linearized(b)
 	if err != nil {
@@ -257,6 +293,32 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	}
 	if err := checkFirstPageEnd(b, lin); err != nil {
 		return nil, err
+	}
+	// ⛔⛔ AND THE HINT TABLES THEMSELVES, WHICH NOTHING HERE READ UNTIL NOW.
+	// #40 named this gap in writing — "a file can pass this and still have hint
+	// tables that send a reader to the wrong offset" — and
+	// testdata/linearized-gs.pdf was committed as the file that does exactly
+	// that: sound parameters, and hint tables qpdf reports five problems in.
+	//
+	// ⛔ IT COMES LAST, DELIBERATELY. Every check above is about the parameter
+	// dictionary and the file's own landmarks, and each returns a message about
+	// the thing it tested. Decoding the tables needs /H and /S to have been
+	// established first, and running it earlier would answer a question about
+	// /S with a complaint about Table F.4.
+	//
+	// ⚠ WHAT THIS DOES AND DOES NOT CHECK. It requires the tables to DECODE as
+	// F.4 describes them — every width in 0..32, the entries inside the stream,
+	// the page offset table ending at or before /S, the counts bounded by the
+	// document. It does NOT yet compare their VALUES against the document: the
+	// page lengths and group lengths qpdf also reports on are the next step,
+	// and they need the partition. So this closes "the tables are unreadable"
+	// and not "the tables are wrong", and saying otherwise would overstate it.
+	if _, err := d.readHintTables(lin); err != nil {
+		// ⛔ %w TWICE, so the inner error stays matchable. errHintTable is
+		// unexported today and hinttable.go plans to export it, at which point
+		// %v would have silently flattened the one sentinel a caller would
+		// then want to test for. It costs nothing to wrap both now.
+		return nil, fmt.Errorf("%w: %w", ErrHintTablesInvalid, err)
 	}
 	return lin, nil
 }

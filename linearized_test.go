@@ -654,9 +654,21 @@ func TestTheHintStreamIsNotTheEndOfTheFirstPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lin, err := CheckLinearized(b)
+	// ⛔⛔ checkFirstPageEnd AND NOT CheckLinearized, since the hint tables
+	// became part of the latter. This fixture's TABLES are wrong — that is the
+	// other half of why it is committed — so CheckLinearized now refuses it,
+	// and asserting end-to-end acceptance here would be asserting the wrong
+	// thing: the subject is /E, which the parameter checks settle.
+	//
+	// ⛔ Calling the one check this test is named for is also strictly more
+	// precise than calling the pipeline. It was only ever the pipeline because
+	// nothing in the pipeline disagreed with this file.
+	lin, err := Linearized(b)
 	if err != nil {
-		t.Fatalf("a Ghostscript-linearized file was refused: %v", err)
+		t.Fatalf("the cheap check refused a Ghostscript-linearized file: %v", err)
+	}
+	if err := checkFirstPageEnd(b, lin); err != nil {
+		t.Fatalf("/E was refused on a Ghostscript-linearized file: %v", err)
 	}
 	// The precondition the test rests on: if a future fixture moved the hint
 	// stream before the first page, this test would pass while proving
@@ -992,16 +1004,66 @@ func TestASharedTablePositionOutsideAnUnfilteredStreamIsRefused(t *testing.T) {
 }
 
 // ⛔ AND THE CONTROL THAT KEEPS THE ABOVE HONEST: the same fixture untouched
-// is accepted, so the refusal is about the edit and not about this checker
-// disliking Ghostscript's output — which it does not, and #43 depends on it
-// not doing so.
-func TestTheUnfilteredFixtureItselfIsAccepted(t *testing.T) {
+// passes the /S check, so the refusal above is about the edit and not about
+// this checker disliking Ghostscript's output.
+//
+// ⛔⛔ IT ASKS checkHintStream AND NOT CheckLinearized, because the untouched
+// fixture is now REFUSED end-to-end — for its hint TABLES, which is the other
+// half of why it is committed. Asserting the whole pipeline accepts it would
+// have been asserting something that stopped being true, and asserting the
+// pipeline refuses it would not control for anything: the edit above changes
+// /S, so the control has to be /S.
+//
+// ⭐ The pair is stronger than it was. Both files are now refused by
+// CheckLinearized and the two refusals are told apart by their MESSAGE — the
+// edited one for /S, the untouched one for the overrun — which is what the
+// next test asserts.
+func TestTheUnfilteredFixtureItselfPassesTheSlashSCheck(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CheckLinearized(b); err != nil {
-		t.Fatalf("the Ghostscript fixture was refused: %v", err)
+	lin, err := Linearized(b)
+	if err != nil {
+		t.Fatalf("the cheap check refused the Ghostscript fixture: %v", err)
+	}
+	if err := checkHintStream(b, lin); err != nil {
+		t.Fatalf("the Ghostscript fixture's /S was refused: %v", err)
+	}
+}
+
+// ⛔⛔⛔ AND THE FIXTURE #40 PREDICTED IS NOW REFUSED, which is the whole point
+// of wiring the tables into the checker. #40 said in writing: "a file can pass
+// this and still have hint tables that send a reader to the wrong offset".
+// This fixture did exactly that for five merged PRs — sound parameters, and
+// hint tables qpdf reports five problems in.
+//
+// ⛔ THE SENTINEL IS CHECKED, NOT JUST THE REFUSAL. ErrHintTablesInvalid says
+// the parameters agree with the file and the tables do not, which is a
+// different fact to a caller than ErrLinearizationStale: hint tables are an
+// optimisation, so this file is still readable by the ordinary route and only
+// the fast path is lost. A test that accepted any error would pass against a
+// checker that had merged the two.
+//
+// ⛔ AND THE REASON IS NAMED. Without the message assertion this would pass if
+// the tables were refused for some unrelated reason — a width, a truncation —
+// and the specific defect that makes this fixture valuable would stop being
+// the thing under test.
+func TestTheGhostscriptFixtureIsRefusedForItsHintTables(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "linearized-gs.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = CheckLinearized(b)
+	if !errors.Is(err, ErrHintTablesInvalid) {
+		t.Fatalf("error is %v, want ErrHintTablesInvalid", err)
+	}
+	if errors.Is(err, ErrLinearizationStale) {
+		t.Errorf("it was refused as STALE, which says the parameters disagree with the file — "+
+			"they do not, and that is why this fixture is committed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "really the next table") {
+		t.Errorf("it was refused, but not for the overrun this fixture is kept for: %v", err)
 	}
 }
 
@@ -1471,12 +1533,21 @@ func TestQpdfAlsoRefusesASharedTablePositionOutsideTheStream(t *testing.T) {
 }
 
 // ⛔⛔ AND THE GHOSTSCRIPT FIXTURE'S HINT TABLES ARE WRONG, WHICH NOTHING HERE
-// SAID. testdata/linearized-gs.pdf is committed as a POSITIVE and
-// TestTheUnfilteredFixtureItselfIsAccepted asserts this package accepts it —
-// while `qpdf --check` on that exact file exits 3 with five warnings. The
-// fixture is a positive for the PARAMETERS and a negative for the HINT
-// TABLES, and a corpus that records only the first half invites the next
-// reader to treat Ghostscript as a model for the second.
+// SAID FOR FIVE MERGED PULL REQUESTS. testdata/linearized-gs.pdf is committed
+// as a positive for the PARAMETERS and a negative for the HINT TABLES, while
+// `qpdf --check` on that exact file exits 3 with five warnings. A corpus that
+// recorded only the first half invited the next reader to treat Ghostscript as
+// a model for the second.
+//
+// ⭐ THE TODO BELOW HAS BEEN DISCHARGED. This comment used to end "when
+// hint-table checking lands, CheckLinearized should refuse this fixture and
+// this test is where that change announces itself". It has landed:
+// CheckLinearized now decodes the tables and refuses this file with
+// ErrHintTablesInvalid, asserted by
+// TestTheGhostscriptFixtureIsRefusedForItsHintTables. This test keeps its own
+// job, which is different — it records what the FOREIGN judge says, so that a
+// qpdf upgrade which stopped warning would be noticed rather than silently
+// turning the README into a claim nobody can back.
 //
 // ⛔⛔ IT IS NOT A MODEL. qpdf reports `min_group_length: 65536` for it —
 // 0x10000, a placeholder never filled in — against computed group lengths of
@@ -1485,12 +1556,10 @@ func TestQpdfAlsoRefusesASharedTablePositionOutsideTheStream(t *testing.T) {
 // 98 and 31, and exits 0 with no warnings. So when #40's step 3 writes hint
 // tables, the shape to copy is qpdf's.
 //
-// ⭐ AND THIS IS THE PROPERTY #40 PREDICTED IN WRITING: "a file can pass this
-// and still have hint tables that send a reader to the wrong offset". It is
-// now a file in the corpus that does exactly that, named, rather than a risk
-// noted in an issue. The test is the todo marker: when hint-table checking
-// lands, CheckLinearized should refuse this fixture and this test is where
-// that change announces itself.
+// ⭐ AND THIS WAS THE PROPERTY #40 PREDICTED IN WRITING: "a file can pass this
+// and still have hint tables that send a reader to the wrong offset". It was a
+// file in the corpus doing exactly that, named, rather than a risk noted in an
+// issue — and naming it is what made the gap closable.
 //
 // ⛔ IT IS A CHARACTERISATION TEST, AND "NOTHING IN OUR CODE CAN BREAK IT" IS
 // NOT THE WEAKNESS IT SOUNDS LIKE — which is a correction to how this comment

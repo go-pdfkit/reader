@@ -770,13 +770,62 @@ agreed with each other and with neither annex. Its control — an unsigned group
 writing one byte of flag and nothing else — is what makes the case able to
 fail at all.
 
-⛔ **Reading, partitioning, both hint tables and encoding them is all it does —
-there is no linearizing writer yet.** The checker came first on purpose: a
-writer cannot be trusted without one. What remains for #40 is the layout
-(F.3.1's eleven parts) and the two-pass fixpoint for `/L`, `/H`, `/E` and `/T`.
-`CheckLinearized` does not yet consult any of the decoded tables, so the
-Ghostscript fixture is still accepted by it — the overrun refusal above lives
-in `readHintTables`, which the checker does not call.
+### ⭐ The checker now reads the hint tables — and refuses the fixture for a sixth defect, not for qpdf's five
+
+⛔ **The heading had to be rewritten, and the reason is the point.** It first
+read "the gap #40 named is closed", sitting beside "hint tables `qpdf --check`
+reports five problems in" — which implies this package now detects those five.
+**It detects none of them.** The refusal below is the `/S` overrun, which this
+repository's own notes call "a SIXTH thing wrong with that file, after the five
+qpdf warns about". All five mismatches remain undetected. The narrow paragraph
+further down was exact; the heading beside that sentence was not, and review
+caught the juxtaposition rather than the claim.
+
+#40 said in writing that "a file can pass this and still have hint tables that
+send a reader to the wrong offset", and `testdata/linearized-gs.pdf` was
+committed as the file that does exactly that. For five merged pull requests this
+package accepted it.
+
+`CheckLinearized` now decodes both tables as its last step and refuses the
+fixture:
+
+```text
+reader: the hint tables do not describe this file: reader: the hint table
+cannot be read: the page offset table's entries end at bit 330 and /S puts the
+shared object table at byte 38 (bit 304), so 26 bit(s) of the entries are
+really the next table
+```
+
+⛔ **`ErrHintTablesInvalid` is a separate error, and that is not tidiness.** The
+hint tables are an **optimisation**: F.3.6's point is that a reader can show
+page one before the rest arrives. A file whose tables are wrong is still a
+correct PDF openable by the ordinary route — what it has lost is the fast path.
+A caller that could not tell this from `ErrLinearizationStale` would have to
+either reject readable files or accept parameters that lie. The distinction the
+README used to make in prose — "a positive for the parameters and a negative
+for the tables" — is now in the type.
+
+⚠ **What this checks and what it does not.** It requires the tables to *decode*
+as F.4 describes: every width in 0..32, the entries inside the stream, the page
+offset table ending at or before `/S`, the counts bounded by the document. It
+does **not** compare their *values* against the document. The page lengths and
+group lengths qpdf also reports on need the partition, and are the next step. So
+this closes "the tables are unreadable", not "the tables are wrong".
+
+⛔ **Two tests had to stop calling `CheckLinearized`,** which is worth stating
+rather than hiding in a diff. The Ghostscript fixture is the only producer here
+that puts `/H` after the first page (the witness for `/E`'s exclusion rule) and
+the only one writing an *unfiltered* hint stream (the control for `/S`'s upper
+bound). Both needed that file to reach the check they are named for, so each now
+calls that check — `checkFirstPageEnd` and `checkHintStream` — instead of the
+whole pipeline. That is strictly more precise: they were only ever end-to-end
+because nothing end-to-end disagreed with the file.
+
+⛔ **Reading, partitioning, both hint tables, encoding them and checking that
+they decode is all it does — there is no linearizing writer yet.** The checker
+came first on purpose: a writer cannot be trusted without one. What remains for
+#40 is the layout (F.3.1's eleven parts) and the two-pass fixpoint for `/L`,
+`/H`, `/E` and `/T`.
 
 Next wave: the operations built on all of this.
 
