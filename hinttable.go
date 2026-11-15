@@ -416,6 +416,18 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, erro
 	// exact coverage gate rightly refuses to carry. Conservative here, errors
 	// returned below: that combination has no unreachable line and no
 	// justification to be wrong about.
+	// ⛔⛔ AND THE COUNT ITSELF IS CAPPED, NOT ONLY ITS BIT COST — a hole the
+	// shared object table's tests exposed in this bound. When
+	// nbits_shared_identifier and nbits_shared_numerator are BOTH 0, the bit
+	// cost is zero, so the check below passes for any count whatever: a page
+	// claiming four billion references of zero width would loop four billion
+	// times reading nothing. A reference is at most one per remaining bit
+	// before it is absurd, and that is all this cap claims.
+	if total > r.left() {
+		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
+			"bits remain, so most of them describe nothing",
+			errHintTable, total, r.left())
+	}
 	if want := total * int64(h.NBitsSharedIdent+h.NBitsSharedNumerator); want > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s), which need "+
 			"%d bits, and %d remain", errHintTable, total, want, r.left())
@@ -479,10 +491,232 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int) ([]pageEntry, erro
 	return out, nil
 }
 
+// sharedHeader is the shared object hint table's header section, Table F.5's
+// seven items in order. The field names are qpdf's, for the reason given on
+// pageOffsetHeader.
+type sharedHeader struct {
+	FirstSharedObj        uint32 // item 1: first object number in part 8
+	FirstSharedOffset     uint32 // item 2: that object's location
+	NSharedFirstPage      uint32 // item 3: entries for the first page
+	NSharedTotal          uint32 // item 4: entries in all, INCLUDING item 3
+	NBitsNObjects         int    // item 5: bits for a group's object count
+	MinGroupLength        uint32 // item 6: least group length in bytes
+	NBitsDeltaGroupLength int    // item 7: bits for the group-length delta
+}
+
+// sharedGroup is one Table F.6 entry: a run of adjacent objects of which only
+// the first is referenced from outside (F.4.2).
+type sharedGroup struct {
+	Length    uint32 // item 1 + Table F.5 item 6
+	Signature []byte // item 3: a 16-byte MD5, nil when item 2's flag is 0
+	NObjects  uint32 // item 4 + 1, because item 4 is "1 less than the number"
+}
+
+// readSharedTable reads the shared object hint table, which Table F.2 marks
+// Required and /S locates.
+//
+// ⛔ /S IS A BYTE OFFSET INTO THE DECODED STREAM, which is why the reader
+// seeks rather than continues: F.4.2's table does not begin where the page
+// offset table happens to end. CheckLinearized has already refused an /S below
+// 36 or past the data, so by the time this runs the position is inside the
+// stream — and seekByte refuses it again rather than trusting that.
+// ⛔⛔ maxGroups IS THE DOCUMENT'S OBJECT COUNT, AND IT IS A MEMORY BOUND
+// RATHER THAN A PARSING ONE. Review measured the gap it closes: the bit bound
+// below costs one bit per group, while each group is a 32-byte struct, so 2 MiB
+// of zeros declaring 2^24-1000 groups returned no error and allocated 656 MiB
+// — a 256-fold amplification that a 1 GiB decoded stream (a trivial deflate
+// bomb) takes into the hundreds of gigabytes.
+//
+// ⛔ A BIT BOUND CANNOT FIX THIS, because the input is not lying: 2 MiB really
+// does hold 16.7 million one-bit flags. What is absurd is not the bit count but
+// the CLAIM — F.4.2's groups describe "a group of adjacent objects", so a table
+// cannot name more groups than the document has objects. That ceiling comes
+// from the cross-reference table, which is outside this function, so it is
+// passed in.
+func readSharedTable(r *bits, at int, maxGroups int64) (*sharedHeader, []sharedGroup, error) {
+	if err := r.seekByte(at); err != nil {
+		return nil, nil, err
+	}
+
+	// Table F.5, items 1..7, widths in bits. Their sum is 192 bits, which is
+	// where sharedTableHeaderBytes comes from.
+	widths := []int{32, 32, 32, 32, 16, 32, 16}
+	v := make([]uint32, len(widths))
+	for i, n := range widths {
+		got, err := r.read(n)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w (Table F.5, item %d of 7)", err, i+1)
+		}
+		v[i] = got
+	}
+	h := &sharedHeader{
+		FirstSharedObj:        v[0],
+		FirstSharedOffset:     v[1],
+		NSharedFirstPage:      v[2],
+		NSharedTotal:          v[3],
+		NBitsNObjects:         int(v[4]),
+		MinGroupLength:        v[5],
+		NBitsDeltaGroupLength: int(v[6]),
+	}
+
+	// ⛔ The two width items are checked before they are used, for the reason
+	// Table F.3's are: they are 16 bits wide and so can hold a number that is
+	// not a width.
+	for _, c := range []struct {
+		name string
+		item int
+		n    int
+	}{
+		{"nbits_nobjects", 5, h.NBitsNObjects},
+		{"nbits_delta_group_length", 7, h.NBitsDeltaGroupLength},
+	} {
+		if c.n > 32 {
+			return nil, nil, fmt.Errorf("%w: %s is %d, and F.4.1 bounds every bit width to "+
+				"0..32 (Table F.5, item %d)", errHintTable, c.name, c.n, c.item)
+		}
+	}
+
+	// ⛔⛔ ITEM 4 INCLUDES ITEM 3, which F.4.2 states and which a reader that
+	// added them would get wrong: item 4 is "the number of shared object
+	// entries for the shared objects section, INCLUDING the number of shared
+	// object entries for the first page (that is, the value of item 3)". So
+	// the total is item 4, and the second sequence holds item 4 - item 3.
+	if h.NSharedTotal < h.NSharedFirstPage {
+		return nil, nil, fmt.Errorf("%w: the shared object table says %d entries in all and %d "+
+			"for the first page, and Table F.5 item 4 includes item 3",
+			errHintTable, h.NSharedTotal, h.NSharedFirstPage)
+	}
+
+	total := int64(h.NSharedTotal)
+	// ⛔ Bounded before it is used, as the per-page counts are: item 4 is 32
+	// bits, so it can claim four billion groups, each costing up to three
+	// reads.
+	//
+	// ⛔⛔ AND IT COUNTS ONLY ITEM 2's ONE BIT PER GROUP, DELIBERATELY, not the
+	// lengths as well. Every group carries a signature flag — item 2 is a
+	// fixed one bit, the only item here with no configurable width — so one
+	// bit per group is a bound that always holds and never over-reaches.
+	// Including item 1's width would make groups (a) and (b)'s own read errors
+	// unreachable, which is the mistake the page offset table's bound was
+	// corrected for: an exact bound is a stronger claim than the job needs,
+	// and a branch no input can take is a line claiming to be tested.
+	if total > r.left() {
+		return nil, nil, fmt.Errorf("%w: the table claims %d shared object group(s) and only "+
+			"%d bits remain, and every group carries at least item 2's one-bit flag",
+			errHintTable, total, r.left())
+	}
+	// ⛔⛔ AND THE CLAIM IS CAPPED BY THE DOCUMENT'S OBJECTS, which is what stops
+	// one bit of input becoming a 32-byte struct. See the note on maxGroups:
+	// the bit bound above is satisfied by 16.7 million groups in 2 MiB, and
+	// allocating them cost 656 MiB.
+	if total > maxGroups {
+		return nil, nil, fmt.Errorf("%w: the table claims %d shared object group(s) and the "+
+			"document has %d object(s) — F.4.2's groups describe objects, so there cannot be "+
+			"more groups than there are", errHintTable, total, maxGroups)
+	}
+
+	// ⛔⛔ AND THE SECOND SEQUENCE IS REFUSED RATHER THAN GUESSED AT. F.4.2 says
+	// "There shall be two sequences of shared object group entries: the ones
+	// for objects located in the first page, followed by the ones for objects
+	// located in the shared objects section", and then "The order of items in
+	// EACH SEQUENCE shall be as follows". Read strictly, each sequence is
+	// column-major and aligned on its own, which differs from one run of
+	// nshared_total entries whenever the first sequence's widths do not end on
+	// a byte.
+	//
+	// ⛔ NO FILE IN THIS PACKAGE'S CORPUS CAN SETTLE IT: every fixture has
+	// nshared_total == nshared_first_page, so the second sequence is empty
+	// throughout and both readings agree. Decoding it under a guess would
+	// produce group lengths and object counts that parse and are wrong — the
+	// silent failure this whole arc exists to avoid — so a non-empty second
+	// sequence is refused, by name, until a file that exercises it exists.
+	if h.NSharedTotal > h.NSharedFirstPage {
+		return nil, nil, fmt.Errorf("%w: the table has %d group(s) for the shared objects "+
+			"section beyond the first page's %d, and F.4.2's two sequences may each be "+
+			"column-major on their own — no file in this package's corpus settles which, so "+
+			"this is refused rather than decoded under a guess",
+			errHintTable, h.NSharedTotal-h.NSharedFirstPage, h.NSharedFirstPage)
+	}
+
+	groups := make([]sharedGroup, total)
+
+	// ⛔⛔ COLUMN-MAJOR AGAIN, and byte-aligned between groups as F.4.1's are:
+	// F.4.2 says "the items making up each shared object group entry need not
+	// be contiguous; they may be broken up with items from entries for other
+	// shared object groups", then gives the order (a) to (d). The alignment is
+	// the same undocumented producer convention the page offset table uses —
+	// measured, not read.
+	//
+	// (a) Item 1 for every group: the length, as a delta on Table F.5 item 6.
+	for i := range groups {
+		d, err := r.read(h.NBitsDeltaGroupLength)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w (Table F.6 item 1, the group length, for group %d "+
+				"of %d)", err, i+1, total)
+		}
+		groups[i].Length = h.MinGroupLength + d
+	}
+	r.align()
+
+	// (b) Item 2 for every group: one bit saying whether a signature follows.
+	flags := make([]bool, total)
+	for i := range groups {
+		f, err := r.read(1)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w (Table F.6 item 2, the signature flag, for group %d "+
+				"of %d)", err, i+1, total)
+		}
+		flags[i] = f == 1
+	}
+	r.align()
+
+	// (c) Item 3 for every group that has one: a 16-byte MD5.
+	//
+	// ⛔ ONLY WHERE THE FLAG IS SET, which is what makes item 2 worth reading
+	// rather than skipping: a reader that always consumed 128 bits here would
+	// be 16 bytes out of step for every group after the first unsigned one.
+	for i := range groups {
+		if !flags[i] {
+			continue
+		}
+		sig := make([]byte, 16)
+		for j := range sig {
+			b, err := r.read(8)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%w (Table F.6 item 3, the signature, for group %d "+
+					"of %d)", err, i+1, total)
+			}
+			sig[j] = byte(b)
+		}
+		groups[i].Signature = sig
+	}
+	r.align()
+
+	// (d) Item 4 for every group: "a number equal to 1 less than the number of
+	// objects in the group".
+	//
+	// ⛔ THE +1 IS THE ANNEX'S, not a convenience. A group of one object
+	// stores 0, so a reader that kept the raw value would report every group
+	// as holding one object too few — and a group of zero objects is not a
+	// thing F.4.2 describes.
+	for i := range groups {
+		n, err := r.read(h.NBitsNObjects)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w (Table F.6 item 4, the object count, for group %d "+
+				"of %d)", err, i+1, total)
+		}
+		groups[i].NObjects = n + 1
+	}
+
+	return h, groups, nil
+}
+
 // hintTables is what this package reads out of a primary hint stream.
 type hintTables struct {
-	pageOffset *pageOffsetHeader
-	pages      []pageEntry
+	pageOffset   *pageOffsetHeader
+	pages        []pageEntry
+	shared       *sharedHeader
+	sharedGroups []sharedGroup
 }
 
 // readHintTables decodes the hint stream at /H and returns what it holds.
@@ -537,5 +771,32 @@ func (d *Document) readHintTables(lin *Linearization) (*hintTables, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &hintTables{pageOffset: h, pages: entries}, nil
+
+	// ⛔ /S COMES FROM THE STREAM'S OWN DICTIONARY, not from the table: F.3.6
+	// makes it a dictionary entry, and checkHintStream has already required it
+	// to be a direct integer at or above 36 with room for its 24-byte header.
+	sv, ok := s.Dict["S"]
+	if !ok {
+		return nil, fmt.Errorf("%w: the primary hint stream has no /S, so the shared object "+
+			"table cannot be located", errHintTable)
+	}
+	pos, ok := sv.(Integer)
+	if !ok {
+		return nil, fmt.Errorf("%w: /S is %T, not a direct integer", errHintTable, sv)
+	}
+	// ⛔ The object count is the cap on how many groups the table may claim;
+	// see readSharedTable's note on maxGroups. len(d.xref) is the document's
+	// own count, and a table naming more groups than that is describing
+	// objects the file does not have.
+	sh, groups, err := readSharedTable(r, int(pos), int64(len(d.xref)))
+	if err != nil {
+		return nil, err
+	}
+
+	return &hintTables{
+		pageOffset:   h,
+		pages:        entries,
+		shared:       sh,
+		sharedGroups: groups,
+	}, nil
 }
