@@ -621,8 +621,24 @@ and left a 176× amplification in place.
 `/N` is as untrusted here as `/S` was, and for the same reason: nothing on this
 path calls `checkHintStream`. Both ceilings are now the document's object count
 — a page is an indirect object, and F.4.2's identifiers index a table of
-objects, so neither a page count nor one page's references can exceed what the
-file holds.
+objects, so neither a page count nor **one page's** references can exceed what
+the file holds.
+
+⛔⛔ **"One page's" is doing real work there, and the first version of this bound
+got it wrong.** It compared the **sum** of every page's count against the object
+count, which refuses ordinary documents: a hundred pages each referencing fifty
+shared objects is about 255 objects and a sum of 99 × 50 = 4950. Sharing is the
+entire purpose of part 8 — the same object is referenced from many pages — so
+the sum is bounded by pages × objects and never by objects.
+
+This is #52's lesson repeating: a work budget there refused a 150,000-page file
+and had to be removed. **A ceiling in the wrong units does not fail loudly on
+nonsense; it fails on somebody's real document.** The counterexample is now a
+test, because the wrong bound looked right and passed every other case. What
+still bounds the total is the page ceiling plus the two bit bounds: with
+`pages ≤ objects` and each count `≤ objects` the sum cannot exceed `objects²`,
+and the bits bound independently caps it at one reference per remaining bit. The
+176× term is closed by the page ceiling, which is the unambiguous half.
 
 ⛔⛔ **And the ceiling itself was untested, which a mutation found.** Both bounds
 take the cap as an argument, and both had tests passing it directly — so both

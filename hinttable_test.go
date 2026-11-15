@@ -1348,11 +1348,11 @@ func TestAPageCountAboveTheDocumentsObjectCountIsRefused(t *testing.T) {
 	}
 }
 
-// ⛔⛔ AND THE REFERENCE COUNTS, which is the half #56 does name. This needs a
-// page count the cap above ACCEPTS, or that one fires first and this bound is
-// never reached — the two refusals would then be indistinguishable and one of
-// them untested.
-func TestSharedReferencesBeyondTheDocumentsObjectCountAreRefused(t *testing.T) {
+// ⛔⛔ AND THE REFERENCE COUNT IS PER PAGE, NOT THE SUM. This needs a page count
+// the cap above ACCEPTS, or that one fires first and this bound is never
+// reached — the two refusals would be indistinguishable and one of them
+// untested.
+func TestOnePagesSharedReferencesCannotExceedTheDocumentsObjects(t *testing.T) {
 	// Two pages at eight-bit widths. Page one's count must be 0; page two's is
 	// the second byte of group (c), which sits after groups (a) and (b).
 	//
@@ -1362,22 +1362,59 @@ func TestSharedReferencesBeyondTheDocumentsObjectCountAreRefused(t *testing.T) {
 	b := make([]byte, 64)
 	b[5] = 200
 
-	// ⛔ Ten objects, two pages: the page cap passes, so what refuses is the
-	// reference count.
+	// ⛔ Ten objects, two pages: the page cap passes, so what refuses is one
+	// page's reference count.
 	_, err := readPageEntries(&bits{b: b}, entriesHeader(), 2, 10)
 	if !errors.Is(err, errHintTable) {
-		t.Fatalf("200 references in a 10-object document were accepted: %v", err)
+		t.Fatalf("one page with 200 references in a 10-object document was accepted: %v", err)
 	}
-	if !strings.Contains(err.Error(), "reference more objects than there are") {
+	if !strings.Contains(err.Error(), "one page references more objects than the file has") {
 		t.Errorf("it was refused, but not against the document's object count: %v", err)
 	}
 
-	// ⛔ THE CONTROL, same shape as the page one's: generous object count, so
-	// this cap lets it through and only the bit bounds can still object.
+	// ⛔ THE CONTROL: generous object count, so this cap lets it through and
+	// only the bit bounds can still object.
 	_, err = readPageEntries(&bits{b: b}, entriesHeader(), 2, manyObjects)
-	if err != nil && strings.Contains(err.Error(), "than there are") {
+	if err != nil && strings.Contains(err.Error(), "more objects than the file has") {
 		t.Errorf("a document of %d objects was still refused by the object cap: %v",
 			manyObjects, err)
+	}
+}
+
+// ⛔⛔⛔ THE COUNTEREXAMPLE THAT KILLED THE FIRST VERSION OF THAT BOUND, kept as
+// a test because the bound looked right and passed every other case.
+//
+// The first version compared the SUM of all pages' counts against the object
+// count. That refuses an ordinary document: a hundred pages each referencing
+// fifty shared objects is about 255 objects and a sum of 99 × 50 = 4950, so it
+// would have been rejected as claiming "more objects than there are".
+//
+// ⛔ Sharing is the entire purpose of F.3.9's part 8 — the same object is
+// referenced from many pages — so the sum is bounded by pages × objects and
+// never by objects. #52 removed a work budget for refusing a 150 000-page
+// file; a ceiling in the wrong units does not fail on nonsense, it fails on
+// somebody's real document.
+func TestManyPagesSharingManyObjectsIsNotRefused(t *testing.T) {
+	const (
+		pages    = 100
+		perPage  = 50
+		objects  = 255 // pages + their contents + the shared ones + the tree
+		widthsAt = 8
+	)
+
+	// Groups (a) and (b) are one byte per page, then group (c) is one byte per
+	// page holding the count: 0 for page one, 50 for the rest. Groups (d) and
+	// (e) then need one byte each per reference, and (f) and (g) one per page.
+	refs := (pages - 1) * perPage
+	b := make([]byte, 3*pages+2*refs+2*pages)
+	for i := 1; i < pages; i++ {
+		b[2*pages+i] = perPage // group (c), page i+1's count
+	}
+
+	_, err := readPageEntries(&bits{b: b}, entriesHeader(), pages, objects)
+	if err != nil {
+		t.Fatalf("a conforming %d-page document sharing %d objects per page was refused "+
+			"(sum of counts %d, objects %d): %v", pages, perPage, refs, objects, err)
 	}
 }
 

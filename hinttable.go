@@ -450,18 +450,34 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 	// claiming four billion references of zero width would loop four billion
 	// times reading nothing. A reference is at most one per remaining bit
 	// before it is absurd, and that is all this cap claims.
-	// ⛔⛔ AND THE OBJECT COUNT IS THE BOUND THAT ACTUALLY HOLDS, because the two
-	// below are about BITS and a bit is not a byte. Measured above: with the
-	// identifier and numerator widths both 0 the bit-cost bound is vacuous, and
-	// the bits-remaining bound is satisfied by one reference per remaining bit —
-	// 8 388 607 references, 64 MiB, out of 2 MiB of input, with no error. The
-	// input is not lying: a 2 MiB stream really does hold 16.7 million one-bit
-	// fields. "Does it fit in the bits?" is the wrong question, which is the
-	// lesson #55 paid for on the groups side.
-	if total > maxObjects {
-		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) in all and the "+
-			"document has %d object(s), so they reference more objects than there are",
-			errHintTable, total, maxObjects)
+	// ⛔⛔ PER PAGE, AND NOT THE SUM — the first version of this bound compared
+	// the SUM of every page's count against the object count, and that refuses
+	// ordinary documents. One hundred pages each referencing fifty shared
+	// objects is a perfectly conforming file of about 255 objects, and its sum
+	// is 99 × 50 = 4950. The bound would have rejected it.
+	//
+	// ⛔ The claim that IS true is about one page: a single page cannot
+	// reference more distinct shared objects than the document has objects,
+	// because F.4.2's identifiers index a table whose entries describe objects.
+	// Sharing is the whole point of part 8, so the same object is referenced
+	// from many pages and the sum is bounded by pages × objects, not by
+	// objects.
+	//
+	// ⛔ This is #52's lesson repeating: a work budget there refused a
+	// 150 000-page file and had to be removed. A ceiling in the wrong units
+	// does not fail loudly on nonsense, it fails on somebody's real document.
+	//
+	// ⛔ What still bounds the TOTAL is the page ceiling above plus the two bit
+	// bounds below: with pages ≤ maxObjects and each count ≤ maxObjects the sum
+	// cannot exceed maxObjects², and the bits bound independently caps it at
+	// one reference per remaining bit. The 176× term — the pageEntry slice — is
+	// closed by the page ceiling, which is the unambiguous half.
+	for i, n := range counts {
+		if int64(n) > maxObjects {
+			return nil, fmt.Errorf("%w: page %d of %d claims %d shared object reference(s) and "+
+				"the document has %d object(s), so one page references more objects than the "+
+				"file has", errHintTable, i+1, pages, n, maxObjects)
+		}
 	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+
