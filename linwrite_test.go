@@ -1,0 +1,171 @@
+// Copyright (c) 2026, the go-pdfkit/reader authors
+// All rights reserved.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+package reader
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// ⛔⛔⛔ THE PREMISE OF THE WHOLE FIXPOINT, PINNED BY A FOREIGN PRODUCER. The
+// reserved-span technique only works because the span does not move when the
+// numbers change width. qpdf's two classic fixtures say it does not: the same
+// 201 bytes from the start of the parameter object to the `xref` keyword, while
+// the object itself is 82 bytes in one and 83 in the other.
+//
+// ⛔ If a qpdf upgrade began padding inside the dictionary instead, or stopped
+// padding at all, this test is where that shows — and it would mean the
+// mechanism in linwrite.go was modelled on behaviour that had changed.
+func TestQpdfReservesAConstantSpanForTheParameters(t *testing.T) {
+	objStart := regexp.MustCompile(`(?m)^\d+ 0 obj\n`)
+
+	type measured struct{ span, object int }
+	got := map[string]measured{}
+	for _, name := range []string{"linearized.pdf", "linearized-shared.pdf"} {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		loc := objStart.FindIndex(b)
+		if loc == nil {
+			t.Fatalf("%s has no leading indirect object", name)
+		}
+		start := loc[0]
+
+		// ⛔ THE `xref` KEYWORD AND NOT A LATER MATCH. A file with an xref
+		// STREAM has no such keyword at the front at all, and searching the
+		// whole file would measure a span that does not exist —
+		// testdata/linearized-objstm.pdf did exactly that to the probe this
+		// test grew from, matching the letters inside an object stream's
+		// compressed data. Hence the search starts at the object and the two
+		// fixtures here are the classic-xref ones.
+		rel := bytes.Index(b[start:], []byte("\nxref\n"))
+		if rel < 0 {
+			t.Fatalf("%s has no xref keyword after its first object", name)
+		}
+		end := bytes.Index(b[start:], []byte("endobj"))
+		if end < 0 {
+			t.Fatalf("%s has no endobj in its first object", name)
+		}
+		got[name] = measured{span: rel + 1, object: end + len("endobj")}
+	}
+
+	a, b := got["linearized.pdf"], got["linearized-shared.pdf"]
+	if a.span != b.span {
+		t.Errorf("qpdf reserved %d bytes in one file and %d in the other, so the span is not "+
+			"constant and the mechanism in linwrite.go is modelled on nothing: %+v",
+			a.span, b.span, got)
+	}
+	// ⛔ AND THE OBJECTS MUST DIFFER, or the constant span proves nothing: two
+	// identical objects would of course be followed by identical padding, and
+	// the test would pass against a producer that padded inside the dictionary.
+	if a.object == b.object {
+		t.Errorf("both parameter objects are %d bytes, so this pair cannot show that the span "+
+			"absorbs a width change: %+v", a.object, got)
+	}
+	t.Logf("qpdf: span %d, objects %d and %d, padding %d and %d",
+		a.span, a.object, b.object, a.span-a.object, b.span-b.object)
+}
+
+// ⛔⛔ AND THE SPAN THIS PACKAGE WRITES DOES NOT MOVE WITH THE NUMBERS, which is
+// the one property every offset after part 2 depends on.
+func TestTheParameterObjectIsAlwaysTheReservedWidth(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		p    linParams
+	}{
+		{"one-digit values", linParams{L: 1, H0: 2, H1: 3, O: 4, E: 5, N: 6, T: 7}},
+		{"a realistic file", linParams{L: 1367, H0: 550, H1: 127, O: 7, E: 902, N: 2, T: 1169}},
+		{"values near the top of int64", linParams{
+			L: 9223372036854775807, H0: 9223372036854775807, H1: 9223372036854775807,
+			O: 9223372036854775807, E: 9223372036854775807, N: 9223372036854775807,
+			T: 9223372036854775807}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := c.p.object(4)
+			if err != nil {
+				t.Fatalf("it was refused: %v", err)
+			}
+			if len(out) != paramSpan {
+				t.Fatalf("the object is %d bytes and the span is %d — every offset after part "+
+					"2 would be wrong by the difference", len(out), paramSpan)
+			}
+			// ⛔ The padding is SPACES, which is whitespace to a PDF lexer. A
+			// NUL is not, and a parser would stop at it.
+			if i := bytes.IndexByte(out, 0); i >= 0 {
+				t.Errorf("the padding holds a NUL at byte %d, which is not whitespace in ISO "+
+					"32000-1's lexical rules", i)
+			}
+			if !strings.HasSuffix(string(bytes.TrimRight(out, " ")), "endobj\n") {
+				t.Errorf("the object does not end in endobj before its padding: %q", out)
+			}
+		})
+	}
+
+	// ⛔⛔ THE WIDEST CASE ABOVE IS THE ONE THAT MATTERS, and this asserts the
+	// reason 256 was chosen rather than copying qpdf's 201: seven int64 values
+	// at nineteen digits do not fit 201. If they did, this package would be
+	// carrying a larger span for no reason; if 256 did not fit them, the
+	// refusal would be reachable from a real file.
+	widest := linParams{
+		L: 9223372036854775807, H0: 9223372036854775807, H1: 9223372036854775807,
+		O: 9223372036854775807, E: 9223372036854775807, N: 9223372036854775807,
+		T: 9223372036854775807}
+	out, err := widest.object(999999)
+	if err != nil {
+		t.Fatalf("the widest possible parameters do not fit the span, so a real file could "+
+			"reach the refusal: %v", err)
+	}
+	used := len(bytes.TrimRight(out, " "))
+	if used <= 201 {
+		t.Errorf("the widest parameters need %d bytes, which fits qpdf's 201 — then 256 is "+
+			"unjustified and the comment explaining it is wrong", used)
+	}
+	// ⛔ THE EXACT FIGURE, because the comment in linwrite.go now cites it: 202,
+	// which clears qpdf's 201 by ONE byte. A comment that cites a number has to
+	// have the number asserted somewhere or it is the next stale claim.
+	if used != 202 {
+		t.Errorf("the widest parameter object is %d bytes and linwrite.go's note says 202; "+
+			"one of the two is now wrong", used)
+	}
+	t.Logf("the widest possible parameter object is %d bytes of %d reserved", used, paramSpan)
+}
+
+// ⛔⛔ AND A DICTIONARY THAT WILL NOT FIT IS REFUSED, NOT TRUNCATED. One byte
+// too long does not give a broken dictionary: it gives a file where every
+// offset after part 2 is one byte further along than /E, /T and the first-page
+// cross-reference section say. The file opens and a reader following those
+// offsets lands inside the wrong object.
+func TestParametersTooWideForTheSpanAreRefused(t *testing.T) {
+	// ⛔⛔ THE SPAN IS SHRUNK, because the refusal is otherwise UNREACHABLE and
+	// an unreachable refusal is an untested claim. Measured: the widest object
+	// this function can produce is 202 bytes of the 256 reserved, so no int64
+	// value and no int object number can overflow it — an earlier version of
+	// this test tried an eighteen-digit object number and was accepted at 256.
+	// paramSpan is a var for exactly this, the seam intMax and maxDecodedSize
+	// already use here.
+	defer func(n int) { paramSpan = n }(paramSpan)
+	paramSpan = 64
+
+	p := linParams{L: 1367, H0: 550, H1: 127, O: 7, E: 902, N: 2, T: 1169}
+	out, err := p.object(4)
+	if !errors.Is(err, ErrLinearizationTooWide) {
+		t.Fatalf("a realistic dictionary was accepted into a %d-byte span at %d bytes — want "+
+			"ErrLinearizationTooWide", paramSpan, len(out))
+	}
+	if out != nil {
+		t.Errorf("it was refused AND returned %d bytes; a caller ignoring the error would "+
+			"write a file whose every later offset is wrong", len(out))
+	}
+	if !strings.Contains(err.Error(), "are reserved") {
+		t.Errorf("it was refused without saying what the span is: %v", err)
+	}
+}
