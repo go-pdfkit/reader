@@ -561,8 +561,44 @@ every later count — and a non-zero first-page count makes groups (d) and (e)
 consume bits belonging to the pages after it, so every later value is wrong
 while the table still parses.
 
-⛔ **Reading, partitioning, the page offset header and its per-page entries is
-all it does — there is no linearizing writer yet.** The checker came first on purpose: a writer cannot
+### ⛔⛔ F.4.2's "two sequences" are one run, settled by a fixture built for it
+
+The shared object hint table's group entries come in two sequences — those for
+first-page objects, then those for the shared objects section — and F.4.2 gives
+the item order "in **each** sequence". Read strictly, each would be
+column-major and byte-aligned on its own, which differs from one run of
+`nshared_total` entries whenever the first sequence's widths do not end on a
+byte.
+
+⛔ **The qpdf corpus cannot settle it.** Every fixture has
+`nshared_total == nshared_first_page`, so the second sequence is empty and both
+readings agree on all twelve shapes. A green suite said nothing about the
+question, which is why an earlier version *refused* a non-empty second sequence
+rather than guess.
+
+⭐ So a document was built for the question: pages 2..n all point at one
+`/Resources` dictionary page 1 does not reference, which is F.3.9's definition
+of a part 8 object. ⛔ The first attempt still proved nothing — with a **small**
+shared object its length *is* `min_group_length`, so its delta is zero and the
+padding is zero too, and both readings give identical numbers. With a fat one
+they separate:
+
+```text
+min_group_length 99, nbits_delta_group_length 9, lengths 108, 99, 601
+  so the deltas are 9, 0 and 502
+bits after the 24-byte header:
+  00000100 10000000 00111110 11000000
+ONE RUN:       bits 18-26 = 111110110 = 502  → 601  ✓
+TWO SEQUENCES: align to bit 24, read 384     → 483  ✗
+```
+
+qpdf writes **one** column-major run. ⚠ The specification's wording stays
+ambiguous and the measurement does not — and the mutation confirms which test
+settles it: the two-sequence reading reddens the new fixture on both shapes and
+leaves the twelve older ones green.
+
+⛔ **Reading, partitioning and both hint tables is all it does — there is no
+linearizing writer yet.** The checker came first on purpose: a writer cannot
 be trusted without one. What remains for #40 is the per-page entries (Table
 F.4), the shared object hint table (F.4.2), the layout, and the two-pass
 fixpoint for `/L`, `/H`, `/E` and `/T`. `CheckLinearized` does not yet consult
