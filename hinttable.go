@@ -261,6 +261,17 @@ type sharedRef struct {
 	Numerator  uint32 // item 5: where in the content stream it is first used
 }
 
+// sharedRefBytes is what one sharedRef costs, which readPageEntries' memory
+// budget is stated in.
+//
+// ⛔ IT IS ASSERTED, NOT ASSUMED: TestASharedRefCostsWhatTheBudgetThinks
+// compares it against unsafe.Sizeof. The budget is a number of BYTES per byte
+// of input, so if this struct gains a field the ceiling must stay put and the
+// number of references allowed must fall — and a constant nobody checks would
+// instead let the ceiling rise silently. unsafe lives in the test so that this
+// package does not import it.
+const sharedRefBytes = 8
+
 // pageEntry is one page's Table F.4 entry, with the header's minima already
 // added back.
 //
@@ -482,9 +493,9 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 				"file has", errHintTable, i+1, pages, n, maxObjects)
 		}
 	}
-	// ⛔⛔⛔ AND THE BUDGET IN BYTES, which the two bit bounds do NOT provide.
-	// "total ≤ bits remaining" is literally true and useless: one reference per
-	// BIT at eight bytes each IS 64 bytes per input byte, so the
+	// ⛔⛔⛔ AND A BUDGET IN BYTES OF ALLOCATION, which the two bit bounds do NOT
+	// provide. "total ≤ bits remaining" is literally true and useless: one
+	// reference per BIT at eight bytes each IS 64 bytes per input byte, so the
 	// proportionality constant is the amplification. Review measured it,
 	// accepted, on the code as first pushed:
 	//
@@ -494,10 +505,16 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 	// The page ceiling above closes the 176x term; this is the 32x term #56 was
 	// actually filed about, and it needs only a 4096-object document.
 	//
-	// ⛔ THE FIGURE IS MEASURED, NOT CHOSEN, which is what this bound's own
-	// lesson demands — a resource bound stated in the resource. References per
-	// byte of decoded hint stream, over every fixture here including documents
-	// whose pages share a /Resources dictionary:
+	// ⛔ THE INTERVAL IS MEASURED AND THE FIGURE IS CHOSEN INSIDE IT, which is
+	// the honest version of a sentence that stood here claiming "measured, not
+	// chosen" four lines above another admitting the choice. Review caught the
+	// contradiction; it was the third wrong sentence in this one block, after
+	// the two below. What measurement gives is the gap between real documents
+	// and the bomb; where in that gap to sit is a judgement, and saying
+	// otherwise borrows authority the numbers do not confer.
+	//
+	// Bytes of references per byte of decoded hint stream, over every fixture
+	// here including documents whose pages share a /Resources dictionary:
 	//
 	//	entry bytes per stream byte   0.6x  1.2x  3.1x  6.6x  9.4x  10.3x  11.2x
 	//	references per stream byte    0.00  0.01  0.05  0.43  0.67   0.85   0.85
@@ -516,16 +533,24 @@ func readPageEntries(r *bits, h *pageOffsetHeader, pages int, maxObjects int64) 
 	// seven times it. So the shape of the bound was right and the constant was
 	// not.
 	//
-	// Four is chosen over 1 for headroom: 4.7x above the measured maximum for
-	// real documents and 2x below the bomb's 7.8. One would work today with
-	// 18% margin, which is too little for a number nobody will re-measure.
-	// This is an empirical budget with both ends measured, not an invariant,
-	// and it is written here as such.
-	const sharedRefsPerStreamByte = 4
-	if budget := int64(len(r.b)) * sharedRefsPerStreamByte; total > budget {
+	// 32 bytes per stream byte is chosen over 8 for headroom: 4.7x above the
+	// measured maximum for real documents and 1.95x below the bomb's 7.81
+	// references per byte. Eight would work today with 17.6% margin, which is
+	// too little for a number nobody will re-measure.
+	//
+	// ⛔⛔ AND IT IS STATED IN BYTES, NOT IN REFERENCES, which is review's point
+	// and not cosmetic. An earlier version held `sharedRefsPerStreamByte = 4`
+	// and compared `total*8`, hiding sizeof(sharedRef) in BOTH a constant and a
+	// literal. Add a field to sharedRef and the real ceiling rises by half
+	// again with no code change, no failing test, and a message that has
+	// started lying. The budget below is a number of BYTES and the conversion
+	// is named once.
+	const sharedRefBytesPerStreamByte = 32
+	if budget := int64(len(r.b)) * sharedRefBytesPerStreamByte; total*sharedRefBytes > budget {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s), which would "+
-			"hold %d bytes of entries from a %d-byte hint stream, and this reader allows %d "+
-			"reference(s) per stream byte", errHintTable, total, total*8, len(r.b), budget/int64(len(r.b)))
+			"hold %d bytes from a %d-byte hint stream, and this reader allows %d byte(s) of "+
+			"references per stream byte", errHintTable, total, total*sharedRefBytes, len(r.b),
+			int64(sharedRefBytesPerStreamByte))
 	}
 	if total > r.left() {
 		return nil, fmt.Errorf("%w: the pages claim %d shared object reference(s) and only %d "+

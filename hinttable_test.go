@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // ⛔⛔ THE HINT TABLES ARE WHERE #40 SAID THE CHECKER WAS BLIND, and this is the
@@ -1397,6 +1398,22 @@ func TestOnePagesSharedReferencesCannotExceedTheDocumentsObjects(t *testing.T) {
 	}
 }
 
+// ⛔⛔ THE BUDGET'S UNIT, ASSERTED RATHER THAN ASSUMED. readPageEntries budgets
+// bytes of references per byte of input, and the conversion from a count to
+// bytes is sharedRefBytes. If sharedRef gains a field and that constant stays
+// at 8, the real ceiling rises by half again with no code change and no failing
+// test, and the refusal message starts reporting a byte figure that is wrong.
+//
+// ⛔ unsafe is imported HERE and not in the package, so the claim is checked
+// without the reader carrying the import.
+func TestASharedRefCostsWhatTheBudgetThinks(t *testing.T) {
+	if got, want := unsafe.Sizeof(sharedRef{}), uintptr(sharedRefBytes); got != want {
+		t.Fatalf("sharedRef is %d bytes and the budget is stated in %d: either fix the "+
+			"constant AND re-check the 32-bytes-per-stream-byte ceiling, or stop charging "+
+			"the wrong size", got, want)
+	}
+}
+
 // ⛔⛔⛔ THE 64x THAT SURVIVED THE OBJECT CEILINGS, which review measured and
 // which the per-page bound alone does not stop. maxObjects² is reachable from a
 // small stream: with 4096 pages in a 4096-object document, each page's count of
@@ -1436,7 +1453,7 @@ func TestTheReferenceTotalIsBudgetedInBytesNotBits(t *testing.T) {
 		t.Fatalf("%d references from a %d-byte stream were accepted: %v",
 			(pages-1)*perPage, len(b), err)
 	}
-	if !strings.Contains(err.Error(), "reference(s) per stream byte") {
+	if !strings.Contains(err.Error(), "byte(s) of references per stream byte") {
 		t.Errorf("it was refused, but not by the byte budget: %v", err)
 	}
 
@@ -1768,7 +1785,8 @@ func TestSharedReferencesThatCannotFitAreRefusedBeforeBeingRead(t *testing.T) {
 	// be plausible and still too expensive.
 	// ⛔⛔ THE SIZES ARE CHOSEN SO THAT THE INTENDED BOUND IS THE ONE THAT
 	// FIRES, and that took arithmetic once the byte budget was added. The
-	// budget allows 4 references per stream byte; the bits-remaining bound
+	// budget allows 32 bytes of references per stream byte, so 4 references at
+	// sharedRefBytes each; the bits-remaining bound
 	// allows 8N − c, where N is the stream and c the bits already consumed. So
 	// the budget is the tighter of the two whenever c < 4N bits — which is
 	// almost always — and the bits bound is reachable only when MOST of the
