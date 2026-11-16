@@ -850,9 +850,76 @@ because nothing end-to-end disagreed with the file.
 
 ⛔ **Reading, partitioning, both hint tables, encoding them and checking that
 they decode is all it does — there is no linearizing writer yet.** The checker
-came first on purpose: a writer cannot be trusted without one. What remains for
-#40 is the layout (F.3.1's eleven parts) and the two-pass fixpoint for `/L`,
-`/H`, `/E` and `/T`.
+came first on purpose: a writer cannot be trusted without one.
+
+### ⭐⭐ `Document.Linearize` — and the hint tables are real
+
+That paragraph is now out of date and is kept because the order it describes is
+the point: the checker was built first, and every step of the writer was judged
+by it and by qpdf before the next one started.
+
+`Linearize()` writes Annex F's eleven parts and returns the bytes.
+`qpdf --check` says **`File is linearized`** and raises no complaint it does not
+also raise about the input, on one, two, five and twenty-five page documents.
+
+⛔⛔ **THE LAYOUT IS PAGE-MAJOR IN PARTS 6 AND 7, AND A FOREIGN CHECKER IS WHY.**
+Within those parts the order is "page by page, each page's own object first",
+not "ascending object number" — because qpdf measures a page by taking its page
+object's number and the next *nobjects−1* **consecutive** numbers and summing
+their lengths (`Lin::lengthNextN`, read in qpdf's source). It never looks at
+which objects the page actually reaches. A page whose content stream is numbered
+below its page object is therefore measured against whatever happens to be
+numbered above it:
+
+```
+page length mismatch for page 1: hint table = 186; computed length = 162
+```
+
+Those 162 bytes were our page object (101) plus the **page tree** (61) — an
+object belonging to no page at all.
+
+⛔ **And the other page passed by accident,** which is the half worth keeping.
+Its byte extent was 186 and the sum of its two objects was 101 + 85 = 186: the
+same total over a *different* range. One green page and one red page came from
+one defect, so the green one was never evidence.
+
+⛔ **Table F.4 item 2 is a SUM, not an extent.** With the page-major ordering the
+two agree, because a page's objects are now adjacent — but they agree as a
+consequence of the layout, not by definition.
+
+⭐ **Three bit widths are pinned at 32, and that is what makes the file
+converge.** The hint stream sits before the first page, so if its *length*
+changed between the two passes every later offset would move. Of Table F.4's
+seven items only three are measured in bytes — items 2, 6 and 7 — so pinning
+those widths makes the encoded length a function of the page count and the
+shared-reference counts alone, neither of which depends on where anything
+landed. The other widths are still derived from the data, which is already
+pass-invariant. qpdf solves the same problem by padding its hint stream to a
+fixed 200 bytes; pinning the widths costs four bytes per page per item and needs
+no padding at all.
+
+⛔⛔ **`qpdf --check` validates three fields of the page offset table and no
+more:** item 2, the per-page object counts, and the per-page lengths. It never
+reads items 6 and 7 — the content stream's offset and length — and it never
+reads the shared object hint table's groups. So the writer could emit nonsense
+there and every foreign judge in this repository would stay silent. That is the
+same shape as part 5's placement, where `--check` passed a file whose hint
+stream sat in the wrong part. `TestTheHintTablesDescribeTheFileWeWrote` holds
+every field against the bytes we wrote instead, and zeroing item 6 reddens it on
+every page of every shape while qpdf stays quiet.
+
+⛔ **The judge no longer exempts hint-table complaints.** While the tables were
+zeros, the qpdf diff had to skip any complaint matching a keyword list — which
+meant the one subject the step was about was the one subject the judge could not
+speak on. The list grew one entry at a time as qpdf named them and is now
+deleted: every complaint counts.
+
+What remains for #61 is the shared object hint table's *values*. This writer's
+partition puts nothing in part 8, so its table is a required header and no
+groups — but qpdf's own output shows the accounting is wider than part 8:
+linearizing the same two-page input, qpdf reports `nshared_total: 3` with part 8
+**empty**, so it counts first-page objects that later pages also use. Matching
+that is a partition change, not a table change.
 
 Next wave: the operations built on all of this.
 

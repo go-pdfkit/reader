@@ -177,13 +177,23 @@ func TestTheLayoutPutsThePartsWhereQpdfPutsThem(t *testing.T) {
 // fixture, and it covers the intra-part sort that each fixture's one-object
 // parts cannot reach. That is a smaller claim than the one it replaces.
 func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
-	p := &Partition{Of: map[int]Part{
-		1: PartOther,        // 9
-		2: PartShared,       // 8
-		3: PartOtherPrivate, // 7
-		4: PartFirstPage,    // 6
-		5: PartCatalog,      // 4
-	}}
+	// ⛔ Pages and PageObjects are given because parts 6 and 7 are now
+	// PAGE-MAJOR: Order places them page by page so that each page's objects
+	// are numbered consecutively from its own object, which is what qpdf's
+	// checker assumes when it measures a page. A Partition that names a part-6
+	// object no page claims is refused rather than ordered, so this fixture has
+	// to say which page objects 4 and 3 belong to.
+	p := &Partition{
+		Of: map[int]Part{
+			1: PartOther,        // 9
+			2: PartShared,       // 8
+			3: PartOtherPrivate, // 7
+			4: PartFirstPage,    // 6
+			5: PartCatalog,      // 4
+		},
+		Pages:       [][]int{{4}, {3}},
+		PageObjects: []int{4, 3},
+	}
 	got, err := p.Order()
 	if err != nil {
 		t.Fatal(err)
@@ -198,17 +208,30 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 		}
 	}
 
-	// ⛔ AND WITHIN a part the numbers ascend, which is the half the case above
+	// ⛔ AND WITHIN A PART THE NUMBERS ASCEND, which is the half the case above
 	// cannot see because each of its parts holds one object.
-	p = &Partition{Of: map[int]Part{
-		9: PartFirstPage, 7: PartFirstPage, 8: PartFirstPage,
-		2: PartOther, 1: PartOther,
-	}}
+	//
+	// ⛔⛔ EXCEPT IN PARTS 6 AND 7, WHICH ARE PAGE-MAJOR. This block used to put
+	// three objects in part 6 to test the intra-part sort, and that is now the
+	// wrong part to test it in: the page's own object goes FIRST and the rest
+	// ascend after it, because qpdf's checker measures a page by taking its page
+	// object's number and the next nobjects-1 CONSECUTIVE numbers. So the
+	// ascending rule is witnessed in part 9 below, and the page-major rule in
+	// part 6, and the two are different claims.
+	p = &Partition{
+		Of: map[int]Part{
+			9: PartFirstPage, 7: PartFirstPage, 8: PartFirstPage,
+			2: PartOther, 1: PartOther,
+		},
+		// Object 8 is the page, so it leads; 7 and 9 follow in order.
+		Pages:       [][]int{{7, 8, 9}},
+		PageObjects: []int{8},
+	}
 	got, err = p.Order()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []int{7, 8, 9, 1, 2}
+	want = []int{8, 7, 9, 1, 2}
 	// ⛔ THE LENGTH IS ASSERTED HERE TOO, which review found missing: without
 	// it an Order() that DUPLICATED an object passed this block, since the loop
 	// below only indexes the first len(want) entries.
@@ -217,9 +240,104 @@ func TestOrderFollowsThePartsAndNotTheObjectNumbers(t *testing.T) {
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("Order() = %v, want %v — the segment sort is wrong, or it sorted "+
-				"the whole slice and lost the parts", got, want)
+			t.Fatalf("Order() = %v, want %v — the segment sort is wrong, it sorted the "+
+				"whole slice and lost the parts, or part 6 is not page-major", got, want)
 		}
+	}
+}
+
+// ⛔⛔ Of DECIDES THE PART, Pages ONLY DECIDES THE ORDER WITHIN ONE. A page's
+// reach includes objects the partition placed elsewhere — its /Parent is the
+// page tree, which F.3.10 puts in part 9 — so the page-major walk must SKIP
+// them rather than drag them into part 6.
+//
+// ⛔ Partition never hands Order such a set, because it filters each page's set
+// by part before storing it. This is the path a caller outside partition.go
+// takes, and dropping the skip would put the page tree in the middle of the
+// first page's run — which is precisely the consecutive-numbering breakage the
+// page-major ordering exists to prevent.
+func TestThePageMajorWalkSkipsWhatAnotherPartOwns(t *testing.T) {
+	p := &Partition{
+		Of: map[int]Part{
+			1: PartCatalog,
+			2: PartFirstPage, // the page object
+			3: PartFirstPage, // its content stream
+			9: PartOther,     // the page tree, which page 1 reaches
+		},
+		// ⛔ The set names object 9, as a page's reach would.
+		Pages:       [][]int{{2, 3, 9}},
+		PageObjects: []int{2},
+	}
+	got, err := p.Order()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{1, 2, 3, 9}
+	if len(got) != len(want) {
+		t.Fatalf("Order() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Order() = %v, want %v — object 9 was pulled into part 6, or "+
+				"dropped", got, want)
+		}
+	}
+}
+
+// ⛔⛔ A PART-6 OR PART-7 OBJECT NO PAGE CLAIMS IS A REFUSAL, which is the
+// refusal the page-major ordering needs and the one every hand-built Partition
+// in this suite had to be corrected for.
+//
+// ⛔ Of says "belongs to exactly one page that is not the first" for part 7, so
+// if Pages disagrees with Of then one of them is wrong. Emitting the object
+// anyway would drop it between two pages' runs and break the consecutive
+// numbering the ordering exists to create — and qpdf would then measure one
+// page against another page's bytes, which is exactly the defect that made this
+// ordering necessary.
+func TestOrderRefusesAPageObjectItCannotPlace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    *Partition
+		want string
+	}{
+		{
+			name: "a part-6 object outside every page's set",
+			p: &Partition{
+				Of:          map[int]Part{1: PartCatalog, 2: PartFirstPage, 3: PartFirstPage},
+				Pages:       [][]int{{2}},
+				PageObjects: []int{2},
+			},
+			want: "no page claims it",
+		},
+		{
+			name: "a part-7 object outside every page's set",
+			p: &Partition{
+				Of: map[int]Part{1: PartCatalog, 2: PartFirstPage,
+					3: PartOtherPrivate, 4: PartOtherPrivate},
+				Pages:       [][]int{{2}, {3}},
+				PageObjects: []int{2, 3},
+			},
+			want: "no page claims it",
+		},
+		{
+			name: "a page with an object set and no page object",
+			p: &Partition{
+				Of:          map[int]Part{1: PartCatalog, 2: PartFirstPage},
+				Pages:       [][]int{{2}},
+				PageObjects: nil,
+			},
+			want: "no page object",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.p.Order()
+			if !errors.Is(err, ErrCannotLayOut) {
+				t.Fatalf("it was laid out anyway: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("refused, but not for %q: %v", tc.want, err)
+			}
+		})
 	}
 }
 

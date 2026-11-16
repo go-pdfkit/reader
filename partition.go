@@ -86,6 +86,25 @@ type Partition struct {
 	// ⛔ A page's own object is included, because item 1 counts it: qpdf
 	// reports 4 objects for a page whose reach is 3.
 	Pages [][]int
+
+	// PageObjects[i] is page i+1's own page object, in this document's
+	// numbering.
+	//
+	// ⛔⛔ Pages[i][0] IS NOT IT, which is why this field exists. Pages[i] is
+	// built with the page's own object first and then SORTED, so its index 0
+	// is the lowest object number — and on the fixtures here that usually IS
+	// the page, so code assuming it would measure correctly on every shape in
+	// the corpus and be wrong on a document whose content stream is numbered
+	// below its page.
+	//
+	// ⛔⛔ AND THE LAYOUT NEEDS IT, not just the hint tables. qpdf's checker
+	// computes a page's length by taking the page object's number and the next
+	// nobjects-1 CONSECUTIVE numbers and summing their lengths
+	// (QPDF_linearization.cc, Lin::lengthNextN) — so a page whose objects are
+	// not numbered consecutively from its page object is measured against
+	// objects belonging to something else. Order uses this to emit each page's
+	// own object first.
+	PageObjects []int
 }
 
 // ErrCannotPartition reports a document this package declines to place.
@@ -273,6 +292,10 @@ func (d *Document) Partition() (*Partition, error) {
 	// part is not final until this point. Filtering early would have kept the
 	// catalogue in page one's set.
 	perPage := make([][]int, len(pages))
+	pageObjects := make([]int, len(pages))
+	for i := range pages {
+		pageObjects[i] = pages[i].Num
+	}
 	for i, reach := range reaches {
 		want := PartOtherPrivate
 		if i == 0 {
@@ -299,6 +322,7 @@ func (d *Document) Partition() (*Partition, error) {
 		FirstPage:       1,
 		FirstPageObject: first.Num,
 		Pages:           perPage,
+		PageObjects:     pageObjects,
 	}, nil
 }
 

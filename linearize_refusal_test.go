@@ -178,6 +178,7 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 		p := &Partition{
 			Of:              map[int]Part{1: PartCatalog},
 			Pages:           [][]int{{1}},
+			PageObjects:     []int{1},
 			FirstPageObject: 1,
 		}
 		_, err := d.linearizeFrom(p)
@@ -200,6 +201,7 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 		p := &Partition{
 			Of:              map[int]Part{1: PartCatalog, 4: PartFirstPage},
 			Pages:           [][]int{{4}},
+			PageObjects:     []int{4},
 			FirstPageObject: 4,
 		}
 		_, err := d.linearizeFrom(p)
@@ -218,6 +220,7 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 		p := &Partition{
 			Of:              map[int]Part{1: PartCatalog, 9: PartOther},
 			Pages:           [][]int{{1}},
+			PageObjects:     []int{1},
 			FirstPageObject: 1,
 		}
 		_, err := d.linearizeFrom(p)

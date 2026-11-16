@@ -108,6 +108,15 @@ func (d *Document) documentID(v Object) Object {
 	return out
 }
 
+// ⛔ A SEAM, for the same reason as writePageOffset: buildHintTables refuses a
+// page list that is empty, a page with no objects, an extent that runs backwards
+// and a first-page offset below the hint stream's length — and the emission
+// supplies none of those. Every page has its own object, the extents come from
+// a buffer that only grows, and the hint stream is written BEFORE the first
+// page, so its length is always under that page's offset. The propagation stays
+// because a caller outside this file would not have those guarantees.
+var buildHint = buildHintTables
+
 // Linearize writes a linearized copy of the document: ISO 32000-1 Annex F's
 // eleven parts, with the parameter dictionary at the front and the first-page
 // cross-reference section before the objects a reader needs first.
@@ -243,6 +252,13 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 type linMeasured struct {
 	params     linParams
 	mainXrefAt int64 // where the main table's `xref` keyword is, for /Prev
+
+	// hint is the encoded hint tables this pass's extents imply, and hintS is
+	// /S within them. ⛔ They are CONTENT carried between passes, not an
+	// offset, which makes them the one thing here that could change the file's
+	// shape — see the write site for why the length cannot.
+	hint  []byte
+	hintS int
 }
 
 // emitLinearized writes the file once with the parameters it is given, and
@@ -385,6 +401,7 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	}
 
 	offsets := make([]int, len(order)+3)
+	ends := make([]int, len(order)+3)
 	hintAt, hintLen := 0, 0
 	// ⛔⛔ THREE PHASES AND NOT A CONDITIONAL INSIDE THE LOOP. The first version
 	// placed part 5 when the index reached firstPageCount, and carried a
@@ -417,6 +434,11 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 		fmt.Fprintf(&buf, "%d 0 obj\n", num[old])
 		buf.Write(AppendObject(nil, renumber(o, num)))
 		buf.WriteString("\nendobj\n")
+		// ⛔ THE END IS RECORDED TOO, because the hint tables are about EXTENTS
+		// and the start alone cannot give a length. The next object's start is
+		// not the answer: part 5 sits between parts 4 and 6, so object
+		// catalogueCount's "next start" is on the far side of the hint stream.
+		ends[num[old]] = buf.Len()
 
 		// /E is the end of the first page: the last byte of part 6.
 		if p.Of[old] == PartFirstPage || p.Of[old] == PartCatalog {
@@ -452,8 +474,26 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// been received — by which time they have nothing left to accelerate.
 	// Ghostscript's placement is legal (F.3.1 permits either side, which is why
 	// the reader handles both) and it is not the one to copy.
+	// ⛔⛔ THE HINT STREAM IS WRITTEN FROM THE PREVIOUS PASS'S TABLES, which is
+	// the one place in this writer where the CONTENT and not merely a number
+	// comes from the pass before. Its length cannot depend on the pass, or
+	// everything after it would move; buildHintTables guarantees that by fixing
+	// the three byte-measured widths, and `hintData` below is the same call with
+	// the byte extents still at zero, so pass 0 and pass 1 produce the same
+	// number of bytes from the same code.
+	hintTables, hintS := prev.hint, prev.hintS
+	if hintTables == nil {
+		// ⛔ Zero for both offsets: with no bytes measured yet there is no first
+		// page offset to state, and 0 >= 0 satisfies the refusal that stops
+		// item 2 going negative. Only the LENGTH of this call's result is used.
+		t, s, err := buildHint(blankExtents(p), 0, 0)
+		if err != nil {
+			return nil, linMeasured{}, err
+		}
+		hintTables, hintS = t, s
+	}
 	hintAt = buf.Len()
-	hintLen = writeHintStreamPlaceholder(&buf, paramNum+1)
+	hintLen = writeHintStream(&buf, paramNum+1, hintTables, hintS)
 
 	// Part 6: the first page.
 	for _, old := range order[catalogueCount:firstPageCount] {
@@ -503,30 +543,151 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	}
 	copy(out[entriesAt:], entries.Bytes())
 
+	// The tables THIS pass's bytes imply, for the next pass to write. ⛔ Built
+	// after the whole file exists, because a page's extent is not known until
+	// its last object has been written.
+	nextHint, nextS, err := buildHint(
+		d.measurePages(p, num, offsets, ends), offsets[num[p.FirstPageObject]], hintLen)
+	if err != nil {
+		return nil, linMeasured{}, err
+	}
+
 	measured := in
 	measured.L = int64(len(out))
 	measured.H0 = int64(hintAt)
 	measured.H1 = int64(hintLen)
 	measured.T = int64(mainFirstEntry)
-	return out, linMeasured{params: measured, mainXrefAt: int64(mainAt)}, nil
+	return out, linMeasured{
+		params:     measured,
+		mainXrefAt: int64(mainAt),
+		hint:       nextHint,
+		hintS:      nextS,
+	}, nil
 }
 
-// writeHintStreamPlaceholder writes part 5 as a stream that parses and holds no
-// valid hint tables, and returns its length in bytes.
+// writeHintStream writes part 5: the primary hint stream, holding the two tables
+// Table F.2 requires, with /S at the shared object hint table.
 //
-// ⛔⛔ IT IS A PLACEHOLDER AND SAYS SO. Writing real tables needs the per-page
-// byte extents of the file being emitted, which is the step after this one;
-// emitting them half-right would make `qpdf --check` report a hint-table
-// problem that this code could not distinguish from a layout problem. A stream
-// of zeroes is refused by the table reader for a reason it names, which is the
-// honest state to be in.
-func writeHintStreamPlaceholder(buf *bytes.Buffer, num int) int {
-	const body = 36 + 24 // Table F.3's header plus Table F.5's, both zeroed
+// ⛔ THE DATA IS WRITTEN RAW AND /Length IS ITS LENGTH. F.3.6 permits a filter
+// here and this writer uses none, so a reader needs no decode step to reach the
+// tables — which is the point of a structure whose whole job is to be read
+// before the rest of the file arrives.
+func writeHintStream(buf *bytes.Buffer, num int, data []byte, s int) int {
 	start := buf.Len()
-	fmt.Fprintf(buf, "%d 0 obj\n<< /Length %d /S %d >>\nstream\n", num, body, 36)
-	buf.Write(bytes.Repeat([]byte{0}, body))
+	fmt.Fprintf(buf, "%d 0 obj\n<< /Length %d /S %d >>\nstream\n", num, len(data), s)
+	buf.Write(data)
 	buf.WriteString("\nendstream\nendobj\n")
 	return buf.Len() - start
+}
+
+// blankExtents gives every page its real object COUNT and no byte extent, which
+// is what the first pass has to work with.
+//
+// ⛔⛔ THE COUNTS ARE REAL AND THAT IS WHAT MAKES THE LENGTH RIGHT. Table F.3's
+// item 3 is a width derived from the object counts, so a first pass that passed
+// zeros there could choose a narrower width than the second and the stream would
+// change size between them. The counts do not depend on any offset, so they are
+// known now and they are the same on both passes.
+func blankExtents(p *Partition) []pageExtent {
+	out := make([]pageExtent, len(p.Pages))
+	for i, objs := range p.Pages {
+		out[i] = pageExtent{objects: len(objs)}
+	}
+	return out
+}
+
+// measurePages turns the offsets this pass recorded into one extent per page.
+//
+// ⛔ A PAGE'S EXTENT IS THE SPAN OF ITS OBJECTS, taken as a minimum and a
+// maximum rather than as "the first object's start to the last object's end".
+// Order sorts each part's segment by object number, and a page's objects are not
+// guaranteed to be numbered in the order they are emitted, so the first in the
+// slice need not be the earliest in the file.
+func (d *Document) measurePages(p *Partition, num map[int]int, offsets, ends []int) []pageExtent {
+	out := make([]pageExtent, len(p.Pages))
+	for i, objs := range p.Pages {
+		e := pageExtent{objects: len(objs)}
+		for j, old := range objs {
+			n := num[old]
+			if j == 0 || offsets[n] < e.start {
+				e.start = offsets[n]
+			}
+			if j == 0 || ends[n] > e.end {
+				e.end = ends[n]
+			}
+			// ⛔⛔ THE LENGTH IS A SUM OF THE OBJECTS, NOT THE EXTENT, because
+			// that is what the only checker in existence compares it against:
+			// Lin::lengthNextN sums (end - start) per object and never counts
+			// the gaps between them. With the page-major ordering the two
+			// agree, since a page's objects are now adjacent — but they agree
+			// by consequence, and the first version of this code took the
+			// extent and matched on one page out of two by arithmetic
+			// coincidence.
+			e.length += ends[n] - offsets[n]
+		}
+		// ⛔ THE CONTENT STREAMS ARE FOUND THROUGH THE PAGE, not by guessing
+		// which of the page's objects is a stream. A page's object set holds
+		// whatever it reaches — annotations, fonts, an /XObject — and Table
+		// F.4's items 6 and 7 name the content stream specifically.
+		for j, c := range d.contentNumbers(p, i) {
+			n := num[c]
+			if j == 0 || offsets[n] < e.contentStart {
+				e.contentStart = offsets[n]
+			}
+			if j == 0 || ends[n] > e.contentEnd {
+				e.contentEnd = ends[n]
+			}
+			e.hasContent = true
+		}
+		out[i] = e
+	}
+	return out
+}
+
+// contentNumbers returns the object numbers of page i's content streams, in the
+// document's own numbering, keeping only those the page's own object set holds.
+//
+// ⛔ THE FILTER IS NOT A FORMALITY. /Contents could name an object the partition
+// assigned elsewhere, or one that does not exist; an extent computed from an
+// offset outside the page would make items 6 and 7 describe bytes that are not
+// the page's, and `renumber` has already turned an unplaced reference into null.
+func (d *Document) contentNumbers(p *Partition, i int) []int {
+	mine := make(map[int]bool, len(p.Pages[i]))
+	for _, old := range p.Pages[i] {
+		mine[old] = true
+	}
+
+	// ⛔⛔ PageObjects AND NOT Pages[i][0]. Partition puts the page's own object
+	// first in the set and then SORTS it, so index 0 is the lowest object
+	// number — which on these fixtures usually IS the page, so the assumption
+	// would have measured right on every shape in the corpus and been wrong on
+	// a document whose content stream was numbered below its page.
+	if i >= len(p.PageObjects) {
+		return nil
+	}
+	page, err := d.Get(Ref{Num: p.PageObjects[i]})
+	if err != nil {
+		return nil
+	}
+	dict, ok := ToDict(page)
+	if !ok {
+		return nil
+	}
+
+	var out []int
+	switch c := dict["Contents"].(type) {
+	case Ref:
+		if mine[c.Num] {
+			out = append(out, c.Num)
+		}
+	case Array:
+		for _, v := range c {
+			if r, isRef := v.(Ref); isRef && mine[r.Num] {
+				out = append(out, r.Num)
+			}
+		}
+	}
+	return out
 }
 
 // pushInherited copies the page attributes a page INHERITS onto the page
