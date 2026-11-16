@@ -172,7 +172,7 @@ func TestAStatedLengthTheFileDoesNotHaveIsRefused(t *testing.T) {
 		was := tables.pages[0].Length
 		tables.pages[0].Length = was + 7
 
-		err = checkHintLengths(b, d, lin, tables)
+		_, err = checkHintLengths(b, d, lin, tables)
 		if !errors.Is(err, ErrHintTablesInvalid) {
 			t.Fatalf("a page length seven bytes out was accepted: %v", err)
 		}
@@ -194,7 +194,7 @@ func TestAStatedLengthTheFileDoesNotHaveIsRefused(t *testing.T) {
 		was := tables.sharedGroups[0].Length
 		tables.sharedGroups[0].Length = was + 3
 
-		err = checkHintLengths(b, d, lin, tables)
+		_, err = checkHintLengths(b, d, lin, tables)
 		if !errors.Is(err, ErrHintTablesInvalid) {
 			t.Fatalf("a group length three bytes out was accepted: %v", err)
 		}
@@ -269,9 +269,28 @@ func TestTheLengthCheckSaysHowMuchItMeasured(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		// ⛔⛔ Linearized MEASURES NOTHING, AND SAYS SO. This is the half a pair
+		// of counters cannot express: 0 checked from here is indistinguishable
+		// from 0 checked by a CheckLinearized that found every span
+		// compressed. HasOverflowHint exists in this same struct for exactly
+		// that reason — "zero is a legitimate-looking value for an offset that
+		// was never written" — and the first version of these fields ignored
+		// the precedent sitting forty lines above them.
+		read, err := Linearized(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if read.LengthsMeasured {
+			t.Error("Linearized claims to have measured the lengths")
+		}
+
 		lin, err := CheckLinearized(b)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if !lin.LengthsMeasured {
+			t.Error("CheckLinearized does not say it measured the lengths")
 		}
 		if lin.LengthsChecked == 0 {
 			t.Error("it reports nothing checked for a file qpdf accepts")
@@ -291,14 +310,28 @@ func TestTheLengthCheckSaysHowMuchItMeasured(t *testing.T) {
 		lin := &Linearization{FirstPageObject: 1}
 		tables := &hintTables{pages: []pageEntry{{NObjects: 2, Length: 123456}}}
 
-		if err := checkHintLengths(d.buf, d, lin, tables); err != nil {
+		tally, err := checkHintLengths(d.buf, d, lin, tables)
+		if err != nil {
 			t.Fatalf("a compressed span was refused: %v", err)
 		}
 		// ⛔ THE POINT: nil, and nothing checked. A caller reading only the
 		// error would believe 123456 had been confirmed.
-		if lin.LengthsChecked != 0 || lin.LengthsSkipped != 1 {
+		if tally.checked != 0 || tally.skipped != 1 {
 			t.Errorf("it reports %d checked and %d skipped, want 0 and 1",
-				lin.LengthsChecked, lin.LengthsSkipped)
+				tally.checked, tally.skipped)
+		}
+
+		// ⛔⛔ AND A SECOND RUN DOES NOT ADD UP, which the first version got
+		// wrong: the loops incremented through the Linearization and nothing
+		// reset them, so the counts described how many times the function had
+		// been CALLED. A test in this file reused one across three calls and
+		// triple-counted in silence.
+		again, err := checkHintLengths(d.buf, d, lin, tables)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again != tally {
+			t.Errorf("a second run reports %+v where the first reported %+v", again, tally)
 		}
 	})
 
@@ -318,12 +351,13 @@ func TestTheLengthCheckSaysHowMuchItMeasured(t *testing.T) {
 			sharedGroups: []sharedGroup{{NObjects: 2, Length: 99999}},
 		}
 
-		if err := checkHintLengths(d.buf, d, lin, tables); err != nil {
+		tally, err := checkHintLengths(d.buf, d, lin, tables)
+		if err != nil {
 			t.Fatalf("a compressed group span was refused: %v", err)
 		}
-		if lin.LengthsChecked != 0 || lin.LengthsSkipped != 1 {
+		if tally.checked != 0 || tally.skipped != 1 {
 			t.Errorf("it reports %d checked and %d skipped, want 0 and 1",
-				lin.LengthsChecked, lin.LengthsSkipped)
+				tally.checked, tally.skipped)
 		}
 	})
 }
@@ -458,7 +492,7 @@ func TestEveryWayTheLengthCheckRefuses(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkHintLengths(tc.b, tc.doc, tc.lin, tc.tables)
+			_, err := checkHintLengths(tc.b, tc.doc, tc.lin, tc.tables)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("this shape is meant to be accepted and was refused: %v", err)

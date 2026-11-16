@@ -68,21 +68,30 @@ type Linearization struct {
 	// PageCount is /N, the number of pages in the document.
 	PageCount int
 
+	// LengthsMeasured says whether the hint tables' lengths were looked at at
+	// all. [CheckLinearized] sets it; [Linearized] leaves it false.
+	//
+	// ⛔⛔ IT EXISTS FOR THE REASON HasOverflowHint DOES, and the first version
+	// of these fields had to learn that from this very struct. A count of zero
+	// is a legitimate-looking value for a measurement that never ran: a
+	// Linearization from [Linearized] reports 0 checked because nothing checked
+	// it, and one from [CheckLinearized] can report 0 because every span was
+	// inside an object stream. Documenting the difference is not the same as
+	// making it unrepresentable.
+	LengthsMeasured bool
+
 	// LengthsChecked and LengthsSkipped count the hint-table lengths
-	// CheckLinearized held against the file, and those it could not measure.
+	// [CheckLinearized] held against the file, and those it could not measure.
+	// They mean nothing unless LengthsMeasured is true.
 	//
-	// ⛔⛔ THEY EXIST BECAUSE nil ALONE IS AMBIGUOUS. An object inside an object
-	// stream has no offset of its own, so a span containing one is not measured
-	// — and a file whose page objects are ALL compressed therefore returns
-	// exactly what a fully verified file returns. A caller depending on "the
-	// lengths were checked" cannot tell those apart from the error alone.
+	// ⛔ A span is not measured when it contains an object inside an object
+	// stream: such an object has no offset of its own, and qpdf substitutes its
+	// CONTAINER's, so several objects would measure from one byte. That is its
+	// accounting rather than a fact about the file, so the span is skipped.
 	//
-	// ⚠ LengthsChecked is 0 for a file read by [Linearized] rather than
-	// [CheckLinearized]: nothing was checked, which is the honest answer rather
-	// than an omission. A non-zero LengthsSkipped is not a defect in the file —
-	// object streams are legal in a linearized document and F.4 says nothing
-	// against them — it is the measurement declining to claim what it cannot
-	// see.
+	// ⚠ A non-zero LengthsSkipped is NOT a defect in the file. Object streams
+	// are legal in a linearized document and F.4 says nothing against them; it
+	// is the measurement declining to claim what it cannot see.
 	LengthsChecked, LengthsSkipped int
 
 	// MainXrefOffset is /T. For a file with a traditional cross-reference
@@ -344,9 +353,15 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	// two are different questions: every width can be in range, every entry
 	// inside the stream, and a page length still be a number the page does not
 	// have.
-	if err := checkHintLengths(b, d, lin, tables); err != nil {
+	tally, err := checkHintLengths(b, d, lin, tables)
+	if err != nil {
 		return nil, err
 	}
+	// ⛔ ASSIGNED, and LengthsMeasured set unconditionally: a caller must be
+	// able to tell "nothing was measurable" from "nothing measured it", which a
+	// pair of zeroes cannot say on its own.
+	lin.LengthsMeasured = true
+	lin.LengthsChecked, lin.LengthsSkipped = tally.checked, tally.skipped
 	return lin, nil
 }
 

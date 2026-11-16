@@ -27,14 +27,28 @@ import "fmt"
 // it rejects readable PDFs, which is #52's scar (a work budget that refused a
 // 150 000-page file) and #59's (a bound that refused an ordinary document
 // sharing three fonts).
-// ⛔ IT RECORDS WHAT IT MEASURED on the Linearization, because returning nil
-// alone cannot distinguish "every length agreed" from "no length could be
-// measured" — see LengthsChecked.
-func checkHintLengths(b []byte, d *Document, lin *Linearization, t *hintTables) error {
-	if err := checkPageLengths(b, d, lin, t); err != nil {
-		return err
+// ⛔ IT RETURNS WHAT IT MEASURED rather than incrementing the Linearization,
+// because returning nil alone cannot distinguish "every length agreed" from "no
+// length could be measured" — see LengthsMeasured.
+//
+// ⛔⛔ RETURNED AND NOT ACCUMULATED, which the first version got wrong: the
+// loops incremented through the pointer and nothing reset them, so the counts
+// described how many times the function had been CALLED with that
+// Linearization rather than anything about the file. A test in this package
+// already reused one across three calls and triple-counted; nothing asserted
+// the numbers, which is the only reason it was invisible.
+func checkHintLengths(b []byte, d *Document, lin *Linearization, t *hintTables) (lengthTally, error) {
+	var tally lengthTally
+	if err := checkPageLengths(b, d, lin, t, &tally); err != nil {
+		return tally, err
 	}
-	return checkGroupLengths(b, d, lin, t)
+	err := checkGroupLengths(b, d, lin, t, &tally)
+	return tally, err
+}
+
+// lengthTally is what one run measured: a value, so two runs cannot add up.
+type lengthTally struct {
+	checked, skipped int
 }
 
 // ⛔⛔ THERE IS NO SEAM HERE, AND THE REASONING THAT WANTED ONE WAS FALSE. A
@@ -65,7 +79,8 @@ func checkHintLengths(b []byte, d *Document, lin *Linearization, t *hintTables) 
 // ⛔ So a checker that summed "the objects this page reaches" would disagree
 // with qpdf on exactly the files qpdf complains about, and would be measuring a
 // different quantity under the same name.
-func checkPageLengths(b []byte, d *Document, lin *Linearization, t *hintTables) error {
+func checkPageLengths(b []byte, d *Document, lin *Linearization, t *hintTables,
+	tally *lengthTally) error {
 	refs := d.pageRefs()
 	for i, e := range t.pages {
 		if i >= len(refs) {
@@ -78,10 +93,10 @@ func checkPageLengths(b []byte, d *Document, lin *Linearization, t *hintTables) 
 		}
 		if !ok {
 			// ⚠ Not measurable the way qpdf measures it — see spanLength.
-			lin.LengthsSkipped++
+			tally.skipped++
 			continue
 		}
-		lin.LengthsChecked++
+		tally.checked++
 		if int(e.Length) != total {
 			return fmt.Errorf("%w: page %d's entry says %d bytes and its %d object(s) from "+
 				"object %d occupy %d", ErrHintTablesInvalid, i+1, e.Length, e.NObjects,
@@ -105,7 +120,8 @@ func checkPageLengths(b []byte, d *Document, lin *Linearization, t *hintTables) 
 // 9 at bytes 677, 773 and 886 and the first page ending at 917. 773-677 = 96,
 // 886-773 = 113, 917-886 = 31. The three groups are the first page's own
 // objects, which is why "the shared table describes part 8" is false.
-func checkGroupLengths(b []byte, d *Document, lin *Linearization, t *hintTables) error {
+func checkGroupLengths(b []byte, d *Document, lin *Linearization, t *hintTables,
+	tally *lengthTally) error {
 	if t.shared == nil {
 		return nil
 	}
@@ -127,9 +143,9 @@ func checkGroupLengths(b []byte, d *Document, lin *Linearization, t *hintTables)
 			return err
 		}
 		if !ok {
-			lin.LengthsSkipped++
+			tally.skipped++
 		} else {
-			lin.LengthsChecked++
+			tally.checked++
 			if int(g.Length) != total {
 				return fmt.Errorf("%w: shared group %d says %d bytes and its %d object(s) "+
 					"from object %d occupy %d", ErrHintTablesInvalid, i, g.Length, count,
