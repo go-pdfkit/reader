@@ -892,28 +892,49 @@ describing it wrongly. Filling that table is a partition question — qpdf repor
 
 ### ⛔⛔⛔ And that refusal is far wider than "pages sharing a content stream"
 
-Sharing a content stream is the rare case. Table 30 lets a page inherit
-`/Resources`, `/MediaBox`, `/CropBox` and `/Rotate` from the page tree, and the
-writer pushes those down because F.3.7 needs part 6 self-contained. So a document
-is refused **iff an inheritable indirect value is inherited by more than one
-page** — and one shared resource dictionary on the page tree node is the ordinary
-way to write a multi-page PDF, so a large share of real files are refused today.
+The rule is about **sharing**, and nothing else:
 
-⛔ **"Multi-page with an indirect inherited value" is NOT the rule**, and that is
-what this table said until a three-level fixture refuted it. What matters is how
-many pages inherit the *same* object, not how many pages the document has:
+> refused iff an object a page after the first reaches is **also** reached by the
+> first page or by another page
+
+⛔ **Two narrower rules were written here first and both were wrong**, which is
+why this one is stated in terms of *reaching* rather than of any mechanism:
+
+- *"a multi-page document with an indirect inherited value"* — refuted by a
+  three-level tree whose sub-node carries the reference with exactly **one** page
+  under it: that object is part 7, private to that page, and accepted.
+- *"an inheritable indirect value inherited by more than one page"* — only
+  **sufficient**. Refuted by a page that states its *own* `/Resources` naming the
+  node's object under `/XObject` while the other page inherits it: exactly one
+  page inherits, and the object is shared all the same.
+
+⛔⛔ **Inheritance is a route by which a page reaches an object**, not a separate
+case. Table 30 lets a page omit `/Resources`, `/MediaBox`, `/CropBox` and
+`/Rotate`, and the writer pushes those down because F.3.7 needs part 6
+self-contained — so an inherited reference makes the page reach that object
+exactly as naming it would. It matters here only because it is the route that is
+easy to miss: one shared resource dictionary on the page tree node is the
+ordinary way to write a multi-page PDF, so a large share of real files are
+refused today.
 
 | shape | accepted? |
 |---|---|
 | one page, inherited indirect `/Resources` | **yes** — nothing to share with |
-| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object |
-| multi-page, each page states its own `/Resources` | **yes** |
+| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object to reach |
+| multi-page, each page naming a **different** `/Resources` object | **yes** — nothing shared |
 | a **sub-node**'s indirect `/Resources` with **one** page under it | **yes** — part 7, private to that page |
 | a **sub-node**'s indirect `/Resources` with **two** pages under it | **no** — part 8, shared |
 | flat multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
+| one page inherits it, the other reaches it via its **own** `/Resources` | **no** — one inheritor, still shared |
+| two pages naming the **same** `/Resources` object, no inheritance at all | **no** — stating your own is not a cure |
 
-⛔ Every fixture in that table but the two sub-node rows is a **flat** page tree,
-which is exactly why the boundary was mis-stated: a flat tree cannot express
+⚠ **"Each page states its own" is not an exemption**, and that row above says
+"a different object" for a reason: the earlier wording passed for an unstated
+second reason — the fixture gave each page a distinct object. Stating your own
+removes the *inheritance* route, not the sharing.
+
+⛔ Every fixture but the two sub-node rows is a **flat** page tree, which is
+exactly why the first boundary was mis-stated: a flat tree cannot express
 "inherited by one page out of several". The accepting rows carry more weight than
 the refusing ones — without them a stricter reach would refuse everything and the
 suite would stay green.

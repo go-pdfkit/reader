@@ -340,6 +340,69 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 		return plain
 	}
 
+	// ⛔⛔ A PAGE THAT STATES ITS OWN /Resources AND NAMES THE INHERITED OBJECT
+	// INSIDE IT. Page 1 inherits nothing — it has its own /Resources — but that
+	// dictionary names the node's object under /XObject, and page 2 inherits it.
+	// So EXACTLY ONE page inherits the value and the document is still shared,
+	// which is why "inherited by more than one page" is only a SUFFICIENT
+	// condition and not the rule.
+	viaOwnResources := func(t *testing.T) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		pagesRef := w.Reserve()
+		shared := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+
+		c1 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (a) Tj ET")})
+		c2 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (b) Tj ET")})
+		// Page 1 states its own /Resources — and reaches the node's object
+		// through it.
+		first := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c1,
+			"Resources": Dict{"XObject": shared}})
+		// Page 2 states nothing and inherits the node's /Resources.
+		second := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c2})
+
+		w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{first, second},
+			"Count":     Integer(2),
+			"Resources": shared,
+			"MediaBox":  Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
+	// ⛔⛔ TWO PAGES STATING THE SAME /Resources OBJECT, with no inheritance
+	// anywhere. "Each page states its own" is NOT an exemption: the cure is not
+	// sharing, and stating your own only removes the INHERITANCE route. The
+	// accepting row above passes because its two objects DIFFER, which was a
+	// second, unstated reason.
+	sameOwnResources := func(t *testing.T) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		pagesRef := w.Reserve()
+		res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+
+		kids := make(Array, 0, 2)
+		for i := 0; i < 2; i++ {
+			c := w.Add(&Stream{Dict: Dict{},
+				Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i+1))})
+			kids = append(kids, w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+				"Contents": c, "Resources": res}))
+		}
+		w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": kids, "Count": Integer(2),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
 	for _, tc := range []struct {
 		name   string
 		plain  func(*testing.T) []byte
@@ -348,6 +411,18 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 		// sharing is not caused by inheritance and naming one would be false.
 		key string
 	}{
+		{
+			name:   "one page inherits the object the other reaches through its own /Resources",
+			plain:  viaOwnResources,
+			accept: false,
+			key:    "/Resources", // the inherited value IS the shared object
+		},
+		{
+			name:   "two pages stating the SAME /Resources object, no inheritance",
+			plain:  sameOwnResources,
+			accept: false,
+			key:    "", // nothing was inherited, so no key may be blamed
+		},
 		{
 			name:   "one page inheriting an indirect /Resources",
 			plain:  func(t *testing.T) []byte { return indirect(t, 1, false) },
@@ -376,7 +451,11 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 			accept: true, // an inline /MediaBox array adds no object
 		},
 		{
-			name:   "two pages each stating their own /Resources",
+			// ⛔ "EACH STATING THEIR OWN" WAS THE OLD NAME AND IT NAMED THE
+			// WRONG REASON. This passes because the two objects DIFFER, not
+			// because the pages state them — the row below, where both state
+			// the SAME object, is refused.
+			name:   "two pages each naming a DIFFERENT /Resources object",
 			plain:  func(t *testing.T) []byte { return indirect(t, 2, true) },
 			accept: true,
 		},

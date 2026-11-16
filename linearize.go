@@ -139,25 +139,36 @@ var buildHint = buildHintTables
 // so the writer returns an error naming the objects instead. Filling that table
 // is a partition question, not a table one, and it is #61.
 //
-// ⛔⛔⛔ THAT SCOPE IS WIDER THAN IT SOUNDS, AND SHARING A CONTENT STREAM IS THE
-// RARE CASE. Table 30 lets a page inherit /Resources, /MediaBox, /CropBox and
-// /Rotate from the page tree, and the writer pushes those down because F.3.7
-// needs part 6 self-contained. The rule is:
+// ⛔⛔⛔ THE RULE IS ABOUT SHARING, AND NOTHING ELSE:
 //
-//	refused iff an inheritable INDIRECT value is inherited by MORE THAN ONE page
+//	refused iff an object a page after the first reaches is ALSO reached by
+//	the first page or by another page
 //
-// which is a large share of real multi-page PDFs, since one shared resource
-// dictionary on the page tree node is the ordinary way to write them.
+// ⛔ TWO NARROWER RULES WERE WRITTEN HERE FIRST AND BOTH WERE WRONG, which is
+// why this one is stated in terms of reaching rather than of any mechanism:
 //
-// ⛔ "MULTI-PAGE WITH AN INDIRECT INHERITED VALUE" IS NOT THE RULE, and that is
-// what this comment said until a three-level fixture refuted it: a sub-node
-// carrying an indirect /Resources with exactly ONE page under it puts that
-// object in part 7, private to that page, and the document is accepted. What
-// counts is how many pages inherit the SAME object, not how many pages exist.
+//   - "a multi-page document with an indirect inherited value" — refuted by a
+//     three-level tree whose sub-node carries the reference with exactly ONE
+//     page under it: that object is part 7, private to that page, accepted.
+//   - "an inheritable indirect value inherited by MORE THAN ONE page" — only
+//     SUFFICIENT. Refuted by a page that states its OWN /Resources naming the
+//     node's object under /XObject while the other page inherits it: exactly
+//     one page inherits, and the object is shared all the same.
 //
-// ⚠ Also unaffected: a one-page document, a document whose inheritable values
-// are DIRECT (an inline /MediaBox array adds no object), and one where each page
-// states its own.
+// ⛔⛔ INHERITANCE IS A ROUTE BY WHICH A PAGE REACHES AN OBJECT, not a separate
+// case. Table 30 lets a page omit /Resources, /MediaBox, /CropBox and /Rotate
+// and take an ancestor's, and the writer pushes those down because F.3.7 needs
+// part 6 self-contained — so an inherited reference makes the page reach that
+// object exactly as naming it would. It matters here only because it is the
+// route that is easy to miss: one shared resource dictionary on the page tree
+// node is the ordinary way to write a multi-page PDF, so a large share of real
+// files are refused.
+//
+// ⚠ AND "EACH PAGE STATES ITS OWN" IS NOT AN EXEMPTION. Two pages whose
+// /Resources is the SAME object are refused with no inheritance anywhere;
+// stating your own removes the inheritance route and not the sharing. What is
+// genuinely unaffected: a one-page document, and inheritable values that are
+// DIRECT, since an inline /MediaBox array adds no object to reach.
 //
 // ⚠ The error names the inheritable key only when THAT KEY'S OWN OBJECT is the
 // shared one. Asking merely "does this page inherit anything by reference"
