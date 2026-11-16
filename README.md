@@ -839,6 +839,49 @@ does **not** compare their *values* against the document. The page lengths and
 group lengths qpdf also reports on need the partition, and are the next step. So
 this closes "the tables are unreadable", not "the tables are wrong".
 
+### ⭐ And the values too — "the tables are wrong" is closed as well
+
+The paragraph above describes `CheckLinearized` before #61. It now also holds
+**Table F.4 item 2** (a page's length) and **Table F.6 item 1** (a shared group's)
+against the file.
+
+⛔ **The span is consecutive object numbers from the page object**, which is
+qpdf's definition rather than an obvious one: `Lin::lengthNextN` takes the page
+dictionary's number and the next *nobjects−1* **numbers** and sums each one's own
+length, never consulting which objects the page reaches. A checker summing *"what
+this page reaches"* would disagree with qpdf on exactly the files qpdf complains
+about — which the writer learned the hard way in the same arc.
+
+⛔ **The shared groups describe two runs**, not one: the first `nshared_first_page`
+of them are part 6's objects counted from `/O`, the rest part 8's counted from
+Table F.5 item 1. Measured on qpdf's own output — `nshared_first_page: 2`,
+`nshared_total: 3`, `first_shared_obj: 5` for `testdata/linearized-shared.pdf`,
+which is the one fixture that exercises both.
+
+⭐ **The oracle is qpdf from the other side.** On every file qpdf accepts, its
+silence means its own computed length equals the length the table states — so our
+figure matching the table *is* our figure matching qpdf's. Dropping the line
+ending after `endobj` (which Table F.1 counts and qpdf calls `end_after_space`)
+reddens **41 tests**, including the twelve-shape agreement suite, each off by
+exactly one byte per object.
+
+⚠ **A span inside an object stream is not measured**, and `LengthsMeasured`,
+`LengthsChecked` and `LengthsSkipped` say so — because such an object has no
+offset of its own and qpdf substitutes its *container's*, which is its accounting
+rather than a fact about the file. An object stream is legal here, so the file is
+not refused for it. The boolean exists for the reason `HasOverflowHint` does: a
+count of zero cannot distinguish "nothing was measurable" from "nothing measured
+it".
+
+⛔ **What #61 asked for and did not get:** the Ghostscript fixture refused *naming
+a length*. Its tables do not decode at all — the entries overrun `/S` by 26 bits —
+so no ordering reaches a length in that file. qpdf prints `computed = 252` for it
+because its decoder reads through the overrun; reading through it here would
+compare bits of the *shared* table reinterpreted as page lengths, refusing the
+right file for the wrong reason. The witness is a byte flipped in a file **this
+package wrote** instead, which is possible because our hint stream is unfiltered
+and item 2 is pinned at 32 bits.
+
 ⛔ **Two tests had to stop calling `CheckLinearized`,** which is worth stating
 rather than hiding in a diff. The Ghostscript fixture is the only producer here
 that puts `/H` after the first page (the witness for `/E`'s exclusion rule) and

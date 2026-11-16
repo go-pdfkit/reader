@@ -68,6 +68,32 @@ type Linearization struct {
 	// PageCount is /N, the number of pages in the document.
 	PageCount int
 
+	// LengthsMeasured says whether the hint tables' lengths were looked at at
+	// all. [CheckLinearized] sets it; [Linearized] leaves it false.
+	//
+	// ⛔⛔ IT EXISTS FOR THE REASON HasOverflowHint DOES, and the first version
+	// of these fields had to learn that from this very struct. A count of zero
+	// is a legitimate-looking value for a measurement that never ran: a
+	// Linearization from [Linearized] reports 0 checked because nothing checked
+	// it, and one from [CheckLinearized] can report 0 because every span was
+	// inside an object stream. Documenting the difference is not the same as
+	// making it unrepresentable.
+	LengthsMeasured bool
+
+	// LengthsChecked and LengthsSkipped count the hint-table lengths
+	// [CheckLinearized] held against the file, and those it could not measure.
+	// They mean nothing unless LengthsMeasured is true.
+	//
+	// ⛔ A span is not measured when it contains an object inside an object
+	// stream: such an object has no offset of its own, and qpdf substitutes its
+	// CONTAINER's, so several objects would measure from one byte. That is its
+	// accounting rather than a fact about the file, so the span is skipped.
+	//
+	// ⚠ A non-zero LengthsSkipped is NOT a defect in the file. Object streams
+	// are legal in a linearized document and F.4 says nothing against them; it
+	// is the measurement declining to claim what it cannot see.
+	LengthsChecked, LengthsSkipped int
+
 	// MainXrefOffset is /T. For a file with a traditional cross-reference
 	// table this is "the offset of the white-space character preceding the
 	// first entry of the main cross-reference table (the entry for object
@@ -313,13 +339,29 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	// page lengths and group lengths qpdf also reports on are the next step,
 	// and they need the partition. So this closes "the tables are unreadable"
 	// and not "the tables are wrong", and saying otherwise would overstate it.
-	if _, err := d.readHintTables(lin); err != nil {
+	tables, err := d.readHintTables(lin)
+	if err != nil {
 		// ⛔ %w TWICE, so the inner error stays matchable. errHintTable is
 		// unexported today and hinttable.go plans to export it, at which point
 		// %v would have silently flattened the one sentinel a caller would
 		// then want to test for. It costs nothing to wrap both now.
 		return nil, fmt.Errorf("%w: %w", ErrHintTablesInvalid, err)
 	}
+	// ⛔⛔ AND THEIR VALUES, which is the half the paragraph above says this
+	// does NOT check — it did not, until #61. Decoding answers "do the tables
+	// obey F.4's layout"; this answers "do they describe THIS file", and the
+	// two are different questions: every width can be in range, every entry
+	// inside the stream, and a page length still be a number the page does not
+	// have.
+	tally, err := checkHintLengths(b, d, lin, tables)
+	if err != nil {
+		return nil, err
+	}
+	// ⛔ ASSIGNED, and LengthsMeasured set unconditionally: a caller must be
+	// able to tell "nothing was measurable" from "nothing measured it", which a
+	// pair of zeroes cannot say on its own.
+	lin.LengthsMeasured = true
+	lin.LengthsChecked, lin.LengthsSkipped = tally.checked, tally.skipped
 	return lin, nil
 }
 
