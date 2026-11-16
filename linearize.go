@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrCannotLinearize reports a document this package declines to linearize.
@@ -108,28 +109,88 @@ func (d *Document) documentID(v Object) Object {
 	return out
 }
 
+// ⛔ A SEAM, for the same reason as writePageOffset: buildHintTables refuses a
+// page list that is empty, a page with no objects, an extent that runs backwards
+// and a first-page offset below the hint stream's length — and the emission
+// supplies none of those. Every page has its own object, the extents come from
+// a buffer that only grows, and the hint stream is written BEFORE the first
+// page, so its length is always under that page's offset. The propagation stays
+// because a caller outside this file would not have those guarantees.
+var buildHint = buildHintTables
+
 // Linearize writes a linearized copy of the document: ISO 32000-1 Annex F's
 // eleven parts, with the parameter dictionary at the front and the first-page
 // cross-reference section before the objects a reader needs first.
 //
-// ⛔⛔ THE HINT TABLES ARE NOT WRITTEN YET, AND THIS IS DELIBERATE RATHER THAN
-// UNFINISHED. #40 names five steps; this is the fifth, and splitting it is what
-// makes the layout measurable on its own. The file carries a hint stream that
-// is syntactically a stream and holds no valid tables, so:
+// The file carries the parameter dictionary, both cross-reference sections, and
+// a primary hint stream holding Table F.3's page offset table and Table F.5's
+// shared object hint table. `qpdf --check` reports no problem with it.
 //
-//	`qpdf --check` validates the parameters, both cross-reference sections,
-//	/O, /E, /T and the object structure — and reports the hint tables as
-//	wrong, which they are.
+// ⛔⛔ IT REFUSES A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT WITH AN EARLIER
+// ONE, and that is the one shape it cannot write. F.4.2's shared object hint
+// table is how a page after the first says which of part 6's and part 8's
+// objects it depends on; this writer emits a required but EMPTY one, which is
+// the truth for a document whose pages are independent and a contradiction for
+// one whose pages are not. Measured — two pages sharing a content stream gives
+// `qpdf --check`:
 //
-// ⭐ That isolation is the same move every earlier step used: the partition was
-// judged before the layout, the layout before the fixpoint, the encoder's bytes
-// before any file existed. A writer that emitted everything at once could only
-// be asked "is this file right", and qpdf's answer would name a hint-table
-// problem while a wrong /T sat underneath it.
+//	WARNING: page 1: shared object 3: in computed list but not hint table
 //
-// ⚠ So a file from this function is NOT a usable linearized PDF yet. The
-// guarantee it does carry is the one `qpdf --check` can confirm: the layout,
-// the parameters and the two cross-reference sections.
+// so the writer returns an error naming the objects instead. Filling that table
+// is a partition question, not a table one, and it is #61.
+//
+// ⛔⛔⛔ THE RULE IS ABOUT SHARING, AND NOTHING ELSE:
+//
+//	refused iff an object a page after the first reaches is ALSO reached by
+//	the first page or by another page — other than the CATALOGUE, which part 4
+//	delivers ahead of the first page
+//
+// ⛔ THE CATALOGUE EXCEPTION IS NOT A SPECIAL CASE IN THE CODE, which is why it
+// has to be in the sentence: `of[catNum] = PartCatalog` is assigned AFTER the
+// readers loop and overwrites whatever sharing would have made it, so Shared's
+// "part 6 or part 8" test cannot see it. And that is correct rather than
+// convenient — part 4 precedes part 6 and arrives with the first page, so a
+// later page depending on the catalogue needs no F.4.2 entry. Measured: two
+// pages each carrying /PieceInfo give Of[catalogue] = part 4, Shared empty, the
+// document accepted, and `qpdf --check` silent. Part 4 holds nothing but the
+// catalogue, so there is no second instance.
+//
+// ⛔ TWO NARROWER RULES WERE WRITTEN HERE FIRST AND BOTH WERE WRONG, which is
+// why this one is stated in terms of reaching rather than of any mechanism:
+//
+//   - "a multi-page document with an indirect inherited value" — refuted by a
+//     three-level tree whose sub-node carries the reference with exactly ONE
+//     page under it: that object is part 7, private to that page, accepted.
+//   - "an inheritable indirect value inherited by MORE THAN ONE page" — only
+//     SUFFICIENT. Refuted by a page that states its OWN /Resources naming the
+//     node's object under /XObject while the other page inherits it: exactly
+//     one page inherits, and the object is shared all the same.
+//
+// ⛔⛔ INHERITANCE IS A ROUTE BY WHICH A PAGE REACHES AN OBJECT, not a separate
+// case. Table 30 lets a page omit /Resources, /MediaBox, /CropBox and /Rotate
+// and take an ancestor's, and the writer pushes those down because F.3.7 needs
+// part 6 self-contained — so an inherited reference makes the page reach that
+// object exactly as naming it would. It matters here only because it is the
+// route that is easy to miss: one shared resource dictionary on the page tree
+// node is the ordinary way to write a multi-page PDF, so a large share of real
+// files are refused.
+//
+// ⚠ AND "EACH PAGE STATES ITS OWN" IS NOT AN EXEMPTION. Two pages whose
+// /Resources is the SAME object are refused with no inheritance anywhere;
+// stating your own removes the inheritance route and not the sharing. What is
+// genuinely unaffected: a one-page document, and inheritable values that are
+// DIRECT, since an inline /MediaBox array adds no object to reach.
+//
+// ⚠ The error names the inheritable key only when THAT KEY'S OWN OBJECT is the
+// shared one. Asking merely "does this page inherit anything by reference"
+// conflates two causes and can state a falsehood — see inheritedByReference.
+//
+// ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
+// defects were separable: the partition before the layout, the layout before the
+// fixpoint, the encoder's bytes before any file existed, and the layout before
+// the tables. A writer that emitted everything at once could only be asked "is
+// this file right", and qpdf's answer would have named a hint-table problem
+// while a wrong /T sat underneath it.
 func (d *Document) Linearize() ([]byte, error) {
 	p, err := d.Partition()
 	if err != nil {
@@ -151,6 +212,70 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 	order, err := p.Order()
 	if err != nil {
 		return nil, err
+	}
+
+	// ⛔⛔⛔ A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT IS REFUSED, BECAUSE THE
+	// SHARED OBJECT HINT TABLE IS NOT WRITTEN YET. F.4.2's table is how a page
+	// after the first says which of part 6's and part 8's objects it depends on,
+	// and this writer emits a required-but-EMPTY one. For a document where every
+	// page's objects are private that is the truth; for one where they are not,
+	// it is a hint table that contradicts the file.
+	//
+	// ⛔ MEASURED, and it is the reason this refusal exists rather than a
+	// comment: two pages sharing one content stream gives
+	//
+	//	WARNING: page 1: shared object 3: in computed list but not hint table
+	//
+	// from `qpdf --check`, while our own CheckLinearized accepts the file — so
+	// nothing in this package would have caught it.
+	//
+	// ⛔⛔ AND THE WHOLE JUDGED CORPUS MISSES IT. buildPages gives every page its
+	// own content stream, so part 6 holds nothing a later page reaches and
+	// `Shared` is empty on every shape the suite builds. The qpdf judge was
+	// green because the corpus could not express the case, which is the second
+	// time in this arc that a passing oracle meant "the fixture says nothing".
+	//
+	// ⚠ REFUSING IS THE HONEST OPTION, NOT THE AMBITIOUS ONE. Writing the table
+	// means deciding which part-6 objects are shared and in what order, which is
+	// a partition question — qpdf reports `nshared_total: 3` with part 8 EMPTY —
+	// and that is #61. A writer that returns an error here is worse than one that
+	// works and better than one that lies.
+	// ⛔ ONE ENTRY PER PAGE, CHECKED FIRST: a caller reaching linearizeFrom with
+	// a hand-built Partition can leave Shared nil for a document that does share
+	// objects, and the loop below would then find nothing to refuse. pageMajor
+	// already refuses the same shape for PageObjects.
+	if len(p.Shared) != len(p.Pages) {
+		return nil, fmt.Errorf("%w: the partition has %d page(s) and %d shared-object "+
+			"list(s), so it cannot say which pages share anything",
+			ErrCannotLinearize, len(p.Pages), len(p.Shared))
+	}
+	for i, s := range p.Shared {
+		if len(s) == 0 {
+			continue
+		}
+		// ⛔⛔ THE MESSAGE NAMES THE CAUSE, NOT ONLY THE OBJECT. Review found the
+		// first version reporting "page 2 shares object(s) [2]" for a document
+		// whose author never wrote object 2 into either page: it arrived by
+		// INHERITANCE, because the page tree node's /Resources is an indirect
+		// reference and the writer pushes it down. An object number the caller
+		// cannot find in their own source is not a diagnosis.
+		if keys := d.inheritedByReference(Ref{Num: p.PageObjects[i]}, s); len(keys) != 0 {
+			// ⛔ WITH THE SLASH, because that is how a PDF key is written and
+			// how the caller will search their own file for it. Formatting a
+			// []Name directly gives "[Resources]", which is neither the key as
+			// the document spells it nor a list a reader recognises.
+			named := make([]string, 0, len(keys))
+			for _, key := range keys {
+				named = append(named, "/"+string(key))
+			}
+			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
+				"which it inherits as %s from an ancestor in the page tree — and the "+
+				"shared object hint table this writer emits is empty",
+				ErrCannotLinearize, i+1, s, strings.Join(named, ", "))
+		}
+		return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
+			"and the shared object hint table this writer emits is empty",
+			ErrCannotLinearize, i+1, s)
 	}
 	// ⛔ NO GUARD FOR AN EMPTY ORDER, AND THAT IS DELIBERATE. Partition refuses
 	// a document with no pages by name, and Order returns one entry per placed
@@ -243,6 +368,13 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 type linMeasured struct {
 	params     linParams
 	mainXrefAt int64 // where the main table's `xref` keyword is, for /Prev
+
+	// hint is the encoded hint tables this pass's extents imply, and hintS is
+	// /S within them. ⛔ They are CONTENT carried between passes, not an
+	// offset, which makes them the one thing here that could change the file's
+	// shape — see the write site for why the length cannot.
+	hint  []byte
+	hintS int
 }
 
 // emitLinearized writes the file once with the parameters it is given, and
@@ -385,6 +517,7 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	}
 
 	offsets := make([]int, len(order)+3)
+	ends := make([]int, len(order)+3)
 	hintAt, hintLen := 0, 0
 	// ⛔⛔ THREE PHASES AND NOT A CONDITIONAL INSIDE THE LOOP. The first version
 	// placed part 5 when the index reached firstPageCount, and carried a
@@ -417,6 +550,11 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 		fmt.Fprintf(&buf, "%d 0 obj\n", num[old])
 		buf.Write(AppendObject(nil, renumber(o, num)))
 		buf.WriteString("\nendobj\n")
+		// ⛔ THE END IS RECORDED TOO, because the hint tables are about EXTENTS
+		// and the start alone cannot give a length. The next object's start is
+		// not the answer: part 5 sits between parts 4 and 6, so object
+		// catalogueCount's "next start" is on the far side of the hint stream.
+		ends[num[old]] = buf.Len()
 
 		// /E is the end of the first page: the last byte of part 6.
 		if p.Of[old] == PartFirstPage || p.Of[old] == PartCatalog {
@@ -452,8 +590,26 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// been received — by which time they have nothing left to accelerate.
 	// Ghostscript's placement is legal (F.3.1 permits either side, which is why
 	// the reader handles both) and it is not the one to copy.
+	// ⛔⛔ THE HINT STREAM IS WRITTEN FROM THE PREVIOUS PASS'S TABLES, which is
+	// the one place in this writer where the CONTENT and not merely a number
+	// comes from the pass before. Its length cannot depend on the pass, or
+	// everything after it would move; buildHintTables guarantees that by fixing
+	// the three byte-measured widths, and `hintData` below is the same call with
+	// the byte extents still at zero, so pass 0 and pass 1 produce the same
+	// number of bytes from the same code.
+	hintTables, hintS := prev.hint, prev.hintS
+	if hintTables == nil {
+		// ⛔ Zero for both offsets: with no bytes measured yet there is no first
+		// page offset to state, and 0 >= 0 satisfies the refusal that stops
+		// item 2 going negative. Only the LENGTH of this call's result is used.
+		t, s, err := buildHint(blankExtents(p), 0, 0)
+		if err != nil {
+			return nil, linMeasured{}, err
+		}
+		hintTables, hintS = t, s
+	}
 	hintAt = buf.Len()
-	hintLen = writeHintStreamPlaceholder(&buf, paramNum+1)
+	hintLen = writeHintStream(&buf, paramNum+1, hintTables, hintS)
 
 	// Part 6: the first page.
 	for _, old := range order[catalogueCount:firstPageCount] {
@@ -503,30 +659,151 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	}
 	copy(out[entriesAt:], entries.Bytes())
 
+	// The tables THIS pass's bytes imply, for the next pass to write. ⛔ Built
+	// after the whole file exists, because a page's extent is not known until
+	// its last object has been written.
+	nextHint, nextS, err := buildHint(
+		d.measurePages(p, num, offsets, ends), offsets[num[p.FirstPageObject]], hintLen)
+	if err != nil {
+		return nil, linMeasured{}, err
+	}
+
 	measured := in
 	measured.L = int64(len(out))
 	measured.H0 = int64(hintAt)
 	measured.H1 = int64(hintLen)
 	measured.T = int64(mainFirstEntry)
-	return out, linMeasured{params: measured, mainXrefAt: int64(mainAt)}, nil
+	return out, linMeasured{
+		params:     measured,
+		mainXrefAt: int64(mainAt),
+		hint:       nextHint,
+		hintS:      nextS,
+	}, nil
 }
 
-// writeHintStreamPlaceholder writes part 5 as a stream that parses and holds no
-// valid hint tables, and returns its length in bytes.
+// writeHintStream writes part 5: the primary hint stream, holding the two tables
+// Table F.2 requires, with /S at the shared object hint table.
 //
-// ⛔⛔ IT IS A PLACEHOLDER AND SAYS SO. Writing real tables needs the per-page
-// byte extents of the file being emitted, which is the step after this one;
-// emitting them half-right would make `qpdf --check` report a hint-table
-// problem that this code could not distinguish from a layout problem. A stream
-// of zeroes is refused by the table reader for a reason it names, which is the
-// honest state to be in.
-func writeHintStreamPlaceholder(buf *bytes.Buffer, num int) int {
-	const body = 36 + 24 // Table F.3's header plus Table F.5's, both zeroed
+// ⛔ THE DATA IS WRITTEN RAW AND /Length IS ITS LENGTH. F.3.6 permits a filter
+// here and this writer uses none, so a reader needs no decode step to reach the
+// tables — which is the point of a structure whose whole job is to be read
+// before the rest of the file arrives.
+func writeHintStream(buf *bytes.Buffer, num int, data []byte, s int) int {
 	start := buf.Len()
-	fmt.Fprintf(buf, "%d 0 obj\n<< /Length %d /S %d >>\nstream\n", num, body, 36)
-	buf.Write(bytes.Repeat([]byte{0}, body))
+	fmt.Fprintf(buf, "%d 0 obj\n<< /Length %d /S %d >>\nstream\n", num, len(data), s)
+	buf.Write(data)
 	buf.WriteString("\nendstream\nendobj\n")
 	return buf.Len() - start
+}
+
+// blankExtents gives every page its real object COUNT and no byte extent, which
+// is what the first pass has to work with.
+//
+// ⛔⛔ THE COUNTS ARE REAL AND THAT IS WHAT MAKES THE LENGTH RIGHT. Table F.3's
+// item 3 is a width derived from the object counts, so a first pass that passed
+// zeros there could choose a narrower width than the second and the stream would
+// change size between them. The counts do not depend on any offset, so they are
+// known now and they are the same on both passes.
+func blankExtents(p *Partition) []pageExtent {
+	out := make([]pageExtent, len(p.Pages))
+	for i, objs := range p.Pages {
+		out[i] = pageExtent{objects: len(objs)}
+	}
+	return out
+}
+
+// measurePages turns the offsets this pass recorded into one extent per page.
+//
+// ⛔ A PAGE'S EXTENT IS THE SPAN OF ITS OBJECTS, taken as a minimum and a
+// maximum rather than as "the first object's start to the last object's end".
+// Order sorts each part's segment by object number, and a page's objects are not
+// guaranteed to be numbered in the order they are emitted, so the first in the
+// slice need not be the earliest in the file.
+func (d *Document) measurePages(p *Partition, num map[int]int, offsets, ends []int) []pageExtent {
+	out := make([]pageExtent, len(p.Pages))
+	for i, objs := range p.Pages {
+		e := pageExtent{objects: len(objs)}
+		for j, old := range objs {
+			n := num[old]
+			if j == 0 || offsets[n] < e.start {
+				e.start = offsets[n]
+			}
+			if j == 0 || ends[n] > e.end {
+				e.end = ends[n]
+			}
+			// ⛔⛔ THE LENGTH IS A SUM OF THE OBJECTS, NOT THE EXTENT, because
+			// that is what the only checker in existence compares it against:
+			// Lin::lengthNextN sums (end - start) per object and never counts
+			// the gaps between them. With the page-major ordering the two
+			// agree, since a page's objects are now adjacent — but they agree
+			// by consequence, and the first version of this code took the
+			// extent and matched on one page out of two by arithmetic
+			// coincidence.
+			e.length += ends[n] - offsets[n]
+		}
+		// ⛔ THE CONTENT STREAMS ARE FOUND THROUGH THE PAGE, not by guessing
+		// which of the page's objects is a stream. A page's object set holds
+		// whatever it reaches — annotations, fonts, an /XObject — and Table
+		// F.4's items 6 and 7 name the content stream specifically.
+		for j, c := range d.contentNumbers(p, i) {
+			n := num[c]
+			if j == 0 || offsets[n] < e.contentStart {
+				e.contentStart = offsets[n]
+			}
+			if j == 0 || ends[n] > e.contentEnd {
+				e.contentEnd = ends[n]
+			}
+			e.hasContent = true
+		}
+		out[i] = e
+	}
+	return out
+}
+
+// contentNumbers returns the object numbers of page i's content streams, in the
+// document's own numbering, keeping only those the page's own object set holds.
+//
+// ⛔ THE FILTER IS NOT A FORMALITY. /Contents could name an object the partition
+// assigned elsewhere, or one that does not exist; an extent computed from an
+// offset outside the page would make items 6 and 7 describe bytes that are not
+// the page's, and `renumber` has already turned an unplaced reference into null.
+func (d *Document) contentNumbers(p *Partition, i int) []int {
+	mine := make(map[int]bool, len(p.Pages[i]))
+	for _, old := range p.Pages[i] {
+		mine[old] = true
+	}
+
+	// ⛔⛔ PageObjects AND NOT Pages[i][0]. Partition puts the page's own object
+	// first in the set and then SORTS it, so index 0 is the lowest object
+	// number — which on these fixtures usually IS the page, so the assumption
+	// would have measured right on every shape in the corpus and been wrong on
+	// a document whose content stream was numbered below its page.
+	if i >= len(p.PageObjects) {
+		return nil
+	}
+	page, err := d.Get(Ref{Num: p.PageObjects[i]})
+	if err != nil {
+		return nil
+	}
+	dict, ok := ToDict(page)
+	if !ok {
+		return nil
+	}
+
+	var out []int
+	switch c := dict["Contents"].(type) {
+	case Ref:
+		if mine[c.Num] {
+			out = append(out, c.Num)
+		}
+	case Array:
+		for _, v := range c {
+			if r, isRef := v.(Ref); isRef && mine[r.Num] {
+				out = append(out, r.Num)
+			}
+		}
+	}
+	return out
 }
 
 // pushInherited copies the page attributes a page INHERITS onto the page

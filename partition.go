@@ -86,6 +86,42 @@ type Partition struct {
 	// ⛔ A page's own object is included, because item 1 counts it: qpdf
 	// reports 4 objects for a page whose reach is 3.
 	Pages [][]int
+
+	// PageObjects[i] is page i+1's own page object, in this document's
+	// numbering.
+	//
+	// ⛔⛔ Pages[i][0] IS NOT IT, which is why this field exists. Pages[i] is
+	// built with the page's own object first and then SORTED, so its index 0
+	// is the lowest object number — and on the fixtures here that usually IS
+	// the page, so code assuming it would measure correctly on every shape in
+	// the corpus and be wrong on a document whose content stream is numbered
+	// below its page.
+	//
+	// ⛔⛔ AND THE LAYOUT NEEDS IT, not just the hint tables. qpdf's checker
+	// computes a page's length by taking the page object's number and the next
+	// nobjects-1 CONSECUTIVE numbers and summing their lengths
+	// (QPDF_linearization.cc, Lin::lengthNextN) — so a page whose objects are
+	// not numbered consecutively from its page object is measured against
+	// objects belonging to something else. Order uses this to emit each page's
+	// own object first.
+	PageObjects []int
+
+	// Shared[i] is every object page i+1 reaches that belongs to another
+	// page's part — part 6 or part 8 — and so is a shared object as far as
+	// F.4.2 is concerned. Shared[0] is always empty: Table F.4 item 3 requires
+	// 0 shared references for the first page.
+	//
+	// ⛔⛔ THIS IS NOT "WHAT IS IN PART 8". An object page 1 needs stays in
+	// part 6 even when page 3 needs it too, and part 8 holds only objects
+	// shared between pages that are NOT the first. Measured: for a two-page
+	// document whose pages share one content stream, our part 8 is empty and
+	// qpdf's is too — yet qpdf reports `nshared_total: 3`, because its shared
+	// table covers part 6's shared objects as well.
+	//
+	// ⛔ The writer needs this to know when it CANNOT describe a document:
+	// `qpdf --check` says "page 1: shared object 3: in computed list but not
+	// hint table" for exactly the pages whose Shared is non-empty.
+	Shared [][]int
 }
 
 // ErrCannotPartition reports a document this package declines to place.
@@ -273,6 +309,11 @@ func (d *Document) Partition() (*Partition, error) {
 	// part is not final until this point. Filtering early would have kept the
 	// catalogue in page one's set.
 	perPage := make([][]int, len(pages))
+	pageObjects := make([]int, len(pages))
+	for i := range pages {
+		pageObjects[i] = pages[i].Num
+	}
+	shared := make([][]int, len(pages))
 	for i, reach := range reaches {
 		want := PartOtherPrivate
 		if i == 0 {
@@ -282,16 +323,35 @@ func (d *Document) Partition() (*Partition, error) {
 		// reachFromPage never returns it because the page objects are the
 		// walk's boundary.
 		set := []int{pages[i].Num}
+		var theirs []int
 		for num := range reach {
-			if num != pages[i].Num && of[num] == want {
+			// ⛔ THE PAGE'S OWN NUMBER IS A CONDITION, NOT A BRANCH, because
+			// reachFromPage never returns it — the page objects are the walk's
+			// boundary — so an `if num == pages[i].Num { continue }` is a block
+			// no input enters, and this package's coverage gate refuses those.
+			// Folded into the case below it keeps the guarantee without claiming
+			// a path nothing takes.
+			switch {
+			case of[num] == want && num != pages[i].Num:
 				set = append(set, num)
+			// ⛔⛔ AN OBJECT THIS PAGE REACHES THAT IS NOT ITS OWN. Part 6 and
+			// part 8 are both "reachable from more than one page": an object
+			// page 1 needs stays in part 6 even when page 3 needs it too, and
+			// F.4.2's shared object hint table is how a later page says which
+			// of those it depends on. The page TREE is reached by every page
+			// and belongs to neither — F.3.10 puts it in part 9 — so it is not
+			// one of these.
+			case i > 0 && (of[num] == PartFirstPage || of[num] == PartShared):
+				theirs = append(theirs, num)
 			}
 		}
 		// ⛔ SORTED, so two runs over one document give the same slice: a reach
 		// is a map, and a writer emitting in map order would produce different
 		// bytes every time from the same input.
 		sort.Ints(set)
+		sort.Ints(theirs)
 		perPage[i] = set
+		shared[i] = theirs
 	}
 
 	return &Partition{
@@ -299,6 +359,8 @@ func (d *Document) Partition() (*Partition, error) {
 		FirstPage:       1,
 		FirstPageObject: first.Num,
 		Pages:           perPage,
+		PageObjects:     pageObjects,
+		Shared:          shared,
 	}, nil
 }
 
@@ -462,7 +524,166 @@ func (d *Document) reachFromPage(page Ref, boundary map[int]bool) (map[int]bool,
 		}
 		start = append(start, v)
 	}
+
+	// ⛔⛔⛔ THE INHERITED ATTRIBUTES ARE PART OF THE PAGE'S REACH, and leaving
+	// them out made this walk measure a graph the writer does not emit. Table 30
+	// lets a page omit /Resources, /MediaBox, /CropBox and /Rotate and take its
+	// parent's, and the writer PUSHES THEM DOWN at emission (pushInherited),
+	// because F.3.7 needs part 6 to hold everything that displays page one. If
+	// the ancestor's value is an INDIRECT REFERENCE, the pushed-down copy is
+	// that reference — so the emitted page names an object this walk never saw.
+	//
+	// ⛔ Measured, before this: two pages inheriting an indirect /Resources from
+	// the page tree node gave Pages=[[3 5] [4 6]] with the resources object in
+	// part 9, and `qpdf --check` on the result said all three of
+	//
+	//	end of first page section (/E) mismatch: /E = 905; computed = 1190
+	//	object count mismatch for page 0: hint table = 2; computed = 3
+	//	page 1: shared object 7: in computed list but not hint table
+	//
+	// — so /E, Table F.4 item 1 and the shared list were ALL wrong, and the
+	// first two of those are older than the hint tables. The partition was
+	// describing the source document while the writer emitted a different one.
+	//
+	// ⭐ Fixing it HERE rather than in the hint tables is what makes the rest
+	// consistent: once the object is in the page's reach, `of` classifies it,
+	// Pages counts it, Shared sees that a later page needs it, and the writer's
+	// refusal covers the case it cannot yet describe.
+	for _, v := range d.inheritedAttributes(page, dict) {
+		start = append(start, v)
+	}
 	return d.reach(start, boundary), nil
+}
+
+// inheritedByReference returns the inheritable keys whose inherited value IS one
+// of `shared` — the objects this page shares with an earlier one.
+//
+// ⛔ IT EXISTS FOR A MESSAGE, and only the refusal path calls it. "page 2 shares
+// object 2" is not a diagnosis for a document whose author never wrote object 2
+// into either page: it arrived because the page tree node's /Resources is a
+// reference and the writer pushes inherited attributes down. Naming the key
+// turns an object number the caller cannot find into something they can.
+//
+// ⛔⛔ AND IT MUST BE ASKED ABOUT THE SHARED OBJECTS, NOT ABOUT THE PAGE. The
+// first version asked only "does this page inherit anything by reference", which
+// conflated two causes and could state a falsehood. Review constructed it: two
+// pages naming the SAME /Contents explicitly, with page 2 under a sub-node
+// carrying an indirect /Rotate private to it, produced
+//
+//	page 2 shares object(s) [4] with an earlier page, which it inherits as
+//	/Rotate from an ancestor in the page tree
+//
+// where object 4 is written in both page dictionaries and was never inherited,
+// and /Rotate's object is 3 and is not shared at all. Both halves of that
+// sentence were true and their conjunction was not.
+//
+// ⚠ IT MISSES THE TRANSITIVE CASE, deliberately. `reach` expands through an
+// inherited /Resources, so an object deep underneath it is shared without being
+// that key's value — and there the plain message, naming only the object, is the
+// honest one. A helper that cannot be wrong is worth more than one that is
+// usually more specific.
+func (d *Document) inheritedByReference(page Ref, shared []int) []Name {
+	o, err := d.Get(page)
+	if err != nil {
+		return nil
+	}
+	dict, ok := ToDict(o)
+	if !ok {
+		return nil
+	}
+
+	isShared := make(map[int]bool, len(shared))
+	for _, num := range shared {
+		isShared[num] = true
+	}
+
+	// ⛔ inheritablePageKeys AND NOT THE MAP'S OWN ORDER, so the message reads
+	// the same twice: ranging a map would print /Rotate before /Resources on
+	// one run and after it on the next.
+	values := d.inheritedValues(page, dict)
+	var out []Name
+	for _, key := range inheritablePageKeys {
+		ref, isRef := values[key].(Ref)
+		if isRef && isShared[ref.Num] {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// inheritedAttributes returns the values of Table 30's inheritable keys that
+// this page does NOT hold itself and so takes from an ancestor.
+func (d *Document) inheritedAttributes(page Ref, dict Dict) []Object {
+	values := d.inheritedValues(page, dict)
+	out := make([]Object, 0, len(values))
+	// ⛔ In inheritablePageKeys' order and not the map's, so two runs over one
+	// document give the same slice — the same reason Partition sorts each page's
+	// set. A writer whose reach order varies produces different bytes from one
+	// input.
+	for _, key := range inheritablePageKeys {
+		if v, has := values[key]; has {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// inheritedValues walks the /Parent chain and returns, for each of Table 30's
+// inheritable keys the page does not state itself, the value it takes from its
+// NEAREST ancestor.
+//
+// ⛔ THE WALK IS BOUNDED BY A SEEN SET, not by a depth. A /Parent chain that
+// loops is a malformed document this function must not hang on, and a page tree
+// deep enough to matter is cheaper to bound by identity than to guess a limit
+// for. The same argument as pushInherited's, which walks the same chain.
+//
+// ⛔⛔ THE NEAREST ANCESTOR WINS, AND ONLY IT. Table 30's inheritance takes the
+// first value found walking UP, so a /Resources on the parent SHADOWS one on the
+// grandparent. Collecting from every ancestor would put an object the page
+// cannot reach into its reach — and that object would then be classified as part
+// of the page, which is the same class of defect this walk exists to fix, in the
+// opposite direction.
+func (d *Document) inheritedValues(page Ref, dict Dict) map[Name]Object {
+	out := map[Name]Object{}
+	seen := map[int]bool{page.Num: true}
+
+	stated := map[Name]bool{}
+	for _, key := range inheritablePageKeys {
+		if _, has := dict[key]; has {
+			// The page states it itself, so it inherits nothing for it.
+			stated[key] = true
+		}
+	}
+
+	at := dict
+	for {
+		parent, ok := at["Parent"].(Ref)
+		if !ok || seen[parent.Num] {
+			return out
+		}
+		seen[parent.Num] = true
+
+		o, err := d.Get(parent)
+		if err != nil {
+			return out
+		}
+		node, ok := ToDict(o)
+		if !ok {
+			return out
+		}
+		for _, key := range inheritablePageKeys {
+			if stated[key] {
+				continue
+			}
+			if _, already := out[key]; already {
+				continue
+			}
+			if v, has := node[key]; has {
+				out[key] = v
+			}
+		}
+		at = node
+	}
 }
 
 // reachFromTrailer collects everything the trailer reaches, with no boundary:

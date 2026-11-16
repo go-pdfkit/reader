@@ -36,19 +36,25 @@ var digits = regexp.MustCompile(`\d+`)
 // about hint tables or page offsets. A new complaint of any other kind is a
 // defect in the layout and fails here.
 func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
-	for _, pages := range []int{1, 2, 5} {
-		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+	// ⛔⛔ THE INHERITED SHAPE IS IN THIS LOOP, AND THAT IS WHERE ITEM 1 GETS AN
+	// ORACLE OUTSIDE THE PARTITION. qpdf checks Table F.4 item 1 directly — it
+	// reported "object count mismatch for page 0: hint table = 2; computed = 3"
+	// on exactly this document before reachFromPage followed inherited
+	// attributes — so running it here is what keeps the value test's comparison
+	// against len(p.Pages[i]) from being the only judge of that field.
+	for _, shape := range hintShapes() {
+		t.Run(shape.name, func(t *testing.T) {
 			qpdf := qpdfOrSkip(t)
 
-			plain := buildPages(t, pages)
+			plain := shape.build(t)
 			d, err := Open(plain)
 			if err != nil {
 				t.Fatal(err)
 			}
 			out, err := d.Linearize()
 			if err != nil {
-				t.Fatalf("Linearize refused a %d-page document this package just built: %v",
-					pages, err)
+				t.Fatalf("Linearize refused a document this package just built (%s): %v",
+					shape.name, err)
 			}
 
 			dir := t.TempDir()
@@ -69,7 +75,7 @@ func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
 				t.Fatalf("qpdf did not report on our file at all, so what it does not say "+
 					"proves nothing:\n%s", got)
 			}
-			t.Logf("qpdf --check on our own %d-page file:\n%s", pages, got)
+			t.Logf("qpdf --check on our own file (%s):\n%s", shape.name, got)
 
 			// ⛔⛔⛔ THE COMPLAINTS ARE DIFFED AGAINST THE INPUT'S, not matched
 			// against a list of words I chose. The first version of this test
@@ -128,17 +134,22 @@ func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
 			// offset below /H was tried here first and is too weak: see that
 			// test.
 
+			// ⛔⛔ THE HINT-TABLE EXEMPTION IS GONE, and removing it is the point
+			// of this step. While the tables were a placeholder this loop had to
+			// skip complaints matching isAboutHintTables, which meant the ONE
+			// subject the step was about was the one subject the judge could not
+			// speak on. Now that the tables are real, every complaint counts.
+			//
+			// ⛔ Keeping the exemption would have been worse than useless: a
+			// future defect in the tables would land in exactly the category the
+			// test had been taught to ignore.
 			base := qpdfComplaints(t, qpdf, dir, "in.pdf", plain)
 			ours := qpdfComplaints(t, qpdf, dir, "ours.pdf", out)
 			for l := range ours {
 				if base[l] {
 					continue
 				}
-				if isAboutHintTables(l) {
-					continue
-				}
-				t.Errorf("qpdf complains about OUR file and not about the input, and it is not "+
-					"about the hint tables — so the layout or the parameters are wrong: %q", l)
+				t.Errorf("qpdf complains about OUR file and not about the input: %q", l)
 			}
 		})
 	}
@@ -177,32 +188,19 @@ func qpdfComplaints(t *testing.T, qpdf, dir, name string, b []byte) map[string]b
 	return out
 }
 
-// isAboutHintTables says whether a complaint is about F.4, which this writer
-// does not produce yet.
+// ⛔⛔ isAboutHintTables IS DELETED, AND ITS HISTORY IS THE RECORD OF THIS STEP.
+// It classified which of our own new complaints were the expected hint-table
+// ones while the tables were zeros, and it grew one entry at a time as qpdf
+// named them: "hint table", "hint stream", "linearization hint", "shared
+// object", "page offset", "page length", then "first page object offset" —
+// which had to be added because the word "object" sits in the middle of the
+// phrase and it does not contain "page offset" — and finally "object count
+// mismatch for page".
 //
-// ⚠ THIS IS STILL A LIST OF WORDS AND STILL A GUESS, and it is narrower than
-// the two it replaced: it only decides which of OUR OWN new complaints are the
-// expected ones. A wrong guess here makes the test too strict, never too
-// lenient — the opposite risk from the version that used a list to decide what
-// counted as a complaint at all.
-func isAboutHintTables(line string) bool {
-	for _, p := range []string{"hint table", "hint stream", "linearization hint",
-		"shared object", "page offset", "page length",
-		// ⛔ "first page object offset" had to be added, and the reason is the
-		// one this function's own note predicts: the list is a guess and a
-		// wrong guess here makes the test too strict. That string is Table
-		// F.3's item 2, `first_page_offset` — squarely a hint-table field —
-		// and it does not contain "page offset" because the word "object"
-		// sits in the middle.
-		"first page object offset",
-		// ⛔ And the per-page object counts, Table F.4 item 1.
-		"object count mismatch for page"} {
-		if strings.Contains(line, p) {
-			return true
-		}
-	}
-	return false
-}
+// ⭐ That list was the work's own to-do list, and it is empty: the real tables
+// draw no complaint on any shape, so the judge needs no exemption and the two
+// callers now fail on ANY new complaint. A keyword list that decides what to
+// ignore is a liability the moment the thing it ignores starts working.
 
 // ⛔⛔ ORDER IS PART-MAJOR, which the emission SLICES ON and which nothing
 // else states. It writes order[:catalogueCount] as part 4 and
@@ -505,7 +503,7 @@ func TestQpdfJudgesTheInfoAndIDFile(t *testing.T) {
 	base := qpdfComplaints(t, qpdf, dir, "in.pdf", plain)
 	written := qpdfComplaints(t, qpdf, dir, "ours.pdf", out)
 	for l := range written {
-		if !base[l] && !isAboutHintTables(l) {
+		if !base[l] {
 			t.Errorf("qpdf says this about our /Info+/ID file and not about the input, "+
 				"and it is not about the hint tables: %q", l)
 		}

@@ -850,9 +850,194 @@ because nothing end-to-end disagreed with the file.
 
 ⛔ **Reading, partitioning, both hint tables, encoding them and checking that
 they decode is all it does — there is no linearizing writer yet.** The checker
-came first on purpose: a writer cannot be trusted without one. What remains for
-#40 is the layout (F.3.1's eleven parts) and the two-pass fixpoint for `/L`,
-`/H`, `/E` and `/T`.
+came first on purpose: a writer cannot be trusted without one.
+
+### ⭐⭐ `Document.Linearize` — and the hint tables are real
+
+That paragraph is now out of date and is kept because the order it describes is
+the point: the checker was built first, and every step of the writer was judged
+by it and by qpdf before the next one started.
+
+`Linearize()` writes Annex F's eleven parts and returns the bytes.
+`qpdf --check` says **`File is linearized`** and raises no complaint it does not
+also raise about the input, on one, two, five and twenty-five page documents
+**whose pages share no objects**.
+
+⛔⛔ **That scope is load-bearing, and review found it rather than the tests.**
+The shared object hint table (F.4.2) is how a page after the first says which of
+part 6's and part 8's objects it depends on, and this writer emits a *required
+but empty* one. For a document whose pages are independent that is the truth;
+for one whose pages are not, it is a hint table that contradicts the file:
+
+```
+WARNING: page 1: shared object 3: in computed list but not hint table
+```
+
+measured on two pages sharing one content stream — while our own
+`CheckLinearized` **accepted** that file, so nothing in this package would have
+caught it.
+
+⛔ **And the whole judged corpus could not express the case.** `buildPages` gives
+every page its own content stream, so no object is reached by two pages and
+`Partition.Shared` is empty on every shape the suite builds. The foreign judge
+was green because the fixtures were silent — the second time in this arc that a
+passing oracle meant "the corpus says nothing". `TestADocumentWhoseLaterPagesShareAnObjectIsRefused`
+commits the missing fixture, and `TestTheJudgedCorpusSharesNothingBetweenPages`
+is its negative control: a suite in which every input is refused measures as
+little as one in which every input passes.
+
+⚠ So `Linearize` **refuses** such a document, naming the objects, rather than
+describing it wrongly. Filling that table is a partition question — qpdf reports
+`nshared_total: 3` with part 8 **empty** for the same input — and it is #61.
+
+### ⛔⛔⛔ And that refusal is far wider than "pages sharing a content stream"
+
+The rule is about **sharing**, and nothing else:
+
+> refused iff an object a page after the first reaches is **also** reached by the
+> first page or by another page — other than the **catalogue**, which part 4
+> delivers ahead of the first page
+
+⛔ The catalogue exception is not a special case in the code, which is why it has
+to be in the sentence: `of[catNum] = PartCatalog` is assigned *after* the readers
+loop and overwrites whatever sharing would have made it, so `Shared`'s "part 6 or
+part 8" test cannot see it. That is correct rather than convenient — part 4
+precedes part 6 and arrives with the first page, so a later page depending on the
+catalogue needs no F.4.2 entry. Measured: two pages each carrying `/PieceInfo`
+give the catalogue part 4, `Shared` empty, the document accepted, and
+`qpdf --check` silent. Part 4 holds nothing but the catalogue, so there is no
+second instance.
+
+⛔ **Two narrower rules were written here first and both were wrong**, which is
+why this one is stated in terms of *reaching* rather than of any mechanism:
+
+- *"a multi-page document with an indirect inherited value"* — refuted by a
+  three-level tree whose sub-node carries the reference with exactly **one** page
+  under it: that object is part 7, private to that page, and accepted.
+- *"an inheritable indirect value inherited by more than one page"* — only
+  **sufficient**. Refuted by a page that states its *own* `/Resources` naming the
+  node's object under `/XObject` while the other page inherits it: exactly one
+  page inherits, and the object is shared all the same.
+
+⛔⛔ **Inheritance is a route by which a page reaches an object**, not a separate
+case. Table 30 lets a page omit `/Resources`, `/MediaBox`, `/CropBox` and
+`/Rotate`, and the writer pushes those down because F.3.7 needs part 6
+self-contained — so an inherited reference makes the page reach that object
+exactly as naming it would. It matters here only because it is the route that is
+easy to miss: one shared resource dictionary on the page tree node is the
+ordinary way to write a multi-page PDF, so a large share of real files are
+refused today.
+
+| shape | accepted? |
+|---|---|
+| one page, inherited indirect `/Resources` | **yes** — nothing to share with |
+| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object to reach |
+| multi-page, each page naming a **different** `/Resources` object | **yes** — nothing shared |
+| a **sub-node**'s indirect `/Resources` with **one** page under it | **yes** — part 7, private to that page |
+| a **sub-node**'s indirect `/Resources` with **two** pages under it | **no** — part 8, shared |
+| flat multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
+| one page inherits it, the other reaches it via its **own** `/Resources` | **no** — one inheritor, still shared |
+| two pages naming the **same** `/Resources` object, no inheritance at all | **no** — stating your own is not a cure |
+
+⚠ **"Each page states its own" is not an exemption**, and that row above says
+"a different object" for a reason: the earlier wording passed for an unstated
+second reason — the fixture gave each page a distinct object. Stating your own
+removes the *inheritance* route, not the sharing.
+
+⛔ Every fixture but the two sub-node rows is a **flat** page tree, which is
+exactly why the first boundary was mis-stated: a flat tree cannot express
+"inherited by one page out of several". The accepting rows carry more weight than
+the refusing ones — without them a stricter reach would refuse everything and the
+suite would stay green.
+
+⚠ **The error names the inheritable key only when that key's own object is the
+shared one.** Asking merely "does this page inherit anything by reference"
+conflates two causes and can state a falsehood: two pages naming the *same*
+`/Contents` explicitly, with one of them under a sub-node carrying an unrelated
+indirect `/Rotate`, produced *"shares object 4 … which it inherits as /Rotate"* —
+where object 4 was written in both page dictionaries and `/Rotate`'s object was
+not shared at all. Both halves were true and the conjunction was not. The
+transitive case is given up deliberately: an object deep under an inherited
+`/Resources` is shared without being that key's value, and there the plain
+message is the honest one.
+
+⛔ **The partition had to learn this before the refusal could be right.**
+`reachFromPage` now follows the inherited attributes, because the writer pushes
+them down at emission: if the node's value is a reference, the emitted page names
+an object no *source* page named, and the partition was measuring a different
+document from the one being written. Before that, such a file was **accepted**
+with three defects — and two of them, `/E` and Table F.4 item 1, were older than
+the hint tables:
+
+```
+end of first page section (/E) mismatch: /E = 905; computed = 1190
+object count mismatch for page 0: hint table = 2; computed = 3
+page 1: shared object 7: in computed list but not hint table
+```
+
+⭐ The one-page inherited shape is in both judged loops, because the repair is
+observable only on a document the writer **accepts** — the two-page fixture stops
+at the refusal. Removing the inheritance from the reach reddens it on exactly
+those first two warnings.
+
+⛔⛔ **THE LAYOUT IS PAGE-MAJOR IN PARTS 6 AND 7, AND A FOREIGN CHECKER IS WHY.**
+Within those parts the order is "page by page, each page's own object first",
+not "ascending object number" — because qpdf measures a page by taking its page
+object's number and the next *nobjects−1* **consecutive** numbers and summing
+their lengths (`Lin::lengthNextN`, read in qpdf's source). It never looks at
+which objects the page actually reaches. A page whose content stream is numbered
+below its page object is therefore measured against whatever happens to be
+numbered above it:
+
+```
+page length mismatch for page 1: hint table = 186; computed length = 162
+```
+
+Those 162 bytes were our page object (101) plus the **page tree** (61) — an
+object belonging to no page at all.
+
+⛔ **And the other page passed by accident,** which is the half worth keeping.
+Its byte extent was 186 and the sum of its two objects was 101 + 85 = 186: the
+same total over a *different* range. One green page and one red page came from
+one defect, so the green one was never evidence.
+
+⛔ **Table F.4 item 2 is a SUM, not an extent.** With the page-major ordering the
+two agree, because a page's objects are now adjacent — but they agree as a
+consequence of the layout, not by definition.
+
+⭐ **Three bit widths are pinned at 32, and that is what makes the file
+converge.** The hint stream sits before the first page, so if its *length*
+changed between the two passes every later offset would move. Of Table F.4's
+seven items only three are measured in bytes — items 2, 6 and 7 — so pinning
+those widths makes the encoded length a function of the page count and the
+shared-reference counts alone, neither of which depends on where anything
+landed. The other widths are still derived from the data, which is already
+pass-invariant. qpdf solves the same problem by padding its hint stream to a
+fixed 200 bytes; pinning the widths costs four bytes per page per item and needs
+no padding at all.
+
+⛔⛔ **`qpdf --check` validates three fields of the page offset table and no
+more:** item 2, the per-page object counts, and the per-page lengths. It never
+reads items 6 and 7 — the content stream's offset and length — and it never
+reads the shared object hint table's groups. So the writer could emit nonsense
+there and every foreign judge in this repository would stay silent. That is the
+same shape as part 5's placement, where `--check` passed a file whose hint
+stream sat in the wrong part. `TestTheHintTablesDescribeTheFileWeWrote` holds
+every field against the bytes we wrote instead, and zeroing item 6 reddens it on
+every page of every shape while qpdf stays quiet.
+
+⛔ **The judge no longer exempts hint-table complaints.** While the tables were
+zeros, the qpdf diff had to skip any complaint matching a keyword list — which
+meant the one subject the step was about was the one subject the judge could not
+speak on. The list grew one entry at a time as qpdf named them and is now
+deleted: every complaint counts.
+
+What remains for #61 is the shared object hint table's *values*. This writer's
+partition puts nothing in part 8, so its table is a required header and no
+groups — but qpdf's own output shows the accounting is wider than part 8:
+linearizing the same two-page input, qpdf reports `nshared_total: 3` with part 8
+**empty**, so it counts first-page objects that later pages also use. Matching
+that is a partition change, not a table change.
 
 Next wave: the operations built on all of this.
 

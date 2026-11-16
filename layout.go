@@ -98,6 +98,36 @@ func (p *Partition) Order() ([]int, error) {
 
 	out := make([]int, 0, len(p.Of))
 	for _, part := range parts {
+		// ⛔⛔ PARTS 6 AND 7 ARE PAGE-MAJOR, AND A FOREIGN CHECKER IS WHY. Within
+		// those parts the order is "page by page, each page's own object first",
+		// not "ascending object number".
+		//
+		// qpdf's checker computes a page's length by taking the page object's
+		// number and the next nobjects-1 CONSECUTIVE object numbers, summing
+		// each one's length — Lin::lengthNextN in QPDF_linearization.cc, read
+		// at main. It never looks at which objects the page actually reaches.
+		// So a page whose content stream is numbered BELOW its page object is
+		// measured against whatever happens to be numbered above it.
+		//
+		// ⛔ Measured, before this ordering existed: for a two-page document our
+		// page 2's objects were 4 (content) and 5 (page), so qpdf summed objects
+		// 5 and 6 — object 6 being the PAGE TREE, nothing to do with page 2 —
+		// and reported "page length mismatch for page 1: hint table = 186;
+		// computed length = 162". 101 + 61 is exactly those two objects.
+		//
+		// ⛔⛔ AND PAGE 1 PASSED BY ACCIDENT, which is the part worth keeping.
+		// Its extent 721..907 was 186 bytes and the sum of objects 3 and 4 was
+		// 101 + 85 = 186 — the same total over a DIFFERENT byte range. One
+		// green page and one red page came from the same defect.
+		if part == PartFirstPage || part == PartOtherPrivate {
+			placed, err := p.pageMajor(part, out)
+			if err != nil {
+				return nil, err
+			}
+			out = placed
+			continue
+		}
+
 		first := len(out)
 		for num, got := range p.Of {
 			if got == part {
@@ -109,6 +139,74 @@ func (p *Partition) Order() ([]int, error) {
 		// and destroy the only thing this function is for. Mutation-confirmed
 		// — `sort.Ints(out)` here reddens all seven fixtures.
 		sort.Ints(out[first:])
+	}
+	return out, nil
+}
+
+// pageMajor appends one part's objects page by page, each page's own object
+// first and its remaining objects in ascending order after it.
+//
+// ⛔ AN OBJECT OF THIS PART THAT NO PAGE CLAIMS IS A REFUSAL, not a silent
+// loss. Of says "belongs to exactly one page"; if Pages disagrees with Of then
+// one of them is wrong, and emitting the object anyway would put it between two
+// pages' runs and break the consecutive numbering this ordering exists to
+// create. This is the same refusal Order makes for an unknown part, one level
+// down.
+func (p *Partition) pageMajor(part Part, out []int) ([]int, error) {
+	claimed := map[int]bool{}
+
+	for i, objs := range p.Pages {
+		if i >= len(p.PageObjects) {
+			return nil, fmt.Errorf("%w: page %d has an object set and no page object",
+				ErrCannotLayOut, i+1)
+		}
+		own := p.PageObjects[i]
+		if p.Of[own] != part {
+			// This page belongs to the other of the two page parts.
+			continue
+		}
+
+		rest := make([]int, 0, len(objs))
+		for _, num := range objs {
+			if num == own {
+				continue
+			}
+			// ⛔⛔ "PLACED ELSEWHERE" AND "NOT PLACED AT ALL" ARE DIFFERENT
+			// ANSWERS, and reading Of with one lookup conflates them: a missing
+			// key gives the zero Part, which is not any of F.3.1's, so an object
+			// Of never mentions looked exactly like one belonging to another
+			// part and was skipped in silence. The emission would then count it
+			// in the page's object total — Pages is what it counts — while the
+			// layout never emitted it, so offsets[0] would drag the page's start
+			// to byte 0 and every item derived from it would be wrong.
+			got, placed := p.Of[num]
+			if !placed {
+				return nil, fmt.Errorf("%w: page %d's set names object %d and the partition "+
+					"does not place it at all", ErrCannotLayOut, i+1, num)
+			}
+			if got != part {
+				// An object this page reaches that the partition placed
+				// elsewhere — shared, or the page tree. Not this run's.
+				continue
+			}
+			rest = append(rest, num)
+		}
+		sort.Ints(rest)
+
+		out = append(out, own)
+		claimed[own] = true
+		for _, num := range rest {
+			out = append(out, num)
+			claimed[num] = true
+		}
+	}
+
+	for num, got := range p.Of {
+		if got == part && !claimed[num] {
+			return nil, fmt.Errorf("%w: object %d is in %v and no page claims it, so the "+
+				"layout cannot number it next to the page it belongs to",
+				ErrCannotLayOut, num, part)
+		}
 	}
 	return out, nil
 }
