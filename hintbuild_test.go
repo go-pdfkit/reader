@@ -191,10 +191,140 @@ func TestAPageInheritingAnIndirectAttribute(t *testing.T) {
 	}
 }
 
-// ⛔ AND A DIRECT INHERITED ATTRIBUTE CHANGES NOTHING, which is the control that
-// keeps the fix from over-reaching: buildPages puts /MediaBox on the node as a
-// direct array, so there is no object to reach and the four judged shapes must
-// stay acceptable. TestTheJudgedCorpusSharesNothingBetweenPages asserts that.
+// ⛔⛔⛔ WHICH INHERITANCE SHAPES THE WRITER ACCEPTS, measured rather than
+// relayed. The refusal's scope is much wider than "pages sharing a content
+// stream": one shared resource dictionary on the page tree node is the ORDINARY
+// way to write a multi-page PDF, so a large share of real files are refused
+// today. That claim is in the README, and a claim in prose is worth what its
+// witness is worth.
+//
+// ⛔ The accepting rows matter more than the refusing one. They are what keeps
+// the fix from over-reaching: a direct inherited value adds no object, a page
+// stating its own inherits nothing, and an object only ONE later page reaches is
+// private to it. Without them a stricter reach would refuse everything and the
+// suite would still be green.
+func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
+	// A page tree node carrying `nodeKeys`, with `pageKeys` on every page.
+	build := func(t *testing.T, pages int, onNode, onPages Dict) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		pagesRef := w.Reserve()
+		kids := make(Array, 0, pages)
+		for i := 0; i < pages; i++ {
+			content := w.Add(&Stream{Dict: Dict{},
+				Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i+1))})
+			page := Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": content}
+			for k, v := range onPages {
+				page[k] = v
+			}
+			kids = append(kids, w.Add(page))
+		}
+		node := Dict{"Type": Name("Pages"), "Kids": kids, "Count": Integer(pages),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}}
+		for k, v := range onNode {
+			node[k] = v
+		}
+		w.Put(pagesRef, node)
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
+	// An indirect resource dictionary, written into whichever document needs it.
+	indirect := func(t *testing.T, pages int, onPages bool) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		pagesRef := w.Reserve()
+		res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+		kids := make(Array, 0, pages)
+		for i := 0; i < pages; i++ {
+			content := w.Add(&Stream{Dict: Dict{},
+				Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i+1))})
+			page := Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": content}
+			if onPages {
+				// Each page names its OWN resources object, so none is shared.
+				page["Resources"] = w.Add(Dict{"ProcSet": Array{Name("PDF")}})
+			}
+			kids = append(kids, w.Add(page))
+		}
+		node := Dict{"Type": Name("Pages"), "Kids": kids, "Count": Integer(pages),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}}
+		if !onPages {
+			node["Resources"] = res
+		}
+		w.Put(pagesRef, node)
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
+	for _, tc := range []struct {
+		name   string
+		plain  func(*testing.T) []byte
+		accept bool
+	}{
+		{
+			name:   "one page inheriting an indirect /Resources",
+			plain:  func(t *testing.T) []byte { return indirect(t, 1, false) },
+			accept: true, // nothing to share with
+		},
+		{
+			name:   "two pages with inheritable values all DIRECT",
+			plain:  func(t *testing.T) []byte { return build(t, 2, nil, nil) },
+			accept: true, // an inline /MediaBox array adds no object
+		},
+		{
+			name:   "two pages each stating their own /Resources",
+			plain:  func(t *testing.T) []byte { return indirect(t, 2, true) },
+			accept: true,
+		},
+		{
+			name:   "two pages inheriting ONE indirect /Resources",
+			plain:  func(t *testing.T) []byte { return indirect(t, 2, false) },
+			accept: false, // needs F.4.2, which is #61
+		},
+		{
+			name:   "twenty-five pages inheriting ONE indirect /Resources",
+			plain:  func(t *testing.T) []byte { return indirect(t, 25, false) },
+			accept: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := Open(tc.plain(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := d.Linearize()
+			if tc.accept {
+				if err != nil {
+					t.Fatalf("this shape is documented as accepted and was refused: %v", err)
+				}
+				// ⛔ And it is a file, not merely an absence of error.
+				if _, err := CheckLinearized(out); err != nil {
+					t.Fatalf("accepted, but our own checker refuses it: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrCannotLinearize) {
+				t.Fatalf("this shape is documented as refused and was accepted: %v", err)
+			}
+			// ⛔⛔ AND THE MESSAGE NAMES THE INHERITABLE KEY. Review found it
+			// reporting "page 2 shares object(s) [2]" for a document whose
+			// author never wrote object 2 into either page — it arrived by
+			// inheritance. An object number the caller cannot find in their
+			// own source is not a diagnosis.
+			if !strings.Contains(err.Error(), "/Resources") {
+				t.Errorf("refused without naming the key it was inherited as: %v", err)
+			}
+		})
+	}
+}
 
 // ⛔⛔ EVERY WAY THE /Parent CHAIN STOPS, and none of them is a refusal. A page
 // whose /Parent dangles or names a non-dictionary inherits nothing, which is the
@@ -268,6 +398,44 @@ func TestTheInheritanceWalkEndsWhereverTheChainDoes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ⛔ THE MESSAGE HELPER NAMES NOTHING WHEN IT CANNOT READ THE PAGE, and it must
+// not panic doing so. It runs only on the refusal path, where Partition has
+// already read every page — so these two are unreachable from Linearize and
+// reached here instead, the same treatment as the emission's error seams.
+//
+// ⚠ A helper that builds an error message is the worst place for a second
+// failure: it would replace a diagnosis with a crash.
+func TestTheInheritedKeyNamesNothingItCannotRead(t *testing.T) {
+	t.Run("a page that does not read", func(t *testing.T) {
+		d := bareDoc(nil, nil, nil)
+		d.buf = []byte("%PDF-1.7\n")
+		d.xref[1] = xrefEntry{kind: 'n', offset: 100000}
+		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+			t.Errorf("it named %v for a page that does not read", got)
+		}
+	})
+
+	t.Run("a page that is not a dictionary", func(t *testing.T) {
+		d := bareDoc(nil, nil, map[int]Object{1: Integer(7)})
+		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+			t.Errorf("it named %v for a page that is not a dictionary", got)
+		}
+	})
+
+	t.Run("a page inheriting a DIRECT value names nothing", func(t *testing.T) {
+		// ⛔ The message is about an object the caller cannot find, so a direct
+		// inherited value — which adds no object — must not be named.
+		d := bareDoc(nil, nil, map[int]Object{
+			1: Dict{"Type": Name("Page"), "Parent": Ref{Num: 2}},
+			2: Dict{"Type": Name("Pages"),
+				"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}},
+		})
+		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+			t.Errorf("it named %v for an inherited value that is not a reference", got)
+		}
+	})
 }
 
 // ⛔ AND THE NEAREST ANCESTOR WINS. Table 30 takes the first value found walking

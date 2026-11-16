@@ -555,28 +555,82 @@ func (d *Document) reachFromPage(page Ref, boundary map[int]bool) (map[int]bool,
 	return d.reach(start, boundary), nil
 }
 
+// inheritedByReference returns the inheritable keys this page takes from an
+// ancestor whose value is an indirect REFERENCE.
+//
+// ⛔ IT EXISTS FOR A MESSAGE, and only the refusal path calls it. "page 2 shares
+// object 2" is not a diagnosis for a document whose author never wrote object 2
+// into either page: it arrived because the page tree node's /Resources is a
+// reference and the writer pushes inherited attributes down. Naming the key
+// turns an object number the caller cannot find into something they can.
+//
+// ⚠ It reports the KEY, not which object came from it. `reach` expands
+// transitively, so an object deep under an inherited /Resources is not that
+// key's value and claiming otherwise would be a guess.
+func (d *Document) inheritedByReference(page Ref) []Name {
+	o, err := d.Get(page)
+	if err != nil {
+		return nil
+	}
+	dict, ok := ToDict(o)
+	if !ok {
+		return nil
+	}
+
+	// ⛔ inheritablePageKeys AND NOT THE MAP'S OWN ORDER, so the message reads
+	// the same twice: ranging a map would print /Rotate before /Resources on
+	// one run and after it on the next.
+	values := d.inheritedValues(page, dict)
+	var out []Name
+	for _, key := range inheritablePageKeys {
+		if _, isRef := values[key].(Ref); isRef {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
 // inheritedAttributes returns the values of Table 30's inheritable keys that
 // this page does NOT hold itself and so takes from an ancestor.
+func (d *Document) inheritedAttributes(page Ref, dict Dict) []Object {
+	values := d.inheritedValues(page, dict)
+	out := make([]Object, 0, len(values))
+	// ⛔ In inheritablePageKeys' order and not the map's, so two runs over one
+	// document give the same slice — the same reason Partition sorts each page's
+	// set. A writer whose reach order varies produces different bytes from one
+	// input.
+	for _, key := range inheritablePageKeys {
+		if v, has := values[key]; has {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// inheritedValues walks the /Parent chain and returns, for each of Table 30's
+// inheritable keys the page does not state itself, the value it takes from its
+// NEAREST ancestor.
 //
 // ⛔ THE WALK IS BOUNDED BY A SEEN SET, not by a depth. A /Parent chain that
 // loops is a malformed document this function must not hang on, and a page tree
 // deep enough to matter is cheaper to bound by identity than to guess a limit
 // for. The same argument as pushInherited's, which walks the same chain.
-func (d *Document) inheritedAttributes(page Ref, dict Dict) []Object {
-	var out []Object
+//
+// ⛔⛔ THE NEAREST ANCESTOR WINS, AND ONLY IT. Table 30's inheritance takes the
+// first value found walking UP, so a /Resources on the parent SHADOWS one on the
+// grandparent. Collecting from every ancestor would put an object the page
+// cannot reach into its reach — and that object would then be classified as part
+// of the page, which is the same class of defect this walk exists to fix, in the
+// opposite direction.
+func (d *Document) inheritedValues(page Ref, dict Dict) map[Name]Object {
+	out := map[Name]Object{}
 	seen := map[int]bool{page.Num: true}
 
-	// ⛔⛔ THE NEAREST ANCESTOR WINS, AND ONLY IT. Table 30's inheritance takes
-	// the first value found walking UP, so a /Resources on the parent SHADOWS
-	// one on the grandparent. Collecting from every ancestor would put an object
-	// the page cannot reach into its reach — and that object would then be
-	// classified as part of the page, which is the same class of defect this
-	// function exists to fix, in the opposite direction.
-	resolved := map[Name]bool{}
+	stated := map[Name]bool{}
 	for _, key := range inheritablePageKeys {
 		if _, has := dict[key]; has {
 			// The page states it itself, so it inherits nothing for it.
-			resolved[key] = true
+			stated[key] = true
 		}
 	}
 
@@ -597,12 +651,14 @@ func (d *Document) inheritedAttributes(page Ref, dict Dict) []Object {
 			return out
 		}
 		for _, key := range inheritablePageKeys {
-			if resolved[key] {
+			if stated[key] {
+				continue
+			}
+			if _, already := out[key]; already {
 				continue
 			}
 			if v, has := node[key]; has {
-				out = append(out, v)
-				resolved[key] = true
+				out[key] = v
 			}
 		}
 		at = node

@@ -890,6 +890,43 @@ little as one in which every input passes.
 describing it wrongly. Filling that table is a partition question — qpdf reports
 `nshared_total: 3` with part 8 **empty** for the same input — and it is #61.
 
+### ⛔⛔⛔ And that refusal is far wider than "pages sharing a content stream"
+
+Sharing a content stream is the rare case. Table 30 lets a page inherit
+`/Resources`, `/MediaBox`, `/CropBox` and `/Rotate` from the page tree, and the
+writer pushes those down because F.3.7 needs part 6 self-contained. So **any
+multi-page document whose page tree node carries one of those four as an
+indirect reference** has every page depending on one object — and that is the
+ordinary way to write a multi-page PDF, so a large share of real files are
+refused today.
+
+| shape | accepted? |
+|---|---|
+| one page, inherited indirect `/Resources` | **yes** — nothing to share with |
+| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object |
+| multi-page, each page states its own `/Resources` | **yes** |
+| multi-page, only the *second* page inherits | **yes** — the object is private to it |
+| multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
+
+⛔ **The partition had to learn this before the refusal could be right.**
+`reachFromPage` now follows the inherited attributes, because the writer pushes
+them down at emission: if the node's value is a reference, the emitted page names
+an object no *source* page named, and the partition was measuring a different
+document from the one being written. Before that, such a file was **accepted**
+with three defects — and two of them, `/E` and Table F.4 item 1, were older than
+the hint tables:
+
+```
+end of first page section (/E) mismatch: /E = 905; computed = 1190
+object count mismatch for page 0: hint table = 2; computed = 3
+page 1: shared object 7: in computed list but not hint table
+```
+
+⭐ The one-page inherited shape is in both judged loops, because the repair is
+observable only on a document the writer **accepts** — the two-page fixture stops
+at the refusal. Removing the inheritance from the reach reddens it on exactly
+those first two warnings.
+
 ⛔⛔ **THE LAYOUT IS PAGE-MAJOR IN PARTS 6 AND 7, AND A FOREIGN CHECKER IS WHY.**
 Within those parts the order is "page by page, each page's own object first",
 not "ascending object number" — because qpdf measures a page by taking its page

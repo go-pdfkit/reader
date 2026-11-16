@@ -36,19 +36,25 @@ var digits = regexp.MustCompile(`\d+`)
 // about hint tables or page offsets. A new complaint of any other kind is a
 // defect in the layout and fails here.
 func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
-	for _, pages := range []int{1, 2, 5} {
-		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+	// ⛔⛔ THE INHERITED SHAPE IS IN THIS LOOP, AND THAT IS WHERE ITEM 1 GETS AN
+	// ORACLE OUTSIDE THE PARTITION. qpdf checks Table F.4 item 1 directly — it
+	// reported "object count mismatch for page 0: hint table = 2; computed = 3"
+	// on exactly this document before reachFromPage followed inherited
+	// attributes — so running it here is what keeps the value test's comparison
+	// against len(p.Pages[i]) from being the only judge of that field.
+	for _, shape := range hintShapes() {
+		t.Run(shape.name, func(t *testing.T) {
 			qpdf := qpdfOrSkip(t)
 
-			plain := buildPages(t, pages)
+			plain := shape.build(t)
 			d, err := Open(plain)
 			if err != nil {
 				t.Fatal(err)
 			}
 			out, err := d.Linearize()
 			if err != nil {
-				t.Fatalf("Linearize refused a %d-page document this package just built: %v",
-					pages, err)
+				t.Fatalf("Linearize refused a document this package just built (%s): %v",
+					shape.name, err)
 			}
 
 			dir := t.TempDir()
@@ -69,7 +75,7 @@ func TestWhatQpdfSaysAboutAFileWeWrote(t *testing.T) {
 				t.Fatalf("qpdf did not report on our file at all, so what it does not say "+
 					"proves nothing:\n%s", got)
 			}
-			t.Logf("qpdf --check on our own %d-page file:\n%s", pages, got)
+			t.Logf("qpdf --check on our own file (%s):\n%s", shape.name, got)
 
 			// ⛔⛔⛔ THE COMPLAINTS ARE DIFFED AGAINST THE INPUT'S, not matched
 			// against a list of words I chose. The first version of this test

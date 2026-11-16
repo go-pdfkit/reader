@@ -27,9 +27,9 @@ import (
 // ⛔ So the oracle here is the DOCUMENT, not an external tool: decode our own
 // tables and hold every field against the bytes we wrote.
 func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
-	for _, pages := range []int{1, 2, 5, 25} {
-		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
-			d, err := Open(buildPages(t, pages))
+	for _, shape := range hintShapes() {
+		t.Run(shape.name, func(t *testing.T) {
+			d, err := Open(shape.build(t))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -59,9 +59,9 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 				t.Fatalf("our own decoder cannot read the tables we wrote: %v", err)
 			}
 
-			if got := len(tables.pages); got != pages {
+			if got := len(tables.pages); got != len(p.Pages) {
 				t.Fatalf("the table holds %d page entr(ies) for a %d-page document",
-					got, pages)
+					got, len(p.Pages))
 			}
 
 			// ⛔ Item 2 reconstructed through the reader's own adjustment, which
@@ -174,6 +174,72 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hintShapes is the set of documents every hint-table judgement runs over.
+//
+// ⛔⛔ THE ONE-PAGE INHERITED SHAPE IS HERE BECAUSE THE FIX HAD NO WITNESS. When
+// reachFromPage learned to follow Table 30's inherited attributes it repaired
+// two defects older than the hint tables — /E and Table F.4 item 1 — but both
+// are observable only on a document the writer ACCEPTS, and the
+// inherited-attribute fixture has TWO pages, so it stops at the shared-object
+// refusal. Deleting inheritedAttributes reddened that test through Pages[0] and
+// left /E and item 1 unobserved.
+//
+// ⭐ One page inheriting an indirect /Resources is the smallest shape where the
+// repair shows: the resources object is part 6, item 1 is 3 rather than 2, and
+// /E runs past it. Measured clean before being added, so this is a witness that
+// can go red and not a known failure.
+func hintShapes() []struct {
+	name  string
+	build func(*testing.T) []byte
+} {
+	out := []struct {
+		name  string
+		build func(*testing.T) []byte
+	}{}
+	for _, n := range []int{1, 2, 5, 25} {
+		pages := n
+		out = append(out, struct {
+			name  string
+			build func(*testing.T) []byte
+		}{
+			name:  fmt.Sprintf("%d pages", pages),
+			build: func(t *testing.T) []byte { return buildPages(t, pages) },
+		})
+	}
+	out = append(out, struct {
+		name  string
+		build func(*testing.T) []byte
+	}{
+		name:  "one page inheriting an indirect /Resources",
+		build: onePageInheritedFixture,
+	})
+	return out
+}
+
+// onePageInheritedFixture writes a ONE-page document whose /Resources is an
+// indirect reference on the page tree node — the smallest shape in which the
+// page's object set must include an object no page dictionary names.
+func onePageInheritedFixture(t *testing.T) []byte {
+	t.Helper()
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+	content := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (one) Tj ET")})
+	// ⛔ No /Resources on the page: it INHERITS it from the node.
+	page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": content})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page},
+		"Count":     Integer(1),
+		"Resources": res,
+		"MediaBox":  Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
 }
 
 // ⛔⛔ THE PASS-INVARIANT LENGTH, ASSERTED DIRECTLY. The hint stream sits before

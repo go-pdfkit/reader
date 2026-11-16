@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrCannotLinearize reports a document this package declines to linearize.
@@ -138,6 +139,20 @@ var buildHint = buildHintTables
 // so the writer returns an error naming the objects instead. Filling that table
 // is a partition question, not a table one, and it is #61.
 //
+// ⛔⛔⛔ THAT SCOPE IS WIDER THAN IT SOUNDS, AND SHARING A CONTENT STREAM IS THE
+// RARE CASE. Table 30 lets a page inherit /Resources, /MediaBox, /CropBox and
+// /Rotate from the page tree, and the writer pushes those down because F.3.7
+// needs part 6 self-contained. So a MULTI-PAGE document whose node carries any
+// of those four as an INDIRECT REFERENCE has every page depending on one
+// object, and is refused — which is a large share of real multi-page PDFs,
+// since one shared resource dictionary is the ordinary way to write them.
+//
+// ⚠ A one-page document is never affected, nor a multi-page one whose
+// inheritable values are DIRECT (an inline /MediaBox array adds no object), nor
+// one where each page states its own. The error names the inheritable key when
+// the dependency arrived that way, because the object number alone is not
+// something the caller can find in their source.
+//
 // ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
 // defects were separable: the partition before the layout, the layout before the
 // fixpoint, the encoder's bytes before any file existed, and the layout before
@@ -203,11 +218,32 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 			ErrCannotLinearize, len(p.Pages), len(p.Shared))
 	}
 	for i, s := range p.Shared {
-		if len(s) != 0 {
-			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
-				"and the shared object hint table this writer emits is empty",
-				ErrCannotLinearize, i+1, s)
+		if len(s) == 0 {
+			continue
 		}
+		// ⛔⛔ THE MESSAGE NAMES THE CAUSE, NOT ONLY THE OBJECT. Review found the
+		// first version reporting "page 2 shares object(s) [2]" for a document
+		// whose author never wrote object 2 into either page: it arrived by
+		// INHERITANCE, because the page tree node's /Resources is an indirect
+		// reference and the writer pushes it down. An object number the caller
+		// cannot find in their own source is not a diagnosis.
+		if keys := d.inheritedByReference(Ref{Num: p.PageObjects[i]}); len(keys) != 0 {
+			// ⛔ WITH THE SLASH, because that is how a PDF key is written and
+			// how the caller will search their own file for it. Formatting a
+			// []Name directly gives "[Resources]", which is neither the key as
+			// the document spells it nor a list a reader recognises.
+			named := make([]string, 0, len(keys))
+			for _, key := range keys {
+				named = append(named, "/"+string(key))
+			}
+			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
+				"which it inherits as %s from an ancestor in the page tree — and the "+
+				"shared object hint table this writer emits is empty",
+				ErrCannotLinearize, i+1, s, strings.Join(named, ", "))
+		}
+		return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
+			"and the shared object hint table this writer emits is empty",
+			ErrCannotLinearize, i+1, s)
 	}
 	// ⛔ NO GUARD FOR AN EMPTY ORDER, AND THAT IS DELIBERATE. Partition refuses
 	// a document with no pages by name, and Order returns one entry per placed
