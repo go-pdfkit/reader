@@ -555,8 +555,8 @@ func (d *Document) reachFromPage(page Ref, boundary map[int]bool) (map[int]bool,
 	return d.reach(start, boundary), nil
 }
 
-// inheritedByReference returns the inheritable keys this page takes from an
-// ancestor whose value is an indirect REFERENCE.
+// inheritedByReference returns the inheritable keys whose inherited value IS one
+// of `shared` — the objects this page shares with an earlier one.
 //
 // ⛔ IT EXISTS FOR A MESSAGE, and only the refusal path calls it. "page 2 shares
 // object 2" is not a diagnosis for a document whose author never wrote object 2
@@ -564,10 +564,25 @@ func (d *Document) reachFromPage(page Ref, boundary map[int]bool) (map[int]bool,
 // reference and the writer pushes inherited attributes down. Naming the key
 // turns an object number the caller cannot find into something they can.
 //
-// ⚠ It reports the KEY, not which object came from it. `reach` expands
-// transitively, so an object deep under an inherited /Resources is not that
-// key's value and claiming otherwise would be a guess.
-func (d *Document) inheritedByReference(page Ref) []Name {
+// ⛔⛔ AND IT MUST BE ASKED ABOUT THE SHARED OBJECTS, NOT ABOUT THE PAGE. The
+// first version asked only "does this page inherit anything by reference", which
+// conflated two causes and could state a falsehood. Review constructed it: two
+// pages naming the SAME /Contents explicitly, with page 2 under a sub-node
+// carrying an indirect /Rotate private to it, produced
+//
+//	page 2 shares object(s) [4] with an earlier page, which it inherits as
+//	/Rotate from an ancestor in the page tree
+//
+// where object 4 is written in both page dictionaries and was never inherited,
+// and /Rotate's object is 3 and is not shared at all. Both halves of that
+// sentence were true and their conjunction was not.
+//
+// ⚠ IT MISSES THE TRANSITIVE CASE, deliberately. `reach` expands through an
+// inherited /Resources, so an object deep underneath it is shared without being
+// that key's value — and there the plain message, naming only the object, is the
+// honest one. A helper that cannot be wrong is worth more than one that is
+// usually more specific.
+func (d *Document) inheritedByReference(page Ref, shared []int) []Name {
 	o, err := d.Get(page)
 	if err != nil {
 		return nil
@@ -577,13 +592,19 @@ func (d *Document) inheritedByReference(page Ref) []Name {
 		return nil
 	}
 
+	isShared := make(map[int]bool, len(shared))
+	for _, num := range shared {
+		isShared[num] = true
+	}
+
 	// ⛔ inheritablePageKeys AND NOT THE MAP'S OWN ORDER, so the message reads
 	// the same twice: ranging a map would print /Rotate before /Resources on
 	// one run and after it on the next.
 	values := d.inheritedValues(page, dict)
 	var out []Name
 	for _, key := range inheritablePageKeys {
-		if _, isRef := values[key].(Ref); isRef {
+		ref, isRef := values[key].(Ref)
+		if isRef && isShared[ref.Num] {
 			out = append(out, key)
 		}
 	}

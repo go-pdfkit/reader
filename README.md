@@ -894,19 +894,40 @@ describing it wrongly. Filling that table is a partition question — qpdf repor
 
 Sharing a content stream is the rare case. Table 30 lets a page inherit
 `/Resources`, `/MediaBox`, `/CropBox` and `/Rotate` from the page tree, and the
-writer pushes those down because F.3.7 needs part 6 self-contained. So **any
-multi-page document whose page tree node carries one of those four as an
-indirect reference** has every page depending on one object — and that is the
-ordinary way to write a multi-page PDF, so a large share of real files are
-refused today.
+writer pushes those down because F.3.7 needs part 6 self-contained. So a document
+is refused **iff an inheritable indirect value is inherited by more than one
+page** — and one shared resource dictionary on the page tree node is the ordinary
+way to write a multi-page PDF, so a large share of real files are refused today.
+
+⛔ **"Multi-page with an indirect inherited value" is NOT the rule**, and that is
+what this table said until a three-level fixture refuted it. What matters is how
+many pages inherit the *same* object, not how many pages the document has:
 
 | shape | accepted? |
 |---|---|
 | one page, inherited indirect `/Resources` | **yes** — nothing to share with |
 | multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object |
 | multi-page, each page states its own `/Resources` | **yes** |
-| multi-page, only the *second* page inherits | **yes** — the object is private to it |
-| multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
+| a **sub-node**'s indirect `/Resources` with **one** page under it | **yes** — part 7, private to that page |
+| a **sub-node**'s indirect `/Resources` with **two** pages under it | **no** — part 8, shared |
+| flat multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
+
+⛔ Every fixture in that table but the two sub-node rows is a **flat** page tree,
+which is exactly why the boundary was mis-stated: a flat tree cannot express
+"inherited by one page out of several". The accepting rows carry more weight than
+the refusing ones — without them a stricter reach would refuse everything and the
+suite would stay green.
+
+⚠ **The error names the inheritable key only when that key's own object is the
+shared one.** Asking merely "does this page inherit anything by reference"
+conflates two causes and can state a falsehood: two pages naming the *same*
+`/Contents` explicitly, with one of them under a sub-node carrying an unrelated
+indirect `/Rotate`, produced *"shares object 4 … which it inherits as /Rotate"* —
+where object 4 was written in both page dictionaries and `/Rotate`'s object was
+not shared at all. Both halves were true and the conjunction was not. The
+transitive case is given up deliberately: an object deep under an inherited
+`/Resources` is shared without being that key's value, and there the plain
+message is the honest one.
 
 ⛔ **The partition had to learn this before the refusal could be right.**
 `reachFromPage` now follows the inherited attributes, because the writer pushes

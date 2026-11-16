@@ -264,15 +264,111 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 		return plain
 	}
 
+	// ⛔⛔ A THREE-LEVEL TREE, because every other fixture here is FLAT and the
+	// rule's boundary lies exactly where a flat tree cannot reach it. The
+	// indirect /Resources sits on a SUB-NODE with `under` pages beneath it: with
+	// one page below, the object is that page's alone and the document is
+	// accepted; with two, it is shared and refused. Row 4's old wording —
+	// "multi-page inheriting one indirect /Resources is refused" — is literally
+	// false for the first of those, and the accurate rule is "refused iff an
+	// inheritable indirect value is inherited by MORE THAN ONE page".
+	deep := func(t *testing.T, under int) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		rootNode := w.Reserve()
+		subNode := w.Reserve()
+		res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+
+		// One page directly under the root node, stating its own resources.
+		direct := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (a) Tj ET")})
+		first := w.Add(Dict{"Type": Name("Page"), "Parent": rootNode,
+			"Contents": direct, "Resources": Dict{}})
+
+		// `under` pages beneath the sub-node, inheriting its /Resources.
+		kids := make(Array, 0, under)
+		for i := 0; i < under; i++ {
+			c := w.Add(&Stream{Dict: Dict{},
+				Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (s%d) Tj ET", i+1))})
+			kids = append(kids, w.Add(Dict{"Type": Name("Page"),
+				"Parent": subNode, "Contents": c}))
+		}
+		w.Put(subNode, Dict{"Type": Name("Pages"), "Parent": rootNode,
+			"Kids": kids, "Count": Integer(under), "Resources": res})
+		w.Put(rootNode, Dict{"Type": Name("Pages"),
+			"Kids":     append(Array{first}, subNode),
+			"Count":    Integer(1 + under),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": rootNode})
+
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
+	// ⛔⛔ AND A DOCUMENT WHERE NAMING THE KEY WOULD BE FALSE. Two pages name the
+	// SAME /Contents explicitly — so the sharing has nothing to do with
+	// inheritance — while page 2 sits under a sub-node carrying an indirect
+	// /Rotate that is private to it. The first version of the message asked
+	// only "does this page inherit anything by reference" and so reported
+	// "shares object 4 … which it inherits as /Rotate", where object 4 was
+	// written in both page dictionaries and /Rotate's object is not shared.
+	falseKey := func(t *testing.T) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		rootNode := w.Reserve()
+		subNode := w.Reserve()
+		rotate := w.Add(Integer(90))
+		shared := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (both) Tj ET")})
+
+		first := w.Add(Dict{"Type": Name("Page"), "Parent": rootNode,
+			"Contents": shared, "Resources": Dict{}})
+		second := w.Add(Dict{"Type": Name("Page"), "Parent": subNode,
+			"Contents": shared, "Resources": Dict{}})
+		w.Put(subNode, Dict{"Type": Name("Pages"), "Parent": rootNode,
+			"Kids": Array{second}, "Count": Integer(1), "Rotate": rotate})
+		w.Put(rootNode, Dict{"Type": Name("Pages"), "Kids": Array{first, subNode},
+			"Count":    Integer(2),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+		root := w.Add(Dict{"Type": Name("Catalog"), "Pages": rootNode})
+
+		plain, err := w.Finish(Dict{"Root": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
 	for _, tc := range []struct {
 		name   string
 		plain  func(*testing.T) []byte
 		accept bool
+		// key is the inheritable key the refusal must name, or "" when the
+		// sharing is not caused by inheritance and naming one would be false.
+		key string
 	}{
 		{
 			name:   "one page inheriting an indirect /Resources",
 			plain:  func(t *testing.T) []byte { return indirect(t, 1, false) },
 			accept: true, // nothing to share with
+		},
+		{
+			name:   "a sub-node's indirect /Resources with ONE page under it",
+			plain:  func(t *testing.T) []byte { return deep(t, 1) },
+			accept: true, // the object is that page's alone
+		},
+		{
+			name:   "a sub-node's indirect /Resources with TWO pages under it",
+			plain:  func(t *testing.T) []byte { return deep(t, 2) },
+			accept: false,
+			key:    "/Resources",
+		},
+		{
+			name:   "pages sharing a /Contents while one inherits an unrelated key",
+			plain:  falseKey,
+			accept: false,
+			key:    "", // naming /Rotate here would be a falsehood
 		},
 		{
 			name:   "two pages with inheritable values all DIRECT",
@@ -288,11 +384,13 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 			name:   "two pages inheriting ONE indirect /Resources",
 			plain:  func(t *testing.T) []byte { return indirect(t, 2, false) },
 			accept: false, // needs F.4.2, which is #61
+			key:    "/Resources",
 		},
 		{
 			name:   "twenty-five pages inheriting ONE indirect /Resources",
 			plain:  func(t *testing.T) []byte { return indirect(t, 25, false) },
 			accept: false,
+			key:    "/Resources",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -314,13 +412,26 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 			if !errors.Is(err, ErrCannotLinearize) {
 				t.Fatalf("this shape is documented as refused and was accepted: %v", err)
 			}
-			// ⛔⛔ AND THE MESSAGE NAMES THE INHERITABLE KEY. Review found it
-			// reporting "page 2 shares object(s) [2]" for a document whose
-			// author never wrote object 2 into either page — it arrived by
-			// inheritance. An object number the caller cannot find in their
-			// own source is not a diagnosis.
-			if !strings.Contains(err.Error(), "/Resources") {
-				t.Errorf("refused without naming the key it was inherited as: %v", err)
+			// ⛔⛔ AND THE MESSAGE NAMES THE KEY ONLY WHEN THE KEY IS THE CAUSE.
+			// Naming it is a diagnosis when the shared object IS the inherited
+			// value — "page 2 shares object 2" tells the caller nothing about a
+			// document where they wrote object 2 into neither page. Naming it
+			// otherwise is a falsehood, and the last case here is a document
+			// where both halves of such a sentence were true while their
+			// conjunction was not.
+			if tc.key == "" {
+				for _, key := range []string{"/Resources", "/MediaBox", "/CropBox",
+					"/Rotate"} {
+					if strings.Contains(err.Error(), key) {
+						t.Errorf("it blamed %s for sharing that inheritance did not "+
+							"cause: %v", key, err)
+					}
+				}
+				return
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("refused without naming %s, the key it was inherited as: %v",
+					tc.key, err)
 			}
 		})
 	}
@@ -412,14 +523,14 @@ func TestTheInheritedKeyNamesNothingItCannotRead(t *testing.T) {
 		d := bareDoc(nil, nil, nil)
 		d.buf = []byte("%PDF-1.7\n")
 		d.xref[1] = xrefEntry{kind: 'n', offset: 100000}
-		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+		if got := d.inheritedByReference(Ref{Num: 1}, []int{2}); got != nil {
 			t.Errorf("it named %v for a page that does not read", got)
 		}
 	})
 
 	t.Run("a page that is not a dictionary", func(t *testing.T) {
 		d := bareDoc(nil, nil, map[int]Object{1: Integer(7)})
-		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+		if got := d.inheritedByReference(Ref{Num: 1}, []int{2}); got != nil {
 			t.Errorf("it named %v for a page that is not a dictionary", got)
 		}
 	})
@@ -432,8 +543,27 @@ func TestTheInheritedKeyNamesNothingItCannotRead(t *testing.T) {
 			2: Dict{"Type": Name("Pages"),
 				"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}},
 		})
-		if got := d.inheritedByReference(Ref{Num: 1}); got != nil {
+		if got := d.inheritedByReference(Ref{Num: 1}, []int{3}); got != nil {
 			t.Errorf("it named %v for an inherited value that is not a reference", got)
+		}
+	})
+
+	t.Run("an inherited reference that is not the shared object", func(t *testing.T) {
+		// ⛔⛔ THE CONJUNCTION REVIEW CONSTRUCTED: the page DOES inherit a
+		// reference and that reference is NOT what it shares. Asking only "does
+		// this page inherit anything by reference" made both halves true and
+		// the sentence false.
+		d := bareDoc(nil, nil, map[int]Object{
+			1: Dict{"Type": Name("Page"), "Parent": Ref{Num: 2}},
+			2: Dict{"Type": Name("Pages"), "Rotate": Ref{Num: 9}},
+		})
+		if got := d.inheritedByReference(Ref{Num: 1}, []int{4}); got != nil {
+			t.Errorf("it named %v for a key whose object is not among the shared ones", got)
+		}
+		// And it DOES name it when the inherited reference is the shared object.
+		if got := d.inheritedByReference(Ref{Num: 1}, []int{9}); len(got) != 1 ||
+			got[0] != "Rotate" {
+			t.Errorf("it named %v when /Rotate's own object is the shared one", got)
 		}
 	})
 }

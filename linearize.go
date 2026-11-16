@@ -142,16 +142,26 @@ var buildHint = buildHintTables
 // ⛔⛔⛔ THAT SCOPE IS WIDER THAN IT SOUNDS, AND SHARING A CONTENT STREAM IS THE
 // RARE CASE. Table 30 lets a page inherit /Resources, /MediaBox, /CropBox and
 // /Rotate from the page tree, and the writer pushes those down because F.3.7
-// needs part 6 self-contained. So a MULTI-PAGE document whose node carries any
-// of those four as an INDIRECT REFERENCE has every page depending on one
-// object, and is refused — which is a large share of real multi-page PDFs,
-// since one shared resource dictionary is the ordinary way to write them.
+// needs part 6 self-contained. The rule is:
 //
-// ⚠ A one-page document is never affected, nor a multi-page one whose
-// inheritable values are DIRECT (an inline /MediaBox array adds no object), nor
-// one where each page states its own. The error names the inheritable key when
-// the dependency arrived that way, because the object number alone is not
-// something the caller can find in their source.
+//	refused iff an inheritable INDIRECT value is inherited by MORE THAN ONE page
+//
+// which is a large share of real multi-page PDFs, since one shared resource
+// dictionary on the page tree node is the ordinary way to write them.
+//
+// ⛔ "MULTI-PAGE WITH AN INDIRECT INHERITED VALUE" IS NOT THE RULE, and that is
+// what this comment said until a three-level fixture refuted it: a sub-node
+// carrying an indirect /Resources with exactly ONE page under it puts that
+// object in part 7, private to that page, and the document is accepted. What
+// counts is how many pages inherit the SAME object, not how many pages exist.
+//
+// ⚠ Also unaffected: a one-page document, a document whose inheritable values
+// are DIRECT (an inline /MediaBox array adds no object), and one where each page
+// states its own.
+//
+// ⚠ The error names the inheritable key only when THAT KEY'S OWN OBJECT is the
+// shared one. Asking merely "does this page inherit anything by reference"
+// conflates two causes and can state a falsehood — see inheritedByReference.
 //
 // ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
 // defects were separable: the partition before the layout, the layout before the
@@ -227,7 +237,7 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 		// INHERITANCE, because the page tree node's /Resources is an indirect
 		// reference and the writer pushes it down. An object number the caller
 		// cannot find in their own source is not a diagnosis.
-		if keys := d.inheritedByReference(Ref{Num: p.PageObjects[i]}); len(keys) != 0 {
+		if keys := d.inheritedByReference(Ref{Num: p.PageObjects[i]}, s); len(keys) != 0 {
 			// ⛔ WITH THE SLASH, because that is how a PDF key is written and
 			// how the caller will search their own file for it. Formatting a
 			// []Name directly gives "[Resources]", which is neither the key as
