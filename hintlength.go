@@ -27,6 +27,9 @@ import "fmt"
 // it rejects readable PDFs, which is #52's scar (a work budget that refused a
 // 150 000-page file) and #59's (a bound that refused an ordinary document
 // sharing three fonts).
+// ⛔ IT RECORDS WHAT IT MEASURED on the Linearization, because returning nil
+// alone cannot distinguish "every length agreed" from "no length could be
+// measured" — see LengthsChecked.
 func checkHintLengths(b []byte, d *Document, lin *Linearization, t *hintTables) error {
 	if err := checkPageLengths(b, d, lin, t); err != nil {
 		return err
@@ -34,18 +37,20 @@ func checkHintLengths(b []byte, d *Document, lin *Linearization, t *hintTables) 
 	return checkGroupLengths(b, d, lin, t)
 }
 
-// ⛔⛔ A SEAM, BECAUSE NO FILE IN EXISTENCE REACHES THE PROPAGATION. For
-// CheckLinearized to return a length error, a file would have to decode its
-// tables cleanly AND state a wrong length — and the only file in the corpus
-// with wrong lengths, testdata/linearized-gs.pdf, does not decode at all (its
-// entries overrun /S by 26 bits). Every file whose tables decode is a file qpdf
-// accepts, which means its lengths are right.
+// ⛔⛔ THERE IS NO SEAM HERE, AND THE REASONING THAT WANTED ONE WAS FALSE. A
+// first version made this a replaceable var, on the grounds that no file could
+// reach the propagation: the one fixture with wrong lengths does not decode (its
+// entries overrun /S by 26 bits), every file that decodes is a file qpdf accepts,
+// and building a counter-example "would mean re-encoding a Flate-compressed hint
+// stream".
 //
-// ⛔ So the propagation is kept and reached HERE rather than left as a branch
-// nothing exercises. Building a real counter-example would mean re-encoding a
-// Flate-compressed hint stream with one altered field, which tests the encoder
-// rather than this path.
-var checkLengths = checkHintLengths
+// ⭐ That is true of qpdf's output and FALSE OF OURS. writeHintStream emits the
+// data RAW with no /Filter, and hintByteWidth pins item 2 at 32 bits — so the
+// page-length column of a file this package wrote sits at a computable byte, and
+// adding 1 to it produces exactly the file the propagation needs, with every
+// offset, /Length and /L still valid. Six review rounds of #66 were spent
+// replacing stated claims with files; reaching for a seam while the materials
+// for a real witness were in our own writer was the same mistake one layer up.
 
 // checkPageLengths compares Table F.4 item 2 for every page.
 //
@@ -73,8 +78,10 @@ func checkPageLengths(b []byte, d *Document, lin *Linearization, t *hintTables) 
 		}
 		if !ok {
 			// ⚠ Not measurable the way qpdf measures it — see spanLength.
+			lin.LengthsSkipped++
 			continue
 		}
+		lin.LengthsChecked++
 		if int(e.Length) != total {
 			return fmt.Errorf("%w: page %d's entry says %d bytes and its %d object(s) from "+
 				"object %d occupy %d", ErrHintTablesInvalid, i+1, e.Length, e.NObjects,
@@ -119,9 +126,15 @@ func checkGroupLengths(b []byte, d *Document, lin *Linearization, t *hintTables)
 		if err != nil {
 			return err
 		}
-		if ok && int(g.Length) != total {
-			return fmt.Errorf("%w: shared group %d says %d bytes and its %d object(s) from "+
-				"object %d occupy %d", ErrHintTablesInvalid, i, g.Length, count, num, total)
+		if !ok {
+			lin.LengthsSkipped++
+		} else {
+			lin.LengthsChecked++
+			if int(g.Length) != total {
+				return fmt.Errorf("%w: shared group %d says %d bytes and its %d object(s) "+
+					"from object %d occupy %d", ErrHintTablesInvalid, i, g.Length, count,
+					num, total)
+			}
 		}
 		num += count
 	}

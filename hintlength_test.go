@@ -7,7 +7,6 @@ package reader
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,8 +35,24 @@ import (
 // it equals qpdf's computation — the same agreement #61 asks for, obtained from
 // the files that decode rather than the one that does not.
 func TestOurLengthsAgreeWithEveryFileQpdfAccepts(t *testing.T) {
-	for _, name := range []string{"linearized.pdf", "linearized-shared.pdf",
-		"linearized-objstm.pdf"} {
+	for _, tc := range []struct {
+		name string
+		// splits says this fixture exercises BOTH runs of shared groups — the
+		// first page's and part 8's — so the counter switch is witnessed.
+		splits bool
+	}{
+		{name: "linearized.pdf"},
+		// ⛔⛔ THE TWO-RUN SPLIT'S WITNESS, measured rather than assumed:
+		// `qpdf --show-linearization testdata/linearized-shared.pdf` reports
+		// nshared_first_page 2, nshared_total 3, first_shared_obj 5, part 8
+		// POPULATED, with group lengths 108, 99 and 601. So group 2 is where
+		// the counter must leave /O and start at object 5, and this is the only
+		// fixture that says so — linearized-objstm.pdf is 3 == 3 and exercises
+		// the first run alone.
+		{name: "linearized-shared.pdf", splits: true},
+		{name: "linearized-objstm.pdf"},
+	} {
+		name := tc.name
 		t.Run(name, func(t *testing.T) {
 			b, err := os.ReadFile(filepath.Join("testdata", name))
 			if err != nil {
@@ -84,10 +99,18 @@ func TestOurLengthsAgreeWithEveryFileQpdfAccepts(t *testing.T) {
 				}
 			}
 
+			if tc.splits != (tables.shared.NSharedFirstPage < tables.shared.NSharedTotal) {
+				t.Fatalf("this fixture reports %d first-page and %d total shared entr(ies), "+
+					"so it does not exercise the runs this case claims",
+					tables.shared.NSharedFirstPage, tables.shared.NSharedTotal)
+			}
+
 			num := lin.FirstPageObject
+			switched := false
 			for i, g := range tables.sharedGroups {
 				if i == int(tables.shared.NSharedFirstPage) {
 					num = int(tables.shared.FirstSharedObj)
+					switched = true
 				}
 				got, ok, err := spanLength(b, d, lin, num, int(g.NObjects))
 				if err != nil {
@@ -105,7 +128,11 @@ func TestOurLengthsAgreeWithEveryFileQpdfAccepts(t *testing.T) {
 				num += int(g.NObjects)
 			}
 
-			t.Logf("%d length(s) compared, %d not measurable", compared, skipped)
+			if tc.splits && !switched {
+				t.Error("the counter never left /O, so part 8's run was not measured")
+			}
+			t.Logf("%d length(s) compared, %d not measurable, split fired: %v",
+				compared, skipped, switched)
 			if compared == 0 {
 				t.Fatal("nothing was compared, so this file witnesses no agreement " +
 					"with qpdf at all")
@@ -194,7 +221,12 @@ func TestASpanInsideAnObjectStreamIsNotMeasured(t *testing.T) {
 	d.buf = []byte("%PDF-1.7\n1 0 obj\n<< >>\nendobj\n")
 	// Object 1 has an offset of its own; object 2 lives in a stream.
 	d.xref[1] = xrefEntry{kind: 'n', offset: 9}
-	d.xref[2] = xrefEntry{kind: 'c'}
+	// ⛔⛔ 'o', NOT 'c'. xref.go defines exactly three kinds — 'n' at a byte
+	// offset, 'o' inside an object stream, 'f' free — and 'c' is not one of
+	// them: nothing in this package writes it. The branch WAS reached, because
+	// 'c' is not 'n', so the test passed while witnessing a state no file can
+	// hold, and a later change treating 'o' specially would have left it green.
+	d.xref[2] = xrefEntry{kind: 'o', strmNum: 1, strmIdx: 0}
 
 	lin := &Linearization{FirstPageObject: 1}
 
@@ -219,6 +251,81 @@ func TestASpanInsideAnObjectStreamIsNotMeasured(t *testing.T) {
 	if _, _, err := spanLength(d.buf, d, lin, 5, 2); !errors.Is(err, ErrHintTablesInvalid) {
 		t.Errorf("a hint table measuring an absent object was accepted: %v", err)
 	}
+}
+
+// ⛔⛔ THE COUNTS DISTINGUISH "ALL AGREED" FROM "NONE MEASURABLE", which a nil
+// error cannot. A file whose page objects are all inside object streams is not
+// refused — object streams are legal in a linearized document — so without these
+// a caller depending on "the lengths were checked" gets the same answer from a
+// verified file and an unverifiable one.
+//
+// ⚠ Review found this, and it also found why linearized-objstm.pdf shows 0
+// skipped: qpdf left objects 8-10 uncompressed, and the compressed ones (11-12)
+// are named by no span. So that fixture does NOT witness the skip, which is why
+// the skipping case below is built by hand.
+func TestTheLengthCheckSaysHowMuchItMeasured(t *testing.T) {
+	t.Run("a file every length of which is measurable", func(t *testing.T) {
+		b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lin, err := CheckLinearized(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lin.LengthsChecked == 0 {
+			t.Error("it reports nothing checked for a file qpdf accepts")
+		}
+		if lin.LengthsSkipped != 0 {
+			t.Errorf("it skipped %d length(s) in a file with no compressed span",
+				lin.LengthsSkipped)
+		}
+	})
+
+	t.Run("a page whose span is compressed", func(t *testing.T) {
+		d := bareDoc(nil, []Ref{{Num: 1}}, map[int]Object{1: Dict{"Type": Name("Page")}})
+		d.buf = []byte("%PDF-1.7\n1 0 obj\n<< >>\nendobj\n")
+		d.xref[1] = xrefEntry{kind: 'n', offset: 9}
+		d.xref[2] = xrefEntry{kind: 'o', strmNum: 1, strmIdx: 0}
+
+		lin := &Linearization{FirstPageObject: 1}
+		tables := &hintTables{pages: []pageEntry{{NObjects: 2, Length: 123456}}}
+
+		if err := checkHintLengths(d.buf, d, lin, tables); err != nil {
+			t.Fatalf("a compressed span was refused: %v", err)
+		}
+		// ⛔ THE POINT: nil, and nothing checked. A caller reading only the
+		// error would believe 123456 had been confirmed.
+		if lin.LengthsChecked != 0 || lin.LengthsSkipped != 1 {
+			t.Errorf("it reports %d checked and %d skipped, want 0 and 1",
+				lin.LengthsChecked, lin.LengthsSkipped)
+		}
+	})
+
+	t.Run("a shared group whose span is compressed", func(t *testing.T) {
+		// ⛔ THE GROUP PATH SKIPS TOO, and no fixture reaches it either: both
+		// runs of groups in every accepted file measure cleanly. The page path
+		// above and this one are separate loops, so a witness for one is not a
+		// witness for the other.
+		d := bareDoc(nil, nil, nil)
+		d.buf = []byte("%PDF-1.7\n1 0 obj\n<< >>\nendobj\n")
+		d.xref[1] = xrefEntry{kind: 'n', offset: 9}
+		d.xref[2] = xrefEntry{kind: 'o', strmNum: 1, strmIdx: 0}
+
+		lin := &Linearization{FirstPageObject: 1}
+		tables := &hintTables{
+			shared:       &sharedHeader{NSharedFirstPage: 1, NSharedTotal: 1},
+			sharedGroups: []sharedGroup{{NObjects: 2, Length: 99999}},
+		}
+
+		if err := checkHintLengths(d.buf, d, lin, tables); err != nil {
+			t.Fatalf("a compressed group span was refused: %v", err)
+		}
+		if lin.LengthsChecked != 0 || lin.LengthsSkipped != 1 {
+			t.Errorf("it reports %d checked and %d skipped, want 0 and 1",
+				lin.LengthsChecked, lin.LengthsSkipped)
+		}
+	})
 }
 
 // ⛔ EVERY WAY THE LENGTH CHECK REFUSES, reached directly because the files that
@@ -253,7 +360,7 @@ func TestEveryWayTheLengthCheckRefuses(t *testing.T) {
 		map[int]Object{1: Dict{"Type": Name("Page")}})
 	tiny.buf = []byte("%PDF-1.7\n1 0 obj\n<< >>\nendobj\n")
 	tiny.xref[1] = xrefEntry{kind: 'n', offset: 9}
-	tiny.xref[2] = xrefEntry{kind: 'c'}
+	tiny.xref[2] = xrefEntry{kind: 'o', strmNum: 1, strmIdx: 0}
 
 	// And one whose single object has an offset the file cannot hold.
 	lost := bareDoc(nil, []Ref{{Num: 1}},
@@ -368,35 +475,109 @@ func TestEveryWayTheLengthCheckRefuses(t *testing.T) {
 	}
 }
 
-// ⛔ AND CheckLinearized PROPAGATES IT, through the seam — because no file
-// reaches that path: a file whose tables decode is a file qpdf accepts, and the
-// one file with wrong lengths does not decode. The propagation is still the
-// thing a caller depends on, so it is reached here rather than left unexercised.
-func TestCheckLinearizedPropagatesALengthRefusal(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("testdata", "linearized.pdf"))
+// ⛔⛔ CheckLinearized REFUSES A REAL FILE WITH A WRONG LENGTH, built by flipping
+// one byte of one this package wrote — not through a replaced function.
+//
+// ⭐ IT IS POSSIBLE BECAUSE OF TWO CHOICES OUR WRITER MADE. writeHintStream
+// emits the hint data RAW, with no /Filter, and hintByteWidth pins Table F.4
+// item 2 at 32 bits — so the page-length column is at a byte this test can
+// COMPUTE, and adding 1 to it leaves every offset, /Length and /L untouched
+// while making the table disagree with the file by exactly one byte.
+//
+// ⛔ A first version used a seam instead, on the stated grounds that a
+// counter-example "would mean re-encoding a Flate-compressed hint stream". That
+// is true of qpdf's output and false of ours — the materials were in our own
+// writer. Six rounds of #66 went into replacing claims with files; this is the
+// same lesson one layer up.
+func TestCheckLinearizedRefusesAFileWhoseLengthIsWrong(t *testing.T) {
+	d, err := Open(buildPages(t, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// It passes today, which is what makes the seam the only way in.
-	if _, err := CheckLinearized(b); err != nil {
-		t.Fatalf("the fixture is refused before the seam is reached: %v", err)
+	good, err := d.Linearize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckLinearized(good); err != nil {
+		t.Fatalf("our own file is refused before anything is flipped: %v", err)
 	}
 
-	boom := fmt.Errorf("%w: a length refusal planted by the test", ErrHintTablesInvalid)
-	saved := checkLengths
-	defer func() { checkLengths = saved }()
-	called := 0
-	checkLengths = func([]byte, *Document, *Linearization, *hintTables) error {
-		called++
-		return boom
+	lin, err := Linearized(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err := Open(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := written.readHintTables(lin)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := CheckLinearized(b); !errors.Is(err, boom) {
-		t.Fatalf("the length refusal did not reach the caller: %v", err)
+	// ⛔ THE POSITION IS DERIVED, NOT COPIED. Table F.3's header is 36 bytes;
+	// group (a) is one item-1 delta per page at NBitsDeltaNObjects bits, padded
+	// to a byte; group (b) follows with item 2 at 32 bits per page. The low
+	// byte of the first page's item 2 is three bytes into that field.
+	dataAt := hintDataOffset(t, good, lin)
+	bits := len(tables.pages) * tables.pageOffset.NBitsDeltaNObjects
+	groupB := 36 + (bits+7)/8
+	at := dataAt + groupB + 3
+
+	was := tables.pages[0].Length
+	bad := make([]byte, len(good))
+	copy(bad, good)
+	bad[at]++
+
+	// ⛔ The flip must land on the field this test claims it did, or the
+	// refusal below could come from anywhere in the stream.
+	reread, err := Linearized(bad)
+	if err != nil {
+		t.Fatalf("the flipped file's parameters no longer read: %v", err)
 	}
-	if called != 1 {
-		t.Errorf("the seam ran %d time(s), want 1", called)
+	rd, err := Open(bad)
+	if err != nil {
+		t.Fatal(err)
 	}
+	after, err := rd.readHintTables(reread)
+	if err != nil {
+		t.Fatalf("the flipped file's tables no longer decode, so the flip hit the wrong "+
+			"byte: %v", err)
+	}
+	if after.pages[0].Length != was+1 {
+		t.Fatalf("the flip changed page 1's length from %d to %d, want %d — it did not "+
+			"land on Table F.4 item 2", was, after.pages[0].Length, was+1)
+	}
+
+	_, err = CheckLinearized(bad)
+	if !errors.Is(err, ErrHintTablesInvalid) {
+		t.Fatalf("a file whose page length is one byte out was accepted: %v", err)
+	}
+	for _, want := range []string{fmtInt(int(was) + 1), fmtInt(int(was))} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// hintDataOffset returns where the primary hint stream's DATA begins, by finding
+// the `stream` keyword inside the object /H points at.
+func hintDataOffset(t *testing.T, b []byte, lin *Linearization) int {
+	t.Helper()
+	at := lin.HintOffset
+	if at <= 0 || at >= len(b) {
+		t.Fatalf("/H is %d and the file is %d bytes", at, len(b))
+	}
+	end := at + lin.HintLength
+	if end > len(b) {
+		end = len(b)
+	}
+	i := strings.Index(string(b[at:end]), "stream")
+	if i < 0 {
+		t.Fatal("the object /H names holds no `stream` keyword")
+	}
+	j := at + i + len("stream")
+	return j + eolAfter(b, j)
 }
 
 // ⛔ AND THE TWO WAYS AN OBJECT'S EXTENT CANNOT BE TAKEN, which no file reaches

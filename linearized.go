@@ -68,6 +68,23 @@ type Linearization struct {
 	// PageCount is /N, the number of pages in the document.
 	PageCount int
 
+	// LengthsChecked and LengthsSkipped count the hint-table lengths
+	// CheckLinearized held against the file, and those it could not measure.
+	//
+	// ⛔⛔ THEY EXIST BECAUSE nil ALONE IS AMBIGUOUS. An object inside an object
+	// stream has no offset of its own, so a span containing one is not measured
+	// — and a file whose page objects are ALL compressed therefore returns
+	// exactly what a fully verified file returns. A caller depending on "the
+	// lengths were checked" cannot tell those apart from the error alone.
+	//
+	// ⚠ LengthsChecked is 0 for a file read by [Linearized] rather than
+	// [CheckLinearized]: nothing was checked, which is the honest answer rather
+	// than an omission. A non-zero LengthsSkipped is not a defect in the file —
+	// object streams are legal in a linearized document and F.4 says nothing
+	// against them — it is the measurement declining to claim what it cannot
+	// see.
+	LengthsChecked, LengthsSkipped int
+
 	// MainXrefOffset is /T. For a file with a traditional cross-reference
 	// table this is "the offset of the white-space character preceding the
 	// first entry of the main cross-reference table (the entry for object
@@ -327,7 +344,7 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	// two are different questions: every width can be in range, every entry
 	// inside the stream, and a page length still be a number the page does not
 	// have.
-	if err := checkLengths(b, d, lin, tables); err != nil {
+	if err := checkHintLengths(b, d, lin, tables); err != nil {
 		return nil, err
 	}
 	return lin, nil
