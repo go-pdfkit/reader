@@ -7,6 +7,7 @@ package reader
 
 import (
 	"fmt"
+	"sort"
 	"testing"
 )
 
@@ -173,6 +174,123 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ⛔⛔ THE PASS-INVARIANT LENGTH, ASSERTED DIRECTLY. The hint stream sits before
+// the first page, so if its length changed between the two passes every later
+// offset would move. Until now the only witness was INDIRECT — /L, through
+// Linearized accepting the file — which reddens for many reasons and localises
+// none of them.
+//
+// ⭐ This compares the two table lengths to each other: the same page objects
+// with NO byte extents (what pass 0 has) and with arbitrary non-zero ones (what
+// pass 1 has). It needs no file, and it reddens the moment one of the three
+// byte-measured widths stops being pinned.
+//
+// ⚠ An earlier form of this check was rejected before it was written: comparing
+// the table length against hintLen would compare two different quantities, since
+// hintLen is the whole stream object — `N 0 obj`, /Length, /S, endstream and
+// all — not the table bytes.
+func TestTheHintStreamIsTheSameLengthWhateverTheOffsets(t *testing.T) {
+	for _, pages := range []int{1, 2, 5, 25} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			d, err := Open(buildPages(t, pages))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := d.Partition()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			blank := blankExtents(p)
+			first, _, err := buildHintTables(blank, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The same pages, with byte extents a layout might produce: each
+			// page a different size, at a different place, with content inside.
+			filled := make([]pageExtent, len(blank))
+			for i := range blank {
+				at := 100000 + i*7919
+				filled[i] = pageExtent{
+					objects:      blank[i].objects,
+					start:        at,
+					end:          at + 3000 + i*11,
+					length:       3000 + i*11,
+					hasContent:   true,
+					contentStart: at + 40,
+					contentEnd:   at + 900 + i,
+				}
+			}
+			second, _, err := buildHintTables(filled, 1000000, 120)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(first) != len(second) {
+				t.Errorf("the tables are %d bytes with no offsets and %d bytes with them, "+
+					"so the hint stream would change size between the two passes and "+
+					"move everything after it", len(first), len(second))
+			}
+		})
+	}
+}
+
+// ⛔⛔ EACH PAGE'S OBJECTS ARE NUMBERED CONSECUTIVELY FROM ITS PAGE OBJECT, which
+// is the assumption qpdf's checker makes and which had NO witness in this
+// repository — `git grep consecutiv` found only comments. Lin::lengthNextN takes
+// the page object's number and the next nobjects-1 numbers and sums THEIR
+// lengths, so a layout that broke this would be measured against objects
+// belonging to something else.
+//
+// ⛔ This is the assertion whose absence let the inherited-attribute defect
+// through: there, page 1's real object count was 3 while the table said 2.
+func TestEachPageIsNumberedConsecutivelyFromItsPageObject(t *testing.T) {
+	for _, pages := range []int{1, 2, 5, 25} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			d, err := Open(buildPages(t, pages))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := d.Partition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			order, err := p.Order()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for i := range p.Pages {
+				own := numberOf(t, order, p.PageObjects[i])
+				want := make(map[int]bool, len(p.Pages[i]))
+				for _, old := range p.Pages[i] {
+					want[numberOf(t, order, old)] = true
+				}
+				for n := own; n < own+len(p.Pages[i]); n++ {
+					if !want[n] {
+						t.Errorf("page %d is object %d with %d object(s), so qpdf will "+
+							"measure objects %d..%d — and %d is not one of the page's %v",
+							i+1, own, len(p.Pages[i]), own, own+len(p.Pages[i])-1, n,
+							sortedNumbers(t, order, p.Pages[i]))
+						break
+					}
+				}
+			}
+		})
+	}
+}
+
+func sortedNumbers(t *testing.T, order []int, olds []int) []int {
+	t.Helper()
+	out := make([]int, 0, len(olds))
+	for _, old := range olds {
+		out = append(out, numberOf(t, order, old))
+	}
+	sort.Ints(out)
+	return out
 }
 
 // contentsOfWrittenPage returns the ORIGINAL object numbers of page i's content

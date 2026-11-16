@@ -140,6 +140,216 @@ func TestADocumentWhoseLaterPagesShareAnObjectIsRefused(t *testing.T) {
 	}
 }
 
+// ⛔⛔⛔ AN INHERITED ATTRIBUTE THAT IS AN INDIRECT REFERENCE, which is the hole
+// the shared-object refusal did NOT close and which review found by building an
+// ordinary PDF. Table 30 lets a page omit /Resources and take the page tree
+// node's; the writer pushes it DOWN at emission, so if the node's value is a
+// reference, every emitted page names an object the source document's pages did
+// not.
+//
+// ⛔ Measured before reachFromPage accounted for it: Pages was [[3 5] [4 6]]
+// with the resources object in part 9, Shared was empty so nothing refused the
+// document, and `qpdf --check` on the output said all three of
+//
+//	end of first page section (/E) mismatch: /E = 905; computed = 1190
+//	object count mismatch for page 0: hint table = 2; computed = 3
+//	page 1: shared object 7: in computed list but not hint table
+//
+// ⛔⛔ TWO OF THOSE ARE OLDER THAN THE HINT TABLES. /E and the object count were
+// wrong in the layout itself; the tables are simply what let qpdf say so. The
+// partition was describing the source document while the writer emitted a
+// different one, and no definition over the source's reach could see it.
+func TestAPageInheritingAnIndirectAttribute(t *testing.T) {
+	plain := inheritedResourcesFixture(t)
+	d, err := Open(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := d.Partition()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ⛔ THE POSITIVE HALF: the resources object must now be in page 1's set.
+	// Without this the refusal below could pass because the partition still
+	// cannot see the object — which is exactly the state this test was written
+	// to catch.
+	res := resourcesObject(t, d)
+	if !contains(p.Pages[0], res) {
+		t.Fatalf("object %d is the pages node's /Resources and page 1's set is %v, so "+
+			"the inherited attribute is still outside the partition's reach",
+			res, p.Pages[0])
+	}
+	if !contains(p.Shared[1], res) {
+		t.Fatalf("page 2 inherits the same /Resources and its shared list is %v",
+			p.Shared[1])
+	}
+
+	// And so the writer refuses it, for the reason it can state.
+	if _, err := d.Linearize(); !errors.Is(err, ErrCannotLinearize) {
+		t.Fatalf("a document whose pages share an inherited object was accepted: %v", err)
+	}
+}
+
+// ⛔ AND A DIRECT INHERITED ATTRIBUTE CHANGES NOTHING, which is the control that
+// keeps the fix from over-reaching: buildPages puts /MediaBox on the node as a
+// direct array, so there is no object to reach and the four judged shapes must
+// stay acceptable. TestTheJudgedCorpusSharesNothingBetweenPages asserts that.
+
+// ⛔⛔ EVERY WAY THE /Parent CHAIN STOPS, and none of them is a refusal. A page
+// whose /Parent dangles or names a non-dictionary inherits nothing, which is the
+// same answer a page with no /Parent gets — and that is the right one, because a
+// broken page tree is not this function's business to diagnose. pushInherited
+// walks the same chain and gives up the same way.
+//
+// ⛔ THE CYCLE CASE IS THE ONE THAT MATTERS: the walk is bounded by a SEEN SET
+// rather than a depth, so a /Parent loop returns instead of hanging. The timeout
+// is what makes that a measurement rather than a claim.
+func TestTheInheritanceWalkEndsWhereverTheChainDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		objects map[int]Object
+		badXref int // an object number whose xref entry points past the buffer
+		page    Dict
+	}{
+		{
+			name:    "no parent at all",
+			objects: nil,
+			page:    Dict{"Type": Name("Page")},
+		},
+		{
+			// ⛔ A MISSING OBJECT IS NOT A READ FAILURE. The first version of
+			// this case used Ref{Num: 99} with no object behind it, and Get
+			// returned a Null without an error — so it exercised the
+			// not-a-dictionary branch and left the unreadable one uncovered,
+			// while its name claimed otherwise. A bad xref offset is what makes
+			// Get actually fail.
+			name:    "a parent that does not read",
+			objects: nil,
+			badXref: 4,
+			page:    Dict{"Type": Name("Page"), "Parent": Ref{Num: 4}},
+		},
+		{
+			name:    "a parent that is missing entirely",
+			objects: nil,
+			page:    Dict{"Type": Name("Page"), "Parent": Ref{Num: 99}},
+		},
+		{
+			name:    "a parent that is not a dictionary",
+			objects: map[int]Object{2: Integer(7)},
+			page:    Dict{"Type": Name("Page"), "Parent": Ref{Num: 2}},
+		},
+		{
+			name: "a parent chain that loops",
+			objects: map[int]Object{
+				2: Dict{"Type": Name("Pages"), "Parent": Ref{Num: 3}},
+				3: Dict{"Type": Name("Pages"), "Parent": Ref{Num: 2}},
+			},
+			page: Dict{"Type": Name("Page"), "Parent": Ref{Num: 2}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := bareDoc(nil, nil, tc.objects)
+			if tc.badXref != 0 {
+				d.buf = []byte("%PDF-1.7\n")
+				d.xref[tc.badXref] = xrefEntry{kind: 'n', offset: 100000}
+			}
+			done := make(chan []Object, 1)
+			go func() {
+				done <- d.inheritedAttributes(Ref{Num: 1}, tc.page)
+			}()
+			select {
+			case got := <-done:
+				if len(got) != 0 {
+					t.Errorf("it inherited %v from a chain that leads nowhere", got)
+				}
+			case <-timeAfterSeconds(5):
+				t.Fatal("the inheritance walk did not return")
+			}
+		})
+	}
+}
+
+// ⛔ AND THE NEAREST ANCESTOR WINS. Table 30 takes the first value found walking
+// up, so a /Resources on the parent SHADOWS one on the grandparent — and
+// collecting both would put an object the page cannot reach into its reach,
+// which is this same defect in the opposite direction.
+func TestInheritanceTakesTheNearestAncestorOnly(t *testing.T) {
+	near := Ref{Num: 10}
+	far := Ref{Num: 11}
+	d := bareDoc(nil, nil, map[int]Object{
+		2: Dict{"Type": Name("Pages"), "Parent": Ref{Num: 3}, "Resources": near},
+		3: Dict{"Type": Name("Pages"), "Resources": far},
+	})
+
+	got := d.inheritedAttributes(Ref{Num: 1},
+		Dict{"Type": Name("Page"), "Parent": Ref{Num: 2}})
+	if len(got) != 1 {
+		t.Fatalf("it inherited %v, and only the parent's /Resources is inheritable here", got)
+	}
+	if r, ok := got[0].(Ref); !ok || r.Num != near.Num {
+		t.Errorf("it inherited %v, want the PARENT's %v and not the grandparent's %v",
+			got[0], near, far)
+	}
+}
+
+// resourcesObject returns the object number the page tree node's /Resources
+// names, read from the document rather than assumed from the fixture's order.
+func resourcesObject(t *testing.T, d *Document) int {
+	t.Helper()
+	cat, err := d.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := d.Get(cat.Get("Pages").(Ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dict, ok := ToDict(node)
+	if !ok {
+		t.Fatalf("the page tree node is %T", node)
+	}
+	ref, ok := dict["Resources"].(Ref)
+	if !ok {
+		t.Fatalf("the fixture's /Resources is %T, not a reference, so it witnesses nothing",
+			dict["Resources"])
+	}
+	return ref.Num
+}
+
+func contains(xs []int, x int) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// inheritedResourcesFixture writes a two-page document whose /Resources is an
+// INDIRECT REFERENCE on the page tree node, so neither page names it.
+func inheritedResourcesFixture(t *testing.T) []byte {
+	t.Helper()
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
+	c1 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (one) Tj ET")})
+	c2 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (two) Tj ET")})
+	one := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c1})
+	two := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c2})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{one, two},
+		"Count":     Integer(2),
+		"Resources": res,
+		"MediaBox":  Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
+
 // ⛔ AND THE NEGATIVE CONTROL: the documents the suite does judge must have
 // nothing shared, or the refusal above would reject them too and the whole
 // corpus would be unreachable.
@@ -230,11 +440,26 @@ func TestTheHintTablesRefuseAValueTooWideForItsField(t *testing.T) {
 			want:  "object count",
 		},
 		{
-			name: "a content stream past 4 GiB",
+			// ⛔ THE TWO CONTENT GUARDS ARE ASSERTED SEPARATELY, because a
+			// `want` of "content stream" matched both names and so could not
+			// tell them apart. The first version of the guard checked
+			// contentEnd-start for item 6 while the stored value is
+			// contentStart-start — conservative, so nothing was truncated, but
+			// it REFUSED a describable page whose offset and length each fit a
+			// uint32 while their sum did not, under a message printing a third
+			// number.
+			name: "a content stream offset past 4 GiB",
+			pages: []pageExtent{{objects: 1, start: 0, end: tooBig + 2, length: 10,
+				hasContent: true, contentStart: tooBig + 1, contentEnd: tooBig + 1}},
+			first: 10,
+			want:  "content stream offset",
+		},
+		{
+			name: "a content stream longer than 4 GiB",
 			pages: []pageExtent{{objects: 1, start: 0, end: tooBig + 2, length: 10,
 				hasContent: true, contentStart: 1, contentEnd: tooBig + 1}},
 			first: 10,
-			want:  "content stream",
+			want:  "content stream length",
 		},
 		{
 			name:  "a first page past 4 GiB",

@@ -176,9 +176,13 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 		d.buf = []byte("%PDF-1.7\n")
 		d.xref[1] = xrefEntry{kind: 'n', offset: 100000}
 		p := &Partition{
-			Of:              map[int]Part{1: PartCatalog},
-			Pages:           [][]int{{1}},
-			PageObjects:     []int{1},
+			Of:          map[int]Part{1: PartCatalog},
+			Pages:       [][]int{{1}},
+			PageObjects: []int{1},
+			// ⛔ One list per page, or the writer refuses the partition before
+			// it reaches the path this case is about — which is what the
+			// shared-object guard is for and what it did to this fixture.
+			Shared:          [][]int{nil},
 			FirstPageObject: 1,
 		}
 		_, err := d.linearizeFrom(p)
@@ -202,6 +206,7 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 			Of:              map[int]Part{1: PartCatalog, 4: PartFirstPage},
 			Pages:           [][]int{{4}},
 			PageObjects:     []int{4},
+			Shared:          [][]int{nil},
 			FirstPageObject: 4,
 		}
 		_, err := d.linearizeFrom(p)
@@ -221,11 +226,35 @@ func TestTheEmissionRefusesAPartitionItCannotUse(t *testing.T) {
 			Of:              map[int]Part{1: PartCatalog, 9: PartOther},
 			Pages:           [][]int{{1}},
 			PageObjects:     []int{1},
+			Shared:          [][]int{nil},
 			FirstPageObject: 1,
 		}
 		_, err := d.linearizeFrom(p)
 		if !errors.Is(err, ErrCannotLinearize) {
 			t.Fatalf("an unreadable part-9 object was accepted: %v", err)
+		}
+	})
+
+	t.Run("a partition that cannot say what is shared", func(t *testing.T) {
+		// ⛔⛔ Shared NIL FOR A DOCUMENT THAT DOES SHARE is the shape a seam
+		// caller can build, and without this guard the per-page loop below it
+		// finds nothing to refuse and the writer emits an empty shared table
+		// for a document that needs one. Review named it; three fixtures in
+		// this very test had to gain a Shared list because of it.
+		d := bareDoc(nil, nil, map[int]Object{1: Dict{"Type": Name("Catalog")}})
+		p := &Partition{
+			Of:              map[int]Part{1: PartCatalog},
+			Pages:           [][]int{{1}},
+			PageObjects:     []int{1},
+			Shared:          nil,
+			FirstPageObject: 1,
+		}
+		_, err := d.linearizeFrom(p)
+		if !errors.Is(err, ErrCannotLinearize) {
+			t.Fatalf("a partition with no shared-object lists was accepted: %v", err)
+		}
+		if !strings.Contains(err.Error(), "shared-object list") {
+			t.Errorf("refused, but not for the missing lists: %v", err)
 		}
 	})
 

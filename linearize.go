@@ -193,6 +193,15 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 	// a partition question — qpdf reports `nshared_total: 3` with part 8 EMPTY —
 	// and that is #61. A writer that returns an error here is worse than one that
 	// works and better than one that lies.
+	// ⛔ ONE ENTRY PER PAGE, CHECKED FIRST: a caller reaching linearizeFrom with
+	// a hand-built Partition can leave Shared nil for a document that does share
+	// objects, and the loop below would then find nothing to refuse. pageMajor
+	// already refuses the same shape for PageObjects.
+	if len(p.Shared) != len(p.Pages) {
+		return nil, fmt.Errorf("%w: the partition has %d page(s) and %d shared-object "+
+			"list(s), so it cannot say which pages share anything",
+			ErrCannotLinearize, len(p.Pages), len(p.Shared))
+	}
 	for i, s := range p.Shared {
 		if len(s) != 0 {
 			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+

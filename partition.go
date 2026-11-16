@@ -524,7 +524,89 @@ func (d *Document) reachFromPage(page Ref, boundary map[int]bool) (map[int]bool,
 		}
 		start = append(start, v)
 	}
+
+	// ⛔⛔⛔ THE INHERITED ATTRIBUTES ARE PART OF THE PAGE'S REACH, and leaving
+	// them out made this walk measure a graph the writer does not emit. Table 30
+	// lets a page omit /Resources, /MediaBox, /CropBox and /Rotate and take its
+	// parent's, and the writer PUSHES THEM DOWN at emission (pushInherited),
+	// because F.3.7 needs part 6 to hold everything that displays page one. If
+	// the ancestor's value is an INDIRECT REFERENCE, the pushed-down copy is
+	// that reference — so the emitted page names an object this walk never saw.
+	//
+	// ⛔ Measured, before this: two pages inheriting an indirect /Resources from
+	// the page tree node gave Pages=[[3 5] [4 6]] with the resources object in
+	// part 9, and `qpdf --check` on the result said all three of
+	//
+	//	end of first page section (/E) mismatch: /E = 905; computed = 1190
+	//	object count mismatch for page 0: hint table = 2; computed = 3
+	//	page 1: shared object 7: in computed list but not hint table
+	//
+	// — so /E, Table F.4 item 1 and the shared list were ALL wrong, and the
+	// first two of those are older than the hint tables. The partition was
+	// describing the source document while the writer emitted a different one.
+	//
+	// ⭐ Fixing it HERE rather than in the hint tables is what makes the rest
+	// consistent: once the object is in the page's reach, `of` classifies it,
+	// Pages counts it, Shared sees that a later page needs it, and the writer's
+	// refusal covers the case it cannot yet describe.
+	for _, v := range d.inheritedAttributes(page, dict) {
+		start = append(start, v)
+	}
 	return d.reach(start, boundary), nil
+}
+
+// inheritedAttributes returns the values of Table 30's inheritable keys that
+// this page does NOT hold itself and so takes from an ancestor.
+//
+// ⛔ THE WALK IS BOUNDED BY A SEEN SET, not by a depth. A /Parent chain that
+// loops is a malformed document this function must not hang on, and a page tree
+// deep enough to matter is cheaper to bound by identity than to guess a limit
+// for. The same argument as pushInherited's, which walks the same chain.
+func (d *Document) inheritedAttributes(page Ref, dict Dict) []Object {
+	var out []Object
+	seen := map[int]bool{page.Num: true}
+
+	// ⛔⛔ THE NEAREST ANCESTOR WINS, AND ONLY IT. Table 30's inheritance takes
+	// the first value found walking UP, so a /Resources on the parent SHADOWS
+	// one on the grandparent. Collecting from every ancestor would put an object
+	// the page cannot reach into its reach — and that object would then be
+	// classified as part of the page, which is the same class of defect this
+	// function exists to fix, in the opposite direction.
+	resolved := map[Name]bool{}
+	for _, key := range inheritablePageKeys {
+		if _, has := dict[key]; has {
+			// The page states it itself, so it inherits nothing for it.
+			resolved[key] = true
+		}
+	}
+
+	at := dict
+	for {
+		parent, ok := at["Parent"].(Ref)
+		if !ok || seen[parent.Num] {
+			return out
+		}
+		seen[parent.Num] = true
+
+		o, err := d.Get(parent)
+		if err != nil {
+			return out
+		}
+		node, ok := ToDict(o)
+		if !ok {
+			return out
+		}
+		for _, key := range inheritablePageKeys {
+			if resolved[key] {
+				continue
+			}
+			if v, has := node[key]; has {
+				out = append(out, v)
+				resolved[key] = true
+			}
+		}
+		at = node
+	}
 }
 
 // reachFromTrailer collects everything the trailer reaches, with no boundary:

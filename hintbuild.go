@@ -132,7 +132,17 @@ func buildHintTables(pages []pageExtent, firstPageObjOffset, hintLen int) ([]byt
 		}{
 			{"object count", p.objects},
 			{"length in bytes", p.length},
-			{"content stream offset", p.contentEnd - p.start},
+			// ⛔⛔ THE GUARD NAMES THE QUANTITY IT STORES. The first version
+			// checked contentEnd-start for item 6 while the stored value is
+			// contentStart-start: conservative, so no truncation escaped, but it
+			// REFUSED a describable page — offset 3e9 and length 3e9 both fit a
+			// uint32 and their sum does not. And the message printed 6e9 under
+			// the name "content stream offset", which is neither value.
+			//
+			// ⛔ The test could not see it either: its stored offset was 1, and
+			// a `want` of "content stream" matched both guard names. They are
+			// asserted separately now.
+			{"content stream offset", p.contentStart - p.start},
 			{"content stream length", p.contentEnd - p.contentStart},
 		} {
 			if int64(c.v) > math.MaxUint32 {
