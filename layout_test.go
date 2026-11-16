@@ -320,6 +320,23 @@ func TestOrderRefusesAPageObjectItCannotPlace(t *testing.T) {
 			want: "no page claims it",
 		},
 		{
+			// ⛔⛔ "PLACED ELSEWHERE" AND "NOT PLACED AT ALL" ARE DIFFERENT
+			// ANSWERS, and one lookup into Of conflates them: a missing key
+			// gives the zero Part, which is not any of F.3.1's, so an object Of
+			// never mentions looked exactly like one belonging to another part
+			// and was skipped in SILENCE. The emission counts the page's
+			// objects from Pages, so it would have counted an object the layout
+			// never emitted — and offsets[0] would drag that page's start to
+			// byte 0.
+			name: "a page's set naming an object the partition does not place",
+			p: &Partition{
+				Of:          map[int]Part{1: PartCatalog, 2: PartFirstPage},
+				Pages:       [][]int{{2, 99}},
+				PageObjects: []int{2},
+			},
+			want: "does not place it at all",
+		},
+		{
 			name: "a page with an object set and no page object",
 			p: &Partition{
 				Of:          map[int]Part{1: PartCatalog, 2: PartFirstPage},

@@ -171,7 +171,20 @@ func (p *Partition) pageMajor(part Part, out []int) ([]int, error) {
 			if num == own {
 				continue
 			}
-			if p.Of[num] != part {
+			// ⛔⛔ "PLACED ELSEWHERE" AND "NOT PLACED AT ALL" ARE DIFFERENT
+			// ANSWERS, and reading Of with one lookup conflates them: a missing
+			// key gives the zero Part, which is not any of F.3.1's, so an object
+			// Of never mentions looked exactly like one belonging to another
+			// part and was skipped in silence. The emission would then count it
+			// in the page's object total — Pages is what it counts — while the
+			// layout never emitted it, so offsets[0] would drag the page's start
+			// to byte 0 and every item derived from it would be wrong.
+			got, placed := p.Of[num]
+			if !placed {
+				return nil, fmt.Errorf("%w: page %d's set names object %d and the partition "+
+					"does not place it at all", ErrCannotLayOut, i+1, num)
+			}
+			if got != part {
 				// An object this page reaches that the partition placed
 				// elsewhere — shared, or the page tree. Not this run's.
 				continue

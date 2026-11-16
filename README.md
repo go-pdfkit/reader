@@ -860,7 +860,35 @@ by it and by qpdf before the next one started.
 
 `Linearize()` writes Annex F's eleven parts and returns the bytes.
 `qpdf --check` says **`File is linearized`** and raises no complaint it does not
-also raise about the input, on one, two, five and twenty-five page documents.
+also raise about the input, on one, two, five and twenty-five page documents
+**whose pages share no objects**.
+
+⛔⛔ **That scope is load-bearing, and review found it rather than the tests.**
+The shared object hint table (F.4.2) is how a page after the first says which of
+part 6's and part 8's objects it depends on, and this writer emits a *required
+but empty* one. For a document whose pages are independent that is the truth;
+for one whose pages are not, it is a hint table that contradicts the file:
+
+```
+WARNING: page 1: shared object 3: in computed list but not hint table
+```
+
+measured on two pages sharing one content stream — while our own
+`CheckLinearized` **accepted** that file, so nothing in this package would have
+caught it.
+
+⛔ **And the whole judged corpus could not express the case.** `buildPages` gives
+every page its own content stream, so no object is reached by two pages and
+`Partition.Shared` is empty on every shape the suite builds. The foreign judge
+was green because the fixtures were silent — the second time in this arc that a
+passing oracle meant "the corpus says nothing". `TestADocumentWhoseLaterPagesShareAnObjectIsRefused`
+commits the missing fixture, and `TestTheJudgedCorpusSharesNothingBetweenPages`
+is its negative control: a suite in which every input is refused measures as
+little as one in which every input passes.
+
+⚠ So `Linearize` **refuses** such a document, naming the objects, rather than
+describing it wrongly. Filling that table is a partition question — qpdf reports
+`nshared_total: 3` with part 8 **empty** for the same input — and it is #61.
 
 ⛔⛔ **THE LAYOUT IS PAGE-MAJOR IN PARTS 6 AND 7, AND A FOREIGN CHECKER IS WHY.**
 Within those parts the order is "page by page, each page's own object first",

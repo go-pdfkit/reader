@@ -105,6 +105,23 @@ type Partition struct {
 	// objects belonging to something else. Order uses this to emit each page's
 	// own object first.
 	PageObjects []int
+
+	// Shared[i] is every object page i+1 reaches that belongs to another
+	// page's part — part 6 or part 8 — and so is a shared object as far as
+	// F.4.2 is concerned. Shared[0] is always empty: Table F.4 item 3 requires
+	// 0 shared references for the first page.
+	//
+	// ⛔⛔ THIS IS NOT "WHAT IS IN PART 8". An object page 1 needs stays in
+	// part 6 even when page 3 needs it too, and part 8 holds only objects
+	// shared between pages that are NOT the first. Measured: for a two-page
+	// document whose pages share one content stream, our part 8 is empty and
+	// qpdf's is too — yet qpdf reports `nshared_total: 3`, because its shared
+	// table covers part 6's shared objects as well.
+	//
+	// ⛔ The writer needs this to know when it CANNOT describe a document:
+	// `qpdf --check` says "page 1: shared object 3: in computed list but not
+	// hint table" for exactly the pages whose Shared is non-empty.
+	Shared [][]int
 }
 
 // ErrCannotPartition reports a document this package declines to place.
@@ -296,6 +313,7 @@ func (d *Document) Partition() (*Partition, error) {
 	for i := range pages {
 		pageObjects[i] = pages[i].Num
 	}
+	shared := make([][]int, len(pages))
 	for i, reach := range reaches {
 		want := PartOtherPrivate
 		if i == 0 {
@@ -305,16 +323,35 @@ func (d *Document) Partition() (*Partition, error) {
 		// reachFromPage never returns it because the page objects are the
 		// walk's boundary.
 		set := []int{pages[i].Num}
+		var theirs []int
 		for num := range reach {
-			if num != pages[i].Num && of[num] == want {
+			// ⛔ THE PAGE'S OWN NUMBER IS A CONDITION, NOT A BRANCH, because
+			// reachFromPage never returns it — the page objects are the walk's
+			// boundary — so an `if num == pages[i].Num { continue }` is a block
+			// no input enters, and this package's coverage gate refuses those.
+			// Folded into the case below it keeps the guarantee without claiming
+			// a path nothing takes.
+			switch {
+			case of[num] == want && num != pages[i].Num:
 				set = append(set, num)
+			// ⛔⛔ AN OBJECT THIS PAGE REACHES THAT IS NOT ITS OWN. Part 6 and
+			// part 8 are both "reachable from more than one page": an object
+			// page 1 needs stays in part 6 even when page 3 needs it too, and
+			// F.4.2's shared object hint table is how a later page says which
+			// of those it depends on. The page TREE is reached by every page
+			// and belongs to neither — F.3.10 puts it in part 9 — so it is not
+			// one of these.
+			case i > 0 && (of[num] == PartFirstPage || of[num] == PartShared):
+				theirs = append(theirs, num)
 			}
 		}
 		// ⛔ SORTED, so two runs over one document give the same slice: a reach
 		// is a map, and a writer emitting in map order would produce different
 		// bytes every time from the same input.
 		sort.Ints(set)
+		sort.Ints(theirs)
 		perPage[i] = set
+		shared[i] = theirs
 	}
 
 	return &Partition{
@@ -323,6 +360,7 @@ func (d *Document) Partition() (*Partition, error) {
 		FirstPageObject: first.Num,
 		Pages:           perPage,
 		PageObjects:     pageObjects,
+		Shared:          shared,
 	}, nil
 }
 

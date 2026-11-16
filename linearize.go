@@ -121,24 +121,29 @@ var buildHint = buildHintTables
 // eleven parts, with the parameter dictionary at the front and the first-page
 // cross-reference section before the objects a reader needs first.
 //
-// ⛔⛔ THE HINT TABLES ARE NOT WRITTEN YET, AND THIS IS DELIBERATE RATHER THAN
-// UNFINISHED. #40 names five steps; this is the fifth, and splitting it is what
-// makes the layout measurable on its own. The file carries a hint stream that
-// is syntactically a stream and holds no valid tables, so:
+// The file carries the parameter dictionary, both cross-reference sections, and
+// a primary hint stream holding Table F.3's page offset table and Table F.5's
+// shared object hint table. `qpdf --check` reports no problem with it.
 //
-//	`qpdf --check` validates the parameters, both cross-reference sections,
-//	/O, /E, /T and the object structure — and reports the hint tables as
-//	wrong, which they are.
+// ⛔⛔ IT REFUSES A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT WITH AN EARLIER
+// ONE, and that is the one shape it cannot write. F.4.2's shared object hint
+// table is how a page after the first says which of part 6's and part 8's
+// objects it depends on; this writer emits a required but EMPTY one, which is
+// the truth for a document whose pages are independent and a contradiction for
+// one whose pages are not. Measured — two pages sharing a content stream gives
+// `qpdf --check`:
 //
-// ⭐ That isolation is the same move every earlier step used: the partition was
-// judged before the layout, the layout before the fixpoint, the encoder's bytes
-// before any file existed. A writer that emitted everything at once could only
-// be asked "is this file right", and qpdf's answer would name a hint-table
-// problem while a wrong /T sat underneath it.
+//	WARNING: page 1: shared object 3: in computed list but not hint table
 //
-// ⚠ So a file from this function is NOT a usable linearized PDF yet. The
-// guarantee it does carry is the one `qpdf --check` can confirm: the layout,
-// the parameters and the two cross-reference sections.
+// so the writer returns an error naming the objects instead. Filling that table
+// is a partition question, not a table one, and it is #61.
+//
+// ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
+// defects were separable: the partition before the layout, the layout before the
+// fixpoint, the encoder's bytes before any file existed, and the layout before
+// the tables. A writer that emitted everything at once could only be asked "is
+// this file right", and qpdf's answer would have named a hint-table problem
+// while a wrong /T sat underneath it.
 func (d *Document) Linearize() ([]byte, error) {
 	p, err := d.Partition()
 	if err != nil {
@@ -160,6 +165,40 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 	order, err := p.Order()
 	if err != nil {
 		return nil, err
+	}
+
+	// ⛔⛔⛔ A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT IS REFUSED, BECAUSE THE
+	// SHARED OBJECT HINT TABLE IS NOT WRITTEN YET. F.4.2's table is how a page
+	// after the first says which of part 6's and part 8's objects it depends on,
+	// and this writer emits a required-but-EMPTY one. For a document where every
+	// page's objects are private that is the truth; for one where they are not,
+	// it is a hint table that contradicts the file.
+	//
+	// ⛔ MEASURED, and it is the reason this refusal exists rather than a
+	// comment: two pages sharing one content stream gives
+	//
+	//	WARNING: page 1: shared object 3: in computed list but not hint table
+	//
+	// from `qpdf --check`, while our own CheckLinearized accepts the file — so
+	// nothing in this package would have caught it.
+	//
+	// ⛔⛔ AND THE WHOLE JUDGED CORPUS MISSES IT. buildPages gives every page its
+	// own content stream, so part 6 holds nothing a later page reaches and
+	// `Shared` is empty on every shape the suite builds. The qpdf judge was
+	// green because the corpus could not express the case, which is the second
+	// time in this arc that a passing oracle meant "the fixture says nothing".
+	//
+	// ⚠ REFUSING IS THE HONEST OPTION, NOT THE AMBITIOUS ONE. Writing the table
+	// means deciding which part-6 objects are shared and in what order, which is
+	// a partition question — qpdf reports `nshared_total: 3` with part 8 EMPTY —
+	// and that is #61. A writer that returns an error here is worse than one that
+	// works and better than one that lies.
+	for i, s := range p.Shared {
+		if len(s) != 0 {
+			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
+				"and the shared object hint table this writer emits is empty",
+				ErrCannotLinearize, i+1, s)
+		}
 	}
 	// ⛔ NO GUARD FOR AN EMPTY ORDER, AND THAT IS DELIBERATE. Partition refuses
 	// a document with no pages by name, and Order returns one entry per placed

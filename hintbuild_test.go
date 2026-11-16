@@ -8,6 +8,7 @@ package reader
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -83,6 +84,199 @@ func TestEveryWayTheHintTablesRefuse(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("refused, but not for %q: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// ⛔⛔⛔ THE CASE THE WHOLE JUDGED CORPUS COULD NOT EXPRESS, which is why qpdf
+// was green about a hint table it would have refused. buildPages gives every
+// page its own content stream, so no object is reached by two pages, part 6
+// holds nothing a later page needs, and the shared object hint table has
+// nothing to say. Every shape the suite builds is that shape.
+//
+// ⛔ Measured on a document whose two pages share ONE content stream:
+//
+//	WARNING: page 1: shared object 3: in computed list but not hint table
+//
+// from `qpdf --check`, while our own CheckLinearized accepted the file. So
+// nothing in this package would have caught it, and the foreign judge was silent
+// only because no fixture could reach the case.
+//
+// ⚠ The writer refuses such a document rather than describing it, and that is
+// #61's to fix. This test is the witness that it refuses, and the fixture is
+// committed so the corpus can express the case from now on.
+func TestADocumentWhoseLaterPagesShareAnObjectIsRefused(t *testing.T) {
+	plain := sharedContentsFixture(t)
+	d, err := Open(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ⛔ THE POSITIVE HALF FIRST: the partition must SEE the sharing, or the
+	// refusal below would be passing for the wrong reason.
+	p, err := d.Partition()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Shared) < 2 {
+		t.Fatalf("the partition reports %d page(s) of shared objects", len(p.Shared))
+	}
+	if len(p.Shared[0]) != 0 {
+		t.Errorf("page 1 is credited with shared objects %v, and Table F.4 item 3 "+
+			"requires 0 there", p.Shared[0])
+	}
+	if len(p.Shared[1]) == 0 {
+		t.Fatal("page 2 reaches page 1's content stream and the partition reports " +
+			"no shared object, so this fixture witnesses nothing")
+	}
+
+	_, err = d.Linearize()
+	if !errors.Is(err, ErrCannotLinearize) {
+		t.Fatalf("a document this writer cannot describe was accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "shares object") {
+		t.Errorf("refused, but not for the shared object: %v", err)
+	}
+}
+
+// ⛔ AND THE NEGATIVE CONTROL: the documents the suite does judge must have
+// nothing shared, or the refusal above would reject them too and the whole
+// corpus would be unreachable.
+//
+// ⭐ "A test suite in which every input passes measures nothing" — and one in
+// which every input is refused measures nothing either. This is the line
+// between the two.
+func TestTheJudgedCorpusSharesNothingBetweenPages(t *testing.T) {
+	for _, pages := range []int{1, 2, 5, 25} {
+		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
+			d, err := Open(buildPages(t, pages))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := d.Partition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, s := range p.Shared {
+				if len(s) != 0 {
+					t.Errorf("page %d shares %v, so buildPages is no longer the "+
+						"independent-pages fixture this corpus assumes", i+1, s)
+				}
+			}
+		})
+	}
+}
+
+// sharedContentsFixture writes a two-page document whose pages share ONE content
+// stream, so that page 2 reaches an object living in part 6.
+func sharedContentsFixture(t *testing.T) []byte {
+	t.Helper()
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	shared := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (both) Tj ET")})
+	one := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+		"Contents": shared, "Resources": Dict{}})
+	two := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+		"Contents": shared, "Resources": Dict{}})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{one, two},
+		"Count":    Integer(2),
+		"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
+
+// ⛔⛔ A VALUE TOO WIDE FOR ITS 32-BIT FIELD IS REFUSED, NOT TRUNCATED. No
+// fixture can reach this — the suite does not build a 4 GiB document — and that
+// is precisely the reason: an untestable truncation in the one structure whose
+// job is to be trusted would send a reader to a wrapped offset.
+//
+// ⛔ This package has named that class three times (#42, #53, #58) and then did
+// it anyway, which is why the refusal is tested by hand here.
+func TestTheHintTablesRefuseAValueTooWideForItsField(t *testing.T) {
+	// ⛔⛔ NOT A CONSTANT, AND NOT ON A 32-BIT BUILD. `int(math.MaxUint32) + 1`
+	// is a constant expression, so it does not COMPILE where int is 32 bits —
+	// caught by `go vet` on linux/386, which is why this repository vets three
+	// architectures. A runtime conversion compiles everywhere, and on a 32-bit
+	// build the value cannot be represented at all, so there is nothing to test.
+	if math.MaxInt <= math.MaxUint32 {
+		t.Skip("int is 32 bits here, so a value above MaxUint32 cannot be built — " +
+			"the refusal is for 64-bit builds, where it is reachable")
+	}
+	var limit int64 = math.MaxUint32
+	tooBig := int(limit) + 1
+
+	for _, tc := range []struct {
+		name  string
+		pages []pageExtent
+		first int
+		want  string
+	}{
+		{
+			name:  "a page longer than 4 GiB",
+			pages: []pageExtent{{objects: 1, start: 0, end: tooBig, length: tooBig}},
+			first: 10,
+			want:  "length in bytes",
+		},
+		{
+			name:  "a page of more than 4 Gi objects",
+			pages: []pageExtent{{objects: tooBig, start: 0, end: 10, length: 10}},
+			first: 10,
+			want:  "object count",
+		},
+		{
+			name: "a content stream past 4 GiB",
+			pages: []pageExtent{{objects: 1, start: 0, end: tooBig + 2, length: 10,
+				hasContent: true, contentStart: 1, contentEnd: tooBig + 1}},
+			first: 10,
+			want:  "content stream",
+		},
+		{
+			name:  "a first page past 4 GiB",
+			pages: []pageExtent{{objects: 1, start: 0, end: 10, length: 10}},
+			first: tooBig + 1,
+			want:  "item 2 would be",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := buildHintTables(tc.pages, tc.first, 1)
+			if !errors.Is(err, errHintTable) {
+				t.Fatalf("it was truncated instead of refused: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("refused, but not for %q: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// ⛔⛔ widthFor TERMINATES ON A 32-BIT DELTA, which it did not: `1<<n` takes the
+// delta's type, so at n == 32 a uint32 shift gives 0, the comparison stays true
+// and the loop spins forever. Measured on 2^31 before the bound was added.
+//
+// ⛔ No caller reaches it today, because the three byte-measured widths are
+// pinned and the derived ones are counts. It is the function a derived byte
+// width would go through — exactly when a 32-bit delta turns up.
+func TestWidthForTerminatesAtThirtyTwoBits(t *testing.T) {
+	of := func(e pageEntry) uint32 { return e.Length }
+	for _, delta := range []uint32{1 << 30, 1 << 31, math.MaxUint32} {
+		t.Run(fmt.Sprint(delta), func(t *testing.T) {
+			done := make(chan int, 1)
+			go func() {
+				done <- widthFor([]pageEntry{{Length: 0}, {Length: delta}}, of, 0)
+			}()
+			select {
+			case got := <-done:
+				if got < 1 || got > 32 {
+					t.Errorf("widthFor = %d, and F.4.1 bounds every width to 0..32", got)
+				}
+			case <-timeAfterSeconds(5):
+				t.Fatalf("widthFor did not return for a delta of %d", delta)
 			}
 		})
 	}

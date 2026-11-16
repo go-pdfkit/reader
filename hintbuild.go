@@ -5,7 +5,10 @@
 
 package reader
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // ⛔⛔ Pages[i][0] IS NOT THE PAGE OBJECT, which is worth recording where the
 // extents are built because the first version of measurePages assumed it was.
@@ -112,6 +115,31 @@ func buildHintTables(pages []pageExtent, firstPageObjOffset, hintLen int) ([]byt
 			return nil, 0, fmt.Errorf("%w: page %d's objects sum to %d bytes",
 				errHintTable, i+1, p.length)
 		}
+		// ⛔⛔ A VALUE TOO WIDE FOR ITS FIELD IS REFUSED, NOT TRUNCATED, and this
+		// file had already named that class three times before doing it:
+		// firstPageOffsetInFile's own comment cites #42 — "a value this build
+		// cannot address is refused, not truncated" — and #53 and #58 are the
+		// same lesson. Table F.4's items are 32-bit, so a page past 4 GiB wrapped
+		// SILENTLY and the hint table would have sent a reader to the wrong
+		// offset in the one structure whose whole job is to be trusted.
+		//
+		// ⛔ No fixture can reach this: a 4 GiB document is not something this
+		// suite builds. That is the reason to refuse rather than to cast — an
+		// untestable truncation is a defect waiting for someone else's file.
+		for _, c := range []struct {
+			name string
+			v    int
+		}{
+			{"object count", p.objects},
+			{"length in bytes", p.length},
+			{"content stream offset", p.contentEnd - p.start},
+			{"content stream length", p.contentEnd - p.contentStart},
+		} {
+			if int64(c.v) > math.MaxUint32 {
+				return nil, 0, fmt.Errorf("%w: page %d's %s is %d, and Table F.4 holds up "+
+					"to %d", errHintTable, i+1, c.name, c.v, uint32(math.MaxUint32))
+			}
+		}
 		e := pageEntry{
 			NObjects: uint32(p.objects),
 			Length:   uint32(p.length),
@@ -143,6 +171,10 @@ func buildHintTables(pages []pageExtent, firstPageObjOffset, hintLen int) ([]byt
 		return nil, 0, fmt.Errorf("%w: the first page's object is at %d and the hint stream "+
 			"is %d bytes, so item 2 would go negative", errHintTable,
 			firstPageObjOffset, hintLen)
+	}
+	if int64(firstPageObjOffset-hintLen) > math.MaxUint32 {
+		return nil, 0, fmt.Errorf("%w: item 2 would be %d, and Table F.3 holds up to %d",
+			errHintTable, firstPageObjOffset-hintLen, uint32(math.MaxUint32))
 	}
 
 	nobjects := func(e pageEntry) uint32 { return e.NObjects }
@@ -237,8 +269,17 @@ func widthFor(entries []pageEntry, of func(pageEntry) uint32, least uint32) int 
 			widest = d
 		}
 	}
+	// ⛔⛔ THE BOUND IS ON n, NOT ON THE COMPARISON, because `1<<n` takes
+	// `widest`'s type: at n == 32 a uint32 shift gives 0, the comparison is
+	// always true, and the loop never ends. Measured on a delta of 2^31 — it
+	// spins. No caller reaches it today, since the three byte-measured widths
+	// are pinned and the derived ones are counts; this is the function a derived
+	// byte width would go through, which is exactly when a 32-bit delta appears.
+	//
+	// ⛔ F.4.1 bounds every width to 0..32, so 32 is both the ceiling and the
+	// widest a uint32 delta can need.
 	n := 1
-	for widest >= 1<<n {
+	for n < 32 && widest >= 1<<n {
 		n++
 	}
 	return n

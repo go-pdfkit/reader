@@ -112,7 +112,17 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 				// version of this block only checked that the offset was inside
 				// the page and the length non-zero, and a mutation setting the
 				// offset to 0 survived all of it.
-				content := d.contentNumbers(p, i)
+				// ⛔⛔ THE ORACLE IS THE WRITTEN FILE, NOT contentNumbers. The
+				// first version called d.contentNumbers(p, i) here — the very
+				// function the writer uses — so a page whose content stream the
+				// writer failed to find reported "no content stream", the test
+				// asserted zeros, and it PASSED. "There is nothing to describe"
+				// and "the oracle could not see it" were indistinguishable.
+				//
+				// ⭐ So this reads /Contents out of the page dictionary in the
+				// file we produced, which is a different path from the one under
+				// test and is also what a reader would do.
+				content := contentsOfWrittenPage(t, written, order, p, i)
 				if len(content) == 0 {
 					if e.ContentOffset != 0 || e.ContentLength != 0 {
 						t.Errorf("page %d has no content stream and the table gives it "+
@@ -163,6 +173,47 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 			}
 		})
 	}
+}
+
+// contentsOfWrittenPage returns the ORIGINAL object numbers of page i's content
+// streams, read from the page dictionary in the file the writer produced.
+//
+// ⛔ A SEPARATE PATH FROM THE WRITER'S. contentNumbers walks the SOURCE document
+// and is what the writer uses; this opens the OUTPUT, resolves the page object
+// there, reads its /Contents and maps the numbers back. If the writer's lookup
+// is wrong, these two disagree — which is the whole point of not reusing it.
+func contentsOfWrittenPage(t *testing.T, written *Document, order []int,
+	p *Partition, i int) []int {
+	t.Helper()
+
+	page, err := written.Get(Ref{Num: numberOf(t, order, p.PageObjects[i])})
+	if err != nil {
+		t.Fatalf("page %d does not read in the file we wrote: %v", i+1, err)
+	}
+	dict, ok := ToDict(page)
+	if !ok {
+		t.Fatalf("page %d is %T in the file we wrote, not a dictionary", i+1, page)
+	}
+
+	// Back from the written numbering to the document's own, so the caller can
+	// compare against p.Pages.
+	back := map[int]int{}
+	for j, old := range order {
+		back[j+1] = old
+	}
+
+	var out []int
+	switch c := dict["Contents"].(type) {
+	case Ref:
+		out = append(out, back[c.Num])
+	case Array:
+		for _, v := range c {
+			if r, isRef := v.(Ref); isRef {
+				out = append(out, back[r.Num])
+			}
+		}
+	}
+	return out
 }
 
 // numberOf maps an original object number to the number the written file gave
