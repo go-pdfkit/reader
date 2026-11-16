@@ -313,12 +313,22 @@ func CheckLinearized(b []byte) (*Linearization, error) {
 	// page lengths and group lengths qpdf also reports on are the next step,
 	// and they need the partition. So this closes "the tables are unreadable"
 	// and not "the tables are wrong", and saying otherwise would overstate it.
-	if _, err := d.readHintTables(lin); err != nil {
+	tables, err := d.readHintTables(lin)
+	if err != nil {
 		// ⛔ %w TWICE, so the inner error stays matchable. errHintTable is
 		// unexported today and hinttable.go plans to export it, at which point
 		// %v would have silently flattened the one sentinel a caller would
 		// then want to test for. It costs nothing to wrap both now.
 		return nil, fmt.Errorf("%w: %w", ErrHintTablesInvalid, err)
+	}
+	// ⛔⛔ AND THEIR VALUES, which is the half the paragraph above says this
+	// does NOT check — it did not, until #61. Decoding answers "do the tables
+	// obey F.4's layout"; this answers "do they describe THIS file", and the
+	// two are different questions: every width can be in range, every entry
+	// inside the stream, and a page length still be a number the page does not
+	// have.
+	if err := checkLengths(b, d, lin, tables); err != nil {
+		return nil, err
 	}
 	return lin, nil
 }
