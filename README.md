@@ -895,7 +895,18 @@ describing it wrongly. Filling that table is a partition question — qpdf repor
 The rule is about **sharing**, and nothing else:
 
 > refused iff an object a page after the first reaches is **also** reached by the
-> first page or by another page
+> first page or by another page — other than the **catalogue**, which part 4
+> delivers ahead of the first page
+
+⛔ The catalogue exception is not a special case in the code, which is why it has
+to be in the sentence: `of[catNum] = PartCatalog` is assigned *after* the readers
+loop and overwrites whatever sharing would have made it, so `Shared`'s "part 6 or
+part 8" test cannot see it. That is correct rather than convenient — part 4
+precedes part 6 and arrives with the first page, so a later page depending on the
+catalogue needs no F.4.2 entry. Measured: two pages each carrying `/PieceInfo`
+give the catalogue part 4, `Shared` empty, the document accepted, and
+`qpdf --check` silent. Part 4 holds nothing but the catalogue, so there is no
+second instance.
 
 ⛔ **Two narrower rules were written here first and both were wrong**, which is
 why this one is stated in terms of *reaching* rather than of any mechanism:

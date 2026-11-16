@@ -142,7 +142,18 @@ var buildHint = buildHintTables
 // ⛔⛔⛔ THE RULE IS ABOUT SHARING, AND NOTHING ELSE:
 //
 //	refused iff an object a page after the first reaches is ALSO reached by
-//	the first page or by another page
+//	the first page or by another page — other than the CATALOGUE, which part 4
+//	delivers ahead of the first page
+//
+// ⛔ THE CATALOGUE EXCEPTION IS NOT A SPECIAL CASE IN THE CODE, which is why it
+// has to be in the sentence: `of[catNum] = PartCatalog` is assigned AFTER the
+// readers loop and overwrites whatever sharing would have made it, so Shared's
+// "part 6 or part 8" test cannot see it. And that is correct rather than
+// convenient — part 4 precedes part 6 and arrives with the first page, so a
+// later page depending on the catalogue needs no F.4.2 entry. Measured: two
+// pages each carrying /PieceInfo give Of[catalogue] = part 4, Shared empty, the
+// document accepted, and `qpdf --check` silent. Part 4 holds nothing but the
+// catalogue, so there is no second instance.
 //
 // ⛔ TWO NARROWER RULES WERE WRITTEN HERE FIRST AND BOTH WERE WRONG, which is
 // why this one is stated in terms of reaching rather than of any mechanism:

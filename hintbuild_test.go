@@ -403,6 +403,43 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 		return plain
 	}
 
+	// ⛔⛔ TWO PAGES THAT BOTH REACH THE CATALOGUE, which the rule's words have to
+	// exempt by name. Each page carries a key whose value is a reference to the
+	// catalogue object, so by "an object a page after the first reaches is also
+	// reached by the first page" it is shared — and the document is ACCEPTED,
+	// because `of[catNum] = PartCatalog` is assigned after the readers loop and
+	// overwrites whatever sharing would have made it.
+	//
+	// ⭐ That is correct rather than convenient: part 4 precedes part 6 and
+	// arrives with the first page, so a later page depending on the catalogue
+	// needs no F.4.2 entry. Part 4 holds nothing but the catalogue, so this is
+	// the only object the exception covers.
+	bothReachCatalogue := func(t *testing.T) []byte {
+		t.Helper()
+		w := NewWriter("1.7")
+		pagesRef := w.Reserve()
+		rootRef := w.Reserve()
+
+		kids := make(Array, 0, 2)
+		for i := 0; i < 2; i++ {
+			c := w.Add(&Stream{Dict: Dict{},
+				Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i+1))})
+			kids = append(kids, w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+				"Contents": c, "Resources": Dict{},
+				// ⛔ A reference back to the catalogue, which both pages reach.
+				"PieceInfo": Dict{"Private": rootRef}}))
+		}
+		w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": kids, "Count": Integer(2),
+			"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+		w.Put(rootRef, Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+		plain, err := w.Finish(Dict{"Root": rootRef})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}
+
 	for _, tc := range []struct {
 		name   string
 		plain  func(*testing.T) []byte
@@ -411,6 +448,11 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 		// sharing is not caused by inheritance and naming one would be false.
 		key string
 	}{
+		{
+			name:   "two pages both reaching the CATALOGUE",
+			plain:  bothReachCatalogue,
+			accept: true, // part 4 arrives ahead of the first page
+		},
 		{
 			name:   "one page inherits the object the other reaches through its own /Resources",
 			plain:  viaOwnResources,
