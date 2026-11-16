@@ -523,8 +523,38 @@ func TestEveryWayTheLengthCheckRefuses(t *testing.T) {
 // is true of qpdf's output and false of ours — the materials were in our own
 // writer. Six rounds of #66 went into replacing claims with files; this is the
 // same lesson one layer up.
+// ⛔⛔ LOOPED FOR THE PADDING TERM, AND NOT FOR THE WRAP — a distinction worth
+// keeping, because claiming the second would be false. Measured across the four
+// shapes:
+//
+//	pages  nbits_delta_nobjects  (bits+7)/8  page 1's delta  low byte
+//	    1          1                  1            0           0x00
+//	    2          1                  1            0           0x00
+//	    5          1                  1            0           0x00
+//	   25          1                  4            0           0x00
+//
+// ⭐ Only the 25-page shape makes group (a)'s padded size anything other than
+// 1, so without it the formula's npages-dependence is witnessed at a single
+// point where it happens to equal the constant it could have been. That is the
+// gain.
+//
+// ⚠ IT DOES NOT REACH THE WRAP. Page 1's item-2 delta is 0 on every shape —
+// page 1 is the shortest or tied, so MinPageLength equals its length — which is
+// why the low byte is 0x00 everywhere and the increment cannot carry. The
+// was+1 pre-assertion is what would make a carry a loud failure rather than a
+// false pass; it stays the backstop for a future fixture rather than something
+// any shape here exercises.
 func TestCheckLinearizedRefusesAFileWhoseLengthIsWrong(t *testing.T) {
-	d, err := Open(buildPages(t, 1))
+	for _, pages := range []int{1, 2, 5, 25} {
+		t.Run(fmtInt(pages)+" pages", func(t *testing.T) {
+			refuseAFlippedLength(t, pages)
+		})
+	}
+}
+
+func refuseAFlippedLength(t *testing.T, pages int) {
+	t.Helper()
+	d, err := Open(buildPages(t, pages))
 	if err != nil {
 		t.Fatal(err)
 	}
