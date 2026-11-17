@@ -10,7 +10,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // ErrCannotLinearize reports a document this package declines to linearize.
@@ -126,64 +125,49 @@ var buildHint = buildHintTables
 // a primary hint stream holding Table F.3's page offset table and Table F.5's
 // shared object hint table. `qpdf --check` reports no problem with it.
 //
-// ⛔⛔ IT REFUSES A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT WITH AN EARLIER
-// ONE, and that is the one shape it cannot write. F.4.2's shared object hint
-// table is how a page after the first says which of part 6's and part 8's
-// objects it depends on; this writer emits a required but EMPTY one, which is
-// the truth for a document whose pages are independent and a contradiction for
-// one whose pages are not. Measured — two pages sharing a content stream gives
-// `qpdf --check`:
+// ⛔⛔ IT WRITES DOCUMENTS WHOSE PAGES SHARE OBJECTS, which until #68 it refused.
+// F.4.2's shared object hint table is how a page after the first says which of
+// part 6's and part 8's objects it depends on; the writer used to emit a
+// required but EMPTY one, true for a document whose pages are independent and a
+// contradiction for one whose pages are not — two pages sharing a content stream
+// gave `qpdf --check`:
 //
 //	WARNING: page 1: shared object 3: in computed list but not hint table
 //
-// so the writer returns an error naming the objects instead. Filling that table
-// is a partition question, not a table one, and it is #61.
+// so it returned an error instead of a file that lied. The table is now filled,
+// and that warning is gone on every shape the suite and the probe exercise.
 //
-// ⛔⛔⛔ THE RULE IS ABOUT SHARING, AND NOTHING ELSE:
+// ⛔⛔⛔ THE REFUSAL IS GONE AND SO IS ITS RULE. What stood here was
 //
 //	refused iff an object a page after the first reaches is ALSO reached by
-//	the first page or by another page — other than the CATALOGUE, which part 4
-//	delivers ahead of the first page
+//	the first page or by another page — other than the CATALOGUE
 //
-// ⛔ THE CATALOGUE EXCEPTION IS NOT A SPECIAL CASE IN THE CODE, which is why it
-// has to be in the sentence: `of[catNum] = PartCatalog` is assigned AFTER the
-// readers loop and overwrites whatever sharing would have made it, so Shared's
-// "part 6 or part 8" test cannot see it. And that is correct rather than
-// convenient — part 4 precedes part 6 and arrives with the first page, so a
-// later page depending on the catalogue needs no F.4.2 entry. Measured: two
-// pages each carrying /PieceInfo give Of[catalogue] = part 4, Shared empty, the
-// document accepted, and `qpdf --check` silent. Part 4 holds nothing but the
-// catalogue, so there is no second instance.
+// and it is kept only to say that it no longer holds: every one of those shapes
+// is written. The sentence was corrected three times before it was right, and
+// the shapes that corrected it are now the rows of
+// TestWhatEachInheritanceShapePutsInTheSharedTable, where each one asserts what
+// goes IN the table instead of whether the file exists.
 //
-// ⛔ TWO NARROWER RULES WERE WRITTEN HERE FIRST AND BOTH WERE WRONG, which is
-// why this one is stated in terms of reaching rather than of any mechanism:
-//
-//   - "a multi-page document with an indirect inherited value" — refuted by a
-//     three-level tree whose sub-node carries the reference with exactly ONE
-//     page under it: that object is part 7, private to that page, accepted.
-//   - "an inheritable indirect value inherited by MORE THAN ONE page" — only
-//     SUFFICIENT. Refuted by a page that states its OWN /Resources naming the
-//     node's object under /XObject while the other page inherits it: exactly
-//     one page inherits, and the object is shared all the same.
+// ⛔ THE CATALOGUE IS STILL THE EXCEPTION, and it survived the change for the
+// reason it was always right: `of[catNum] = PartCatalog` is assigned AFTER the
+// readers loop, so part 4 holds it, part 4 precedes part 6, and it reaches the
+// reader ahead of the first page. planShared plans parts 6 and 8 only, so a
+// later page that depends on the catalogue still gets no F.4.2 identifier —
+// measured, not assumed: that row of the table asserts ZERO identifiers.
 //
 // ⛔⛔ INHERITANCE IS A ROUTE BY WHICH A PAGE REACHES AN OBJECT, not a separate
 // case. Table 30 lets a page omit /Resources, /MediaBox, /CropBox and /Rotate
 // and take an ancestor's, and the writer pushes those down because F.3.7 needs
 // part 6 self-contained — so an inherited reference makes the page reach that
-// object exactly as naming it would. It matters here only because it is the
-// route that is easy to miss: one shared resource dictionary on the page tree
-// node is the ordinary way to write a multi-page PDF, so a large share of real
-// files are refused.
+// object exactly as naming it would. That is why the partition had to learn
+// inheritance (#66) before this table could be right: an object the partition
+// cannot see a page reaching is an object the table cannot describe, and the
+// same fix that made the refusal correct is what makes the table correct.
 //
-// ⚠ AND "EACH PAGE STATES ITS OWN" IS NOT AN EXEMPTION. Two pages whose
-// /Resources is the SAME object are refused with no inheritance anywhere;
-// stating your own removes the inheritance route and not the sharing. What is
-// genuinely unaffected: a one-page document, and inheritable values that are
-// DIRECT, since an inline /MediaBox array adds no object to reach.
-//
-// ⚠ The error names the inheritable key only when THAT KEY'S OWN OBJECT is the
-// shared one. Asking merely "does this page inherit anything by reference"
-// conflates two causes and can state a falsehood — see inheritedByReference.
+// ⚠ WHAT THIS WRITER STILL DOES NOT SAY is WHERE in a page a shared object is
+// first used: F.4.1 items 5 and 13 are a fraction, and refsFor writes 0/1 for
+// every reference. A reader may fetch a shared object earlier than it needs it,
+// never later. See refsFor.
 //
 // ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
 // defects were separable: the partition before the layout, the layout before the
@@ -214,68 +198,26 @@ func (d *Document) linearizeFrom(p *Partition) ([]byte, error) {
 		return nil, err
 	}
 
-	// ⛔⛔⛔ A DOCUMENT WHOSE LATER PAGES SHARE AN OBJECT IS REFUSED, BECAUSE THE
-	// SHARED OBJECT HINT TABLE IS NOT WRITTEN YET. F.4.2's table is how a page
-	// after the first says which of part 6's and part 8's objects it depends on,
-	// and this writer emits a required-but-EMPTY one. For a document where every
-	// page's objects are private that is the truth; for one where they are not,
-	// it is a hint table that contradicts the file.
+	// ⛔ ONE SHARED-OBJECT LIST PER PAGE. A caller reaching linearizeFrom with a
+	// hand-built Partition can leave Shared nil for a document that does share
+	// objects, and every reference the hint tables would describe is taken from
+	// it — so a short list is a partition that cannot say what it must.
+	// pageMajor already refuses the same shape for PageObjects.
 	//
-	// ⛔ MEASURED, and it is the reason this refusal exists rather than a
-	// comment: two pages sharing one content stream gives
+	// ⛔⛔ THIS USED TO BE FOLLOWED BY A REFUSAL OF THE DOCUMENT ITSELF, which
+	// #68 replaced with the table. The refusal was right while the shared object
+	// hint table was emitted required-but-EMPTY: a document whose later pages
+	// share an object got a table contradicting the file, and `qpdf --check`
+	// said so —
 	//
 	//	WARNING: page 1: shared object 3: in computed list but not hint table
 	//
-	// from `qpdf --check`, while our own CheckLinearized accepts the file — so
-	// nothing in this package would have caught it.
-	//
-	// ⛔⛔ AND THE WHOLE JUDGED CORPUS MISSES IT. buildPages gives every page its
-	// own content stream, so part 6 holds nothing a later page reaches and
-	// `Shared` is empty on every shape the suite builds. The qpdf judge was
-	// green because the corpus could not express the case, which is the second
-	// time in this arc that a passing oracle meant "the fixture says nothing".
-	//
-	// ⚠ REFUSING IS THE HONEST OPTION, NOT THE AMBITIOUS ONE. Writing the table
-	// means deciding which part-6 objects are shared and in what order, which is
-	// a partition question — qpdf reports `nshared_total: 3` with part 8 EMPTY —
-	// and that is #61. A writer that returns an error here is worse than one that
-	// works and better than one that lies.
-	// ⛔ ONE ENTRY PER PAGE, CHECKED FIRST: a caller reaching linearizeFrom with
-	// a hand-built Partition can leave Shared nil for a document that does share
-	// objects, and the loop below would then find nothing to refuse. pageMajor
-	// already refuses the same shape for PageObjects.
+	// — while our own checker accepted it. Refusing was the honest state to be
+	// in; describing the document is the better one.
 	if len(p.Shared) != len(p.Pages) {
 		return nil, fmt.Errorf("%w: the partition has %d page(s) and %d shared-object "+
 			"list(s), so it cannot say which pages share anything",
 			ErrCannotLinearize, len(p.Pages), len(p.Shared))
-	}
-	for i, s := range p.Shared {
-		if len(s) == 0 {
-			continue
-		}
-		// ⛔⛔ THE MESSAGE NAMES THE CAUSE, NOT ONLY THE OBJECT. Review found the
-		// first version reporting "page 2 shares object(s) [2]" for a document
-		// whose author never wrote object 2 into either page: it arrived by
-		// INHERITANCE, because the page tree node's /Resources is an indirect
-		// reference and the writer pushes it down. An object number the caller
-		// cannot find in their own source is not a diagnosis.
-		if keys := d.inheritedByReference(Ref{Num: p.PageObjects[i]}, s); len(keys) != 0 {
-			// ⛔ WITH THE SLASH, because that is how a PDF key is written and
-			// how the caller will search their own file for it. Formatting a
-			// []Name directly gives "[Resources]", which is neither the key as
-			// the document spells it nor a list a reader recognises.
-			named := make([]string, 0, len(keys))
-			for _, key := range keys {
-				named = append(named, "/"+string(key))
-			}
-			return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
-				"which it inherits as %s from an ancestor in the page tree — and the "+
-				"shared object hint table this writer emits is empty",
-				ErrCannotLinearize, i+1, s, strings.Join(named, ", "))
-		}
-		return nil, fmt.Errorf("%w: page %d shares object(s) %v with an earlier page, "+
-			"and the shared object hint table this writer emits is empty",
-			ErrCannotLinearize, i+1, s)
 	}
 	// ⛔ NO GUARD FOR AN EMPTY ORDER, AND THAT IS DELIBERATE. Partition refuses
 	// a document with no pages by name, and Order returns one entry per placed
@@ -602,7 +544,7 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 		// ⛔ Zero for both offsets: with no bytes measured yet there is no first
 		// page offset to state, and 0 >= 0 satisfies the refusal that stops
 		// item 2 going negative. Only the LENGTH of this call's result is used.
-		t, s, err := buildHint(blankExtents(p), 0, 0)
+		t, s, err := buildHint(blankExtents(p, order), blankShared(p, order), 0, 0)
 		if err != nil {
 			return nil, linMeasured{}, err
 		}
@@ -663,7 +605,9 @@ func (d *Document) emitLinearized(p *Partition, order []int, num map[int]int,
 	// after the whole file exists, because a page's extent is not known until
 	// its last object has been written.
 	nextHint, nextS, err := buildHint(
-		d.measurePages(p, num, offsets, ends), offsets[num[p.FirstPageObject]], hintLen)
+		d.measurePages(p, order, num, offsets, ends),
+		d.measureShared(p, order, num, offsets, ends),
+		offsets[num[p.FirstPageObject]], hintLen)
 	if err != nil {
 		return nil, linMeasured{}, err
 	}
@@ -704,10 +648,66 @@ func writeHintStream(buf *bytes.Buffer, num int, data []byte, s int) int {
 // zeros there could choose a narrower width than the second and the stream would
 // change size between them. The counts do not depend on any offset, so they are
 // known now and they are the same on both passes.
-func blankExtents(p *Partition) []pageExtent {
+func blankExtents(p *Partition, order []int) []pageExtent {
+	plan := planShared(p, order)
 	out := make([]pageExtent, len(p.Pages))
 	for i, objs := range p.Pages {
-		out[i] = pageExtent{objects: len(objs)}
+		e := pageExtent{objects: len(objs)}
+		// ⛔ THE SHARED REFERENCES ARE REAL HERE TOO, for the same reason the
+		// object counts are: Table F.3's items 10 and 11 are widths derived
+		// from the per-page counts and the identifiers, and neither depends on
+		// an offset. A first pass that passed none could choose narrower widths
+		// than the second and the stream would change size between them.
+		if i > 0 {
+			e.shared = refsFor(plan, p.Shared[i])
+		}
+		out[i] = e
+	}
+	return out
+}
+
+// blankShared is the shared table's SHAPE with no bytes measured: the same
+// groups, each of length zero.
+//
+// ⛔ THE GROUP COUNT IS WHAT MATTERS, and it is pass-invariant — which objects
+// are shared does not depend on where they landed. The lengths are zero because
+// nothing has been measured yet, and they cost nothing in width because
+// NBitsDeltaGroupLength is pinned.
+func blankShared(p *Partition, order []int) sharedInput {
+	plan := planShared(p, order)
+	groups := make([]sharedGroup, len(plan.objects))
+	for i := range groups {
+		groups[i] = sharedGroup{NObjects: 1}
+	}
+	return sharedInput{groups: groups, firstPage: plan.firstPage}
+}
+
+// measureShared fills in the group lengths and part 8's location from this
+// pass's offsets.
+//
+// ⛔ ONE GROUP PER OBJECT. F.4.2 lets a group be a RUN of adjacent objects of
+// which only the first is referenced from outside, which is a compression of
+// the table rather than a requirement — and a run that guessed wrong would
+// describe bytes belonging to an object nobody referenced. One object per group
+// is always correct and costs a few bytes per shared object.
+func (d *Document) measureShared(p *Partition, order []int, num map[int]int,
+	offsets, ends []int) sharedInput {
+	plan := planShared(p, order)
+	out := sharedInput{
+		groups:    make([]sharedGroup, len(plan.objects)),
+		firstPage: plan.firstPage,
+	}
+	for i, old := range plan.objects {
+		n := num[old]
+		out.groups[i] = sharedGroup{
+			NObjects: 1,
+			Length:   uint32(ends[n] - offsets[n]),
+		}
+		// Items 1 and 2 name part 8's first object, which is the first one
+		// after the first-page run.
+		if i == plan.firstPage {
+			out.firstObj, out.firstOff = n, offsets[n]
+		}
 	}
 	return out
 }
@@ -719,10 +719,15 @@ func blankExtents(p *Partition) []pageExtent {
 // Order sorts each part's segment by object number, and a page's objects are not
 // guaranteed to be numbered in the order they are emitted, so the first in the
 // slice need not be the earliest in the file.
-func (d *Document) measurePages(p *Partition, num map[int]int, offsets, ends []int) []pageExtent {
+func (d *Document) measurePages(p *Partition, order []int, num map[int]int,
+	offsets, ends []int) []pageExtent {
+	plan := planShared(p, order)
 	out := make([]pageExtent, len(p.Pages))
 	for i, objs := range p.Pages {
 		e := pageExtent{objects: len(objs)}
+		if i > 0 {
+			e.shared = refsFor(plan, p.Shared[i])
+		}
 		for j, old := range objs {
 			n := num[old]
 			if j == 0 || offsets[n] < e.start {

@@ -158,19 +158,37 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 				}
 			}
 
-			// ⛔ THE SHARED TABLE IS PRESENT AND EMPTY, and both halves matter.
-			// Table F.2 marks it Required, so its absence is malformed; this
-			// writer's partition puts nothing in part 8, so it has no groups.
+			// ⛔⛔ THE SHARED TABLE DESCRIBES PART 6 THEN PART 8, and this block
+			// used to assert it was EMPTY — true while the writer refused every
+			// document that shared anything, and false since it writes one.
+			//
+			// ⛔ The first run is ALL of part 6, not only the objects a later
+			// page uses: nothing in the table says which object an entry
+			// describes, so the first run is positional, counted from /O. qpdf
+			// reports nshared_first_page 3 for a file whose part 6 holds three
+			// objects, including the ones no other page touches.
 			if tables.shared == nil {
 				t.Fatal("no shared object hint table, which Table F.2 marks Required")
 			}
-			if got := len(tables.sharedGroups); got != 0 {
-				t.Errorf("the shared table holds %d group(s) and this writer shares nothing",
-					got)
+			part6, part8 := 0, 0
+			for _, part := range p.Of {
+				switch part {
+				case PartFirstPage:
+					part6++
+				case PartShared:
+					part8++
+				}
 			}
-			if tables.shared.NSharedTotal != 0 || tables.shared.NSharedFirstPage != 0 {
-				t.Errorf("the shared table counts %d in all and %d for the first page",
-					tables.shared.NSharedTotal, tables.shared.NSharedFirstPage)
+			if got, want := int(tables.shared.NSharedFirstPage), part6; got != want {
+				t.Errorf("item 3 says %d first-page entr(ies) and part 6 holds %d object(s)",
+					got, want)
+			}
+			if got, want := int(tables.shared.NSharedTotal), part6+part8; got != want {
+				t.Errorf("item 4 says %d entr(ies) in all and parts 6 and 8 hold %d",
+					got, want)
+			}
+			if got, want := len(tables.sharedGroups), part6+part8; got != want {
+				t.Errorf("the table holds %d group(s) and item 4 wants %d", got, want)
 			}
 		})
 	}
@@ -269,8 +287,12 @@ func TestTheHintStreamIsTheSameLengthWhateverTheOffsets(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			blank := blankExtents(p)
-			first, _, err := buildHintTables(blank, 0, 0)
+			order, err := p.Order()
+			if err != nil {
+				t.Fatal(err)
+			}
+			blank := blankExtents(p, order)
+			first, _, err := buildHintTables(blank, blankShared(p, order), 0, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -288,9 +310,31 @@ func TestTheHintStreamIsTheSameLengthWhateverTheOffsets(t *testing.T) {
 					hasContent:   true,
 					contentStart: at + 40,
 					contentEnd:   at + 900 + i,
+					// ⛔ THE SAME REFERENCES, because they are pass-invariant:
+					// an identifier indexes the shared table and says nothing
+					// about where a byte landed. Dropping them here would make
+					// the two calls differ in their INPUT and the comparison
+					// would prove nothing about the layout.
+					shared: blank[i].shared,
 				}
 			}
-			second, _, err := buildHintTables(filled, 1000000, 120)
+
+			// ⛔ AND THE SAME GROUPS, with lengths a layout might produce. The
+			// count is what fixes the table's size; the lengths ride in a
+			// pinned 32-bit field.
+			sharedBlank := blankShared(p, order)
+			sharedFilled := sharedInput{
+				groups:    make([]sharedGroup, len(sharedBlank.groups)),
+				firstPage: sharedBlank.firstPage,
+			}
+			for i := range sharedFilled.groups {
+				sharedFilled.groups[i] = sharedGroup{NObjects: 1, Length: uint32(700 + i*13)}
+			}
+			if len(sharedFilled.groups) > sharedFilled.firstPage {
+				sharedFilled.firstObj, sharedFilled.firstOff = 9, 500000
+			}
+
+			second, _, err := buildHintTables(filled, sharedFilled, 1000000, 120)
 			if err != nil {
 				t.Fatal(err)
 			}

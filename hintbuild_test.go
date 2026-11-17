@@ -18,9 +18,9 @@ import (
 // a buffer that only grows, and writes the hint stream before the first page so
 // its length is always under that page's offset.
 //
-// ⛔ The refusals stay anyway. A later caller — the one that will supply shared
-// references for #61 — has none of those guarantees, and a propagation no test
-// reaches is a claim nothing can falsify.
+// ⛔ The refusals stay anyway. The caller that supplies shared references (#68)
+// has none of those guarantees — it hands in a plan of its own making — and a
+// propagation no test reaches is a claim nothing can falsify.
 func TestEveryWayTheHintTablesRefuse(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -78,7 +78,7 @@ func TestEveryWayTheHintTablesRefuse(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := buildHintTables(tc.pages, tc.first, tc.hint)
+			_, _, err := buildHintTables(tc.pages, sharedInput{}, tc.first, tc.hint)
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("it was accepted: %v", err)
 			}
@@ -103,10 +103,10 @@ func TestEveryWayTheHintTablesRefuse(t *testing.T) {
 // nothing in this package would have caught it, and the foreign judge was silent
 // only because no fixture could reach the case.
 //
-// ⚠ The writer refuses such a document rather than describing it, and that is
-// #61's to fix. This test is the witness that it refuses, and the fixture is
-// committed so the corpus can express the case from now on.
-func TestADocumentWhoseLaterPagesShareAnObjectIsRefused(t *testing.T) {
+// ⚠ The writer refused such a document rather than describing it wrongly until
+// #68 filled the table. This test is now the witness that it DESCRIBES it, and
+// the fixture it committed is what let the corpus express the case at all.
+func TestADocumentWhoseLaterPagesShareAnObjectIsWritten(t *testing.T) {
 	plain := sharedContentsFixture(t)
 	d, err := Open(plain)
 	if err != nil {
@@ -114,7 +114,8 @@ func TestADocumentWhoseLaterPagesShareAnObjectIsRefused(t *testing.T) {
 	}
 
 	// ⛔ THE POSITIVE HALF FIRST: the partition must SEE the sharing, or the
-	// refusal below would be passing for the wrong reason.
+	// table written below would be describing a document with nothing in it and
+	// passing for the wrong reason.
 	p, err := d.Partition()
 	if err != nil {
 		t.Fatal(err)
@@ -131,12 +132,41 @@ func TestADocumentWhoseLaterPagesShareAnObjectIsRefused(t *testing.T) {
 			"no shared object, so this fixture witnesses nothing")
 	}
 
-	_, err = d.Linearize()
-	if !errors.Is(err, ErrCannotLinearize) {
-		t.Fatalf("a document this writer cannot describe was accepted: %v", err)
+	// ⛔⛔ IT IS WRITTEN NOW, AND THIS TEST USED TO ASSERT THE REFUSAL. While the
+	// shared object hint table was emitted required-but-EMPTY, a document whose
+	// later pages share an object got a table contradicting the file and
+	// `qpdf --check` said so — so refusing was the honest state. #68 writes the
+	// table, and the same document is described instead.
+	out, err := d.Linearize()
+	if err != nil {
+		t.Fatalf("a document whose pages share a content stream was refused: %v", err)
 	}
-	if !strings.Contains(err.Error(), "shares object") {
-		t.Errorf("refused, but not for the shared object: %v", err)
+	if _, err := CheckLinearized(out); err != nil {
+		t.Fatalf("our own checker refuses it: %v", err)
+	}
+
+	// ⛔ AND THE TABLE SAYS SO: page 2 must name the object it shares.
+	lin, err := Linearized(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err := Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := written.readHintTables(lin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables.pages) < 2 {
+		t.Fatalf("the table holds %d page entr(ies)", len(tables.pages))
+	}
+	if len(tables.pages[0].Shared) != 0 {
+		t.Errorf("page 1 names %d shared object(s), and Table F.4 item 3 requires 0",
+			len(tables.pages[0].Shared))
+	}
+	if len(tables.pages[1].Shared) == 0 {
+		t.Error("page 2 shares an object with page 1 and the table names none")
 	}
 }
 
@@ -185,25 +215,40 @@ func TestAPageInheritingAnIndirectAttribute(t *testing.T) {
 			p.Shared[1])
 	}
 
-	// And so the writer refuses it, for the reason it can state.
-	if _, err := d.Linearize(); !errors.Is(err, ErrCannotLinearize) {
-		t.Fatalf("a document whose pages share an inherited object was accepted: %v", err)
+	// ⛔ AND THE WRITER DESCRIBES IT. This asserted a REFUSAL until #68: the
+	// partition seeing the inherited object is what made the refusal correct,
+	// and it is now what makes the shared table correct. The reach fix (#66)
+	// was the prerequisite either way.
+	out, err := d.Linearize()
+	if err != nil {
+		t.Fatalf("a document whose pages share an inherited object was refused: %v", err)
+	}
+	if _, err := CheckLinearized(out); err != nil {
+		t.Fatalf("our own checker refuses it: %v", err)
 	}
 }
 
-// ⛔⛔⛔ WHICH INHERITANCE SHAPES THE WRITER ACCEPTS, measured rather than
-// relayed. The refusal's scope is much wider than "pages sharing a content
-// stream": one shared resource dictionary on the page tree node is the ORDINARY
-// way to write a multi-page PDF, so a large share of real files are refused
-// today. That claim is in the README, and a claim in prose is worth what its
-// witness is worth.
+// ⛔⛔⛔ WHAT EACH INHERITANCE SHAPE PUTS IN THE SHARED TABLE. Until #68 this
+// table had an `accept` column and five rows set to false, and the rule it
+// witnessed — "refused iff an object a page after the first reaches is also
+// reached by another page, other than the catalogue" — was the README's. The
+// shared object hint table makes that rule obsolete: every shape here is now
+// WRITTEN, so a column of eleven `accept: true` would assert nothing a single
+// row does not.
 //
-// ⛔ The accepting rows matter more than the refusing one. They are what keeps
-// the fix from over-reaching: a direct inherited value adds no object, a page
-// stating its own inherits nothing, and an object only ONE later page reaches is
-// private to it. Without them a stricter reach would refuse everything and the
-// suite would still be green.
-func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
+// ⛔⛔ SO THE COLUMN WAS REPLACED RATHER THAN DELETED. What a reader needs from
+// these files is not that Linearize returned nil — it is that a page after the
+// first NAMES the objects it shares, which is the whole point of F.4.1 items 4
+// and 5. `laterPageShares` is that claim, and it has witnesses on BOTH sides:
+// five shapes where a later page must name something and six where it must name
+// NOTHING. A writer that emitted refs for everything, or for nothing, passes the
+// accept column and fails this one.
+//
+// ⭐ The false rows are the ones that keep the writer from over-reaching: a
+// direct inherited value adds no object, a page stating its own inherits
+// nothing, an object only ONE page reaches is private to it, and the catalogue
+// is exempt because part 4 arrives ahead of the first page.
+func TestWhatEachInheritanceShapePutsInTheSharedTable(t *testing.T) {
 	// A page tree node carrying `nodeKeys`, with `pageKeys` on every page.
 	build := func(t *testing.T, pages int, onNode, onPages Dict) []byte {
 		t.Helper()
@@ -441,77 +486,75 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name   string
-		plain  func(*testing.T) []byte
-		accept bool
-		// key is the inheritable key the refusal must name, or "" when the
-		// sharing is not caused by inheritance and naming one would be false.
-		key string
+		name  string
+		plain func(*testing.T) []byte
+		// laterPageShares is whether a page AFTER THE FIRST must carry at
+		// least one Table F.4 item 4 identifier. False means it must carry
+		// none: the shape has nothing for the shared table to describe.
+		laterPageShares bool
 	}{
 		{
-			name:   "two pages both reaching the CATALOGUE",
-			plain:  bothReachCatalogue,
-			accept: true, // part 4 arrives ahead of the first page
+			name:  "two pages both reaching the CATALOGUE",
+			plain: bothReachCatalogue,
+			// ⛔ Part 4 arrives ahead of the first page, so a later page that
+			// depends on the catalogue needs no F.4.2 entry. This was the row
+			// the old refusal had to exempt BY NAME; the writer inherits the
+			// exemption through PartCatalog, which planShared does not plan.
+			laterPageShares: false,
 		},
 		{
-			name:   "one page inherits the object the other reaches through its own /Resources",
-			plain:  viaOwnResources,
-			accept: false,
-			key:    "/Resources", // the inherited value IS the shared object
+			name:            "one page inherits the object the other reaches through its own /Resources",
+			plain:           viaOwnResources,
+			laterPageShares: true,
 		},
 		{
-			name:   "two pages stating the SAME /Resources object, no inheritance",
-			plain:  sameOwnResources,
-			accept: false,
-			key:    "", // nothing was inherited, so no key may be blamed
+			name:            "two pages stating the SAME /Resources object, no inheritance",
+			plain:           sameOwnResources,
+			laterPageShares: true,
 		},
 		{
-			name:   "one page inheriting an indirect /Resources",
-			plain:  func(t *testing.T) []byte { return indirect(t, 1, false) },
-			accept: true, // nothing to share with
+			name:            "one page inheriting an indirect /Resources",
+			plain:           func(t *testing.T) []byte { return indirect(t, 1, false) },
+			laterPageShares: false, // there is no later page
 		},
 		{
-			name:   "a sub-node's indirect /Resources with ONE page under it",
-			plain:  func(t *testing.T) []byte { return deep(t, 1) },
-			accept: true, // the object is that page's alone
+			name:            "a sub-node's indirect /Resources with ONE page under it",
+			plain:           func(t *testing.T) []byte { return deep(t, 1) },
+			laterPageShares: false, // the object is that page's alone
 		},
 		{
-			name:   "a sub-node's indirect /Resources with TWO pages under it",
-			plain:  func(t *testing.T) []byte { return deep(t, 2) },
-			accept: false,
-			key:    "/Resources",
+			name:            "a sub-node's indirect /Resources with TWO pages under it",
+			plain:           func(t *testing.T) []byte { return deep(t, 2) },
+			laterPageShares: true,
 		},
 		{
-			name:   "pages sharing a /Contents while one inherits an unrelated key",
-			plain:  falseKey,
-			accept: false,
-			key:    "", // naming /Rotate here would be a falsehood
+			name:            "pages sharing a /Contents while one inherits an unrelated key",
+			plain:           falseKey,
+			laterPageShares: true, // the /Contents, never the private /Rotate
 		},
 		{
-			name:   "two pages with inheritable values all DIRECT",
-			plain:  func(t *testing.T) []byte { return build(t, 2, nil, nil) },
-			accept: true, // an inline /MediaBox array adds no object
+			name:            "two pages with inheritable values all DIRECT",
+			plain:           func(t *testing.T) []byte { return build(t, 2, nil, nil) },
+			laterPageShares: false, // an inline /MediaBox array adds no object
 		},
 		{
 			// ⛔ "EACH STATING THEIR OWN" WAS THE OLD NAME AND IT NAMED THE
-			// WRONG REASON. This passes because the two objects DIFFER, not
-			// because the pages state them — the row below, where both state
-			// the SAME object, is refused.
-			name:   "two pages each naming a DIFFERENT /Resources object",
-			plain:  func(t *testing.T) []byte { return indirect(t, 2, true) },
-			accept: true,
+			// WRONG REASON. Nothing is shared here because the two objects
+			// DIFFER, not because the pages state them — the row below, where
+			// both inherit the SAME object, shares.
+			name:            "two pages each naming a DIFFERENT /Resources object",
+			plain:           func(t *testing.T) []byte { return indirect(t, 2, true) },
+			laterPageShares: false,
 		},
 		{
-			name:   "two pages inheriting ONE indirect /Resources",
-			plain:  func(t *testing.T) []byte { return indirect(t, 2, false) },
-			accept: false, // needs F.4.2, which is #61
-			key:    "/Resources",
+			name:            "two pages inheriting ONE indirect /Resources",
+			plain:           func(t *testing.T) []byte { return indirect(t, 2, false) },
+			laterPageShares: true,
 		},
 		{
-			name:   "twenty-five pages inheriting ONE indirect /Resources",
-			plain:  func(t *testing.T) []byte { return indirect(t, 25, false) },
-			accept: false,
-			key:    "/Resources",
+			name:            "twenty-five pages inheriting ONE indirect /Resources",
+			plain:           func(t *testing.T) []byte { return indirect(t, 25, false) },
+			laterPageShares: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,39 +563,43 @@ func TestWhichInheritanceShapesTheWriterAccepts(t *testing.T) {
 				t.Fatal(err)
 			}
 			out, err := d.Linearize()
-			if tc.accept {
-				if err != nil {
-					t.Fatalf("this shape is documented as accepted and was refused: %v", err)
-				}
-				// ⛔ And it is a file, not merely an absence of error.
-				if _, err := CheckLinearized(out); err != nil {
-					t.Fatalf("accepted, but our own checker refuses it: %v", err)
-				}
-				return
+			if err != nil {
+				t.Fatalf("this shape was refused: %v", err)
 			}
-			if !errors.Is(err, ErrCannotLinearize) {
-				t.Fatalf("this shape is documented as refused and was accepted: %v", err)
+			// ⛔ And it is a file, not merely an absence of error.
+			lin, err := CheckLinearized(out)
+			if err != nil {
+				t.Fatalf("written, but our own checker refuses it: %v", err)
 			}
-			// ⛔⛔ AND THE MESSAGE NAMES THE KEY ONLY WHEN THE KEY IS THE CAUSE.
-			// Naming it is a diagnosis when the shared object IS the inherited
-			// value — "page 2 shares object 2" tells the caller nothing about a
-			// document where they wrote object 2 into neither page. Naming it
-			// otherwise is a falsehood, and the last case here is a document
-			// where both halves of such a sentence were true while their
-			// conjunction was not.
-			if tc.key == "" {
-				for _, key := range []string{"/Resources", "/MediaBox", "/CropBox",
-					"/Rotate"} {
-					if strings.Contains(err.Error(), key) {
-						t.Errorf("it blamed %s for sharing that inheritance did not "+
-							"cause: %v", key, err)
-					}
-				}
-				return
+
+			// ⛔⛔ READ BACK FROM THE BYTES, not from the plan that wrote them.
+			// A witness taken from planShared would agree with the writer by
+			// construction; this one parses the F.4 entries out of the file and
+			// so also exercises the column-major decode.
+			ld, err := Open(out)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if !strings.Contains(err.Error(), tc.key) {
-				t.Errorf("refused without naming %s, the key it was inherited as: %v",
-					tc.key, err)
+			tables, err := ld.readHintTables(lin)
+			if err != nil {
+				t.Fatalf("the hint tables of our own file do not parse: %v", err)
+			}
+			if got, want := len(tables.pages), len(d.pageRefs()); got != want {
+				t.Fatalf("the page table describes %d page(s) of %d", got, want)
+			}
+
+			refs := 0
+			for _, e := range tables.pages[1:] {
+				refs += len(e.Shared)
+			}
+			if tc.laterPageShares && refs == 0 {
+				t.Errorf("a page after the first shares an object and named none: "+
+					"%d shared entr(ies) in all, %d for the first page",
+					tables.shared.NSharedTotal, tables.shared.NSharedFirstPage)
+			}
+			if !tc.laterPageShares && refs != 0 {
+				t.Errorf("no page after the first shares anything, yet %d identifier(s) "+
+					"were written: a reader will fetch objects it does not need", refs)
 			}
 		})
 	}
@@ -888,7 +935,7 @@ func TestTheHintTablesRefuseAValueTooWideForItsField(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := buildHintTables(tc.pages, tc.first, 1)
+			_, _, err := buildHintTables(tc.pages, sharedInput{}, tc.first, 1)
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("it was truncated instead of refused: %v", err)
 			}
@@ -939,7 +986,7 @@ func TestTheHintTablesPropagateAnEncoderRefusal(t *testing.T) {
 		writePageOffset = func(*pageOffsetHeader, []pageEntry) ([]byte, error) {
 			return nil, boom
 		}
-		if _, _, err := buildHintTables(pages, 100, 10); !errors.Is(err, boom) {
+		if _, _, err := buildHintTables(pages, sharedInput{}, 100, 10); !errors.Is(err, boom) {
 			t.Fatalf("the page offset table's refusal did not reach the caller: %v", err)
 		}
 	})
@@ -950,7 +997,7 @@ func TestTheHintTablesPropagateAnEncoderRefusal(t *testing.T) {
 		writeShared = func(*sharedHeader, []sharedGroup) ([]byte, error) {
 			return nil, boom
 		}
-		if _, _, err := buildHintTables(pages, 100, 10); !errors.Is(err, boom) {
+		if _, _, err := buildHintTables(pages, sharedInput{}, 100, 10); !errors.Is(err, boom) {
 			t.Fatalf("the shared table's refusal did not reach the caller: %v", err)
 		}
 	})
@@ -974,13 +1021,13 @@ func TestTheEmissionPropagatesAHintTableRefusal(t *testing.T) {
 			saved := buildHint
 			defer func() { buildHint = saved }()
 			calls := 0
-			buildHint = func(p []pageExtent, first, hint int) ([]byte, int, error) {
+			buildHint = func(p []pageExtent, s sharedInput, first, hint int) ([]byte, int, error) {
 				if calls >= tc.after {
 					calls++
 					return nil, 0, boom
 				}
 				calls++
-				return saved(p, first, hint)
+				return saved(p, s, first, hint)
 			}
 
 			d, err := Open(buildPages(t, 1))
@@ -1122,4 +1169,54 @@ func TestContentNumbersFindsNothingToReport(t *testing.T) {
 			t.Errorf("it reported %v for an array holding no references", got)
 		}
 	})
+}
+
+// ⛔⛔ TABLE F.5 ITEM 5 IS A WIDTH FOR "1 LESS THAN THE NUMBER", and this writer
+// cannot reach the part of groupCountWidth that depends on it: measureShared
+// makes every group hold exactly ONE object, so the widest value it ever weighs
+// is 0 and one bit always suffices.
+//
+// ⛔ WHICH IS WHY THE TEST CALLS THE FUNCTION DIRECTLY. The alternative was to
+// write the constant 1 at the call site and delete the derivation — but the day
+// a group holds two objects, a header saying "1 bit" makes a reader misparse
+// EVERY group that follows, and a derivation no test can enter is no better
+// than the constant. The rows below are the measurement the writer cannot make.
+//
+// ⭐ The "1 less" is F.6's, not ours: a group of 1 stores 0. So 5 objects need
+// the width of 4, which is 3 bits, not the 3 bits of 5 by accident — the row
+// with 9 objects separates them, storing 8 in 4 bits where 9 would need 4 too,
+// and the row with 17 stores 16 and needs 5.
+func TestTheGroupCountWidthHoldsOneLessThanTheCount(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		counts []uint32
+		want   int
+	}{
+		{"no groups at all", nil, 1},
+		{"every group holding ONE object, which is all this writer emits",
+			[]uint32{1, 1, 1}, 1},
+		{"a group of two stores 1", []uint32{1, 2}, 1},
+		{"a group of three stores 2", []uint32{3, 1}, 2},
+		{"a group of five stores 4", []uint32{1, 5, 2}, 3},
+		{"a group of nine stores 8", []uint32{9}, 4},
+		{"a group of seventeen stores 16", []uint32{17, 3}, 5},
+		{
+			// ⛔ A GROUP OF ZERO OBJECTS IS NOT A GROUP, and uint32(0)-1 is
+			// 4294967295: the guard is what keeps a malformed input from
+			// declaring a 32-bit width.
+			name:   "a group of NO objects does not widen anything",
+			counts: []uint32{0, 1},
+			want:   1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groups := make([]sharedGroup, 0, len(tc.counts))
+			for _, n := range tc.counts {
+				groups = append(groups, sharedGroup{NObjects: n, Length: 10})
+			}
+			if got := groupCountWidth(groups); got != tc.want {
+				t.Errorf("groupCountWidth(%v) = %d bits, want %d", tc.counts, got, tc.want)
+			}
+		})
+	}
 }
