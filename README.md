@@ -944,7 +944,40 @@ passing oracle meant "the corpus says nothing".
 so, and the fixture committed with the refusal is now
 `TestADocumentWhoseLaterPagesShareAnObjectIsWritten`.
 
-### ⭐⭐ The shared object hint table, and the two defects our own checker caught
+### ⛔⛔⛔ And it said it again one step later — the refusal went, the fixtures stayed
+
+The first version of this change **removed the refusal and left `hintShapes()`
+untouched**, so the set of documents every hint-table judgement runs over was
+still four private-page shapes and a one-page inherited one. Not one of them
+shares an object. The suite was green at 100% coverage with qpdf required, and
+it was green the same way it had been before: the inputs were silent.
+
+Found by external review, by mutation, with qpdf 12.4.2 installed:
+
+| mutation | what it breaks | suite, before |
+|---|---|---|
+| `refsFor` identifier reversed | every page names the **wrong** shared objects | **exit 0, green** |
+| `sharedOffset` returning `at` | exactly the item-2 defect this arc fixed | **exit 0, green** |
+
+Both are red now, and the second is red *through qpdf*, which had been silent
+only because nothing it was shown shared anything. The fix is three lines of
+fixtures — `hintShapes()` carries the shared-`/Contents` shape, the inherited
+shape and a three-page shape whose pages 2 and 3 share an object page 1 does not
+reach — plus the assertion that was missing beside the counts: **each identifier
+is decoded back to an object number** and compared with what the page actually
+reaches, through the reader's own rule (`/O + j`, then `FirstSharedObj`) rather
+than by asking `planShared`, which would agree with the writer by construction.
+
+⚠ The probe in the pull request body is **hand-run and uncommitted**, and a
+hand-run judge is not a gate. It found real defects; it cannot keep them out.
+
+⭐ One real finding arrived with those fixtures, and not in the shared table: a
+page that **borrows** a content stream has it sitting *before* its own first
+byte — −83 bytes for the shared-`/Contents` shape — and items 6 and 7 are
+unsigned. There is no representable value, so the writer states **none**, and
+the test now asserts that rather than recomputing what the writer does.
+
+### ⭐⭐ The shared object hint table, and the defects the two judges caught
 
 The table describes **two runs**, which is the thing the annex states only
 obliquely: Table F.5 item 3 is the number of entries *for the first page* and
@@ -965,19 +998,36 @@ shared group 0 says 83 bytes and its 1 object(s) from object 2 occupy 101
 ```
 
 ⛔⛔ **And item 2 is stored as if the hint stream were absent**, exactly like
-Table F.3 item 2. The second defect, also ours and also caught by our checker
-before qpdf saw it:
+Table F.3 item 2. The second defect was caught by **qpdf**:
 
 ```
 first shared object offset mismatch: hint table = 1472; computed = 1300
 ```
 
-with `H_length: 172`, which is the difference. `sharedOffset` does that
-subtraction and **has no clamp**: a version of it returned 0 for an offset below
-the hint length, a branch no emission can reach, and what it would have done is
-turn a wrong offset into the one value meaning "there is no shared object".
+with `H_length: 172`, which is the difference.
 
-⭐ **Every group holds one object.** `measureShared` emits `NObjects: 1` per
+⛔⛔⛔ **That sentence said "also ours and also caught by our checker before qpdf
+saw it", and it was false.** `FirstSharedObj` and `FirstSharedOffset` are
+written, parsed and compared in a hint-table test; **no checker recomputes
+either**, and the string above appears nowhere in the Go source — it is qpdf's
+wording, quoted from its output and then credited to us. External review found
+it by grep; mutation confirmed it, with `sharedOffset` returning the raw offset:
+`CheckLinearized` stays silent and qpdf prints exactly the line above. So the
+honest division is **our checker (#67) caught the group length, qpdf caught the
+offset**, and recomputing item 2 in `CheckLinearized` is a gap this change
+leaves open.
+
+⚠ This is the repository's standing lesson arriving one more time: the code was
+right and the prose about it was wrong. Here the prose claimed a capability the
+package does not have, which is the costlier direction — it would have been read
+as evidence that our checker covers item 2.
+
+⭐ `sharedOffset` does that subtraction and **has no clamp**: a version of it
+returned 0 for an offset below the hint length, a branch no emission can reach,
+and what it would have done is turn a wrong offset into the one value meaning
+"there is no shared object".
+
+⭐ **Every group holds one object.** `measureShared` measures one byte length per
 planned object, so a group's length is that object's own extent and no grouping
 decision can be wrong. It costs a few bytes per shared object against a table
 that groups adjacent ones.
@@ -1012,13 +1062,26 @@ identifiers — because that, not the absence of an error, is what a reader uses
 | flat multi-page inheriting one indirect `/Resources` | **the shared object** |
 | one page inherits it, the other reaches it via its **own** `/Resources` | **the shared object** |
 | two pages naming the **same** `/Resources` object, no inheritance at all | **the shared object** |
+| **twenty-five** pages inheriting one indirect `/Resources` | **the shared object** |
 | two pages sharing a `/Contents` while one inherits an unrelated `/Rotate` | **the `/Contents`**, never the private `/Rotate` |
 
-⛔ **Both halves of that column are witnesses.** Five shapes must name something
-and six must name nothing, so a writer that emitted identifiers for everything —
+⛔ **Both halves of that column are witnesses.** Six shapes must name something
+and five must name nothing, so a writer that emitted identifiers for everything —
 or for nothing, which is what the empty table was — fails it. The previous
 version of this table had an *accepted?* column; with the refusal gone, eleven
 rows of "yes" would have asserted what a single row does.
+
+⚠ That sentence read "five … and six", and this table listed **ten** of the
+eleven rows — the twenty-five-page one was missing, and with it the only row
+that exercises the shapes at scale. Both were found by external review, by
+counting. A prose tally beside the table it describes is worth one recount, and
+a table transcribed from a test is worth one diff against it.
+
+⛔ **And this column judges presence only.** It cannot tell a right identifier
+from a wrong one: reversing `refsFor`'s identifier — every page naming objects
+it does not reach — leaves all eleven rows green. The values are judged by
+`TestTheHintTablesDescribeTheFileWeWrote`, which decodes each identifier back to
+an object number through the reader's own rule.
 
 ⛔ The catalogue row is the one the old rule had to exempt by name, and it still
 holds for the reason it always did: `of[catNum] = PartCatalog` is assigned

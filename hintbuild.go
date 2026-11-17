@@ -54,14 +54,25 @@ type pageExtent struct {
 // sharedInput is what the shared object hint table needs beyond the plan: the
 // measured groups, and where part 8 begins.
 type sharedInput struct {
-	groups []sharedGroup
+	// lengths is one byte length per planned object, in table order. It is int
+	// rather than the uint32 a group stores, because the conversion is where a
+	// document larger than 4 GiB truncates and buildHintTables is where this
+	// package refuses such a document — the same division as pageExtent, whose
+	// guards are reachable from a test that calls the builder directly.
+	//
+	// ⛔ ONE OBJECT PER GROUP, so this slice determines the groups entirely and
+	// the builder constructs them. It used to carry []sharedGroup with
+	// NObjects: 1 written by the caller; external review found the resulting
+	// uint32 conversion unguarded, and a length the builder cannot see is a
+	// length it cannot refuse.
+	lengths []int
 
 	// firstObj and firstOff are Table F.5's items 1 and 2, which locate part 8.
 	// Both are 0 when part 8 is empty — there is then no first shared object to
 	// name, and no group dereferences them.
 	firstObj, firstOff int
 
-	// firstPage is item 3, and len(groups) is item 4.
+	// firstPage is item 3, and len(lengths) is item 4.
 	firstPage int
 }
 
@@ -258,6 +269,37 @@ func buildHintTables(pages []pageExtent, shared sharedInput,
 		return nil, 0, err
 	}
 
+	// ⛔⛔ THE SHARED SIDE IS REFUSED ABOVE 32 BITS TOO, and it was not until
+	// external review: the page guard above covers a page's own quantities,
+	// which stay small in a document whose SIZE is what overflows. Part 8's
+	// offset is the opposite case — every page can be a few kilobytes while the
+	// offset of the shared section is past 4 GiB — so a file larger than
+	// MaxUint32 wrote a wrapped item 2 and said nothing.
+	//
+	// ⛔ Item 2 is checked on the ADJUSTED value, because that is what is
+	// stored: the hint stream's length is subtracted first, and refusing the
+	// raw offset would refuse a file whose stored value fits.
+	groups := make([]sharedGroup, len(shared.lengths))
+	for i, n := range shared.lengths {
+		if int64(n) > math.MaxUint32 {
+			return nil, 0, fmt.Errorf("%w: shared group %d is %d bytes, and Table F.6 "+
+				"holds up to %d", errHintTable, i, n, uint32(math.MaxUint32))
+		}
+		groups[i] = sharedGroup{NObjects: 1, Length: uint32(n)}
+	}
+	for _, c := range []struct {
+		name string
+		v    int
+	}{
+		{"first shared object's number", shared.firstObj},
+		{"first shared object's offset", sharedOffset(shared.firstOff, hintLen)},
+	} {
+		if int64(c.v) > math.MaxUint32 {
+			return nil, 0, fmt.Errorf("%w: the %s is %d, and Table F.5 holds up to %d",
+				errHintTable, c.name, c.v, uint32(math.MaxUint32))
+		}
+	}
+
 	// ⛔⛔ THE SHARED TABLE IS REQUIRED EVEN WITH NOTHING TO SAY. Table F.2 marks
 	// it Required and /S locates it, so a hint stream without one is malformed
 	// however empty the document's part 8 is.
@@ -285,25 +327,27 @@ func buildHintTables(pages []pageExtent, shared sharedInput,
 		// the groups are ONE run of entries, the first item-3 of them being the
 		// first page's.
 		NSharedFirstPage: uint32(shared.firstPage),
-		NSharedTotal:     uint32(len(shared.groups)),
+		NSharedTotal:     uint32(len(groups)),
 
 		// ⛔ Derived and pass-invariant: every group covers one object here, so
 		// this is 1 whatever the layout does.
-		NBitsNObjects: groupCountWidth(shared.groups),
+		NBitsNObjects: groupCountWidth(groups),
 
-		MinGroupLength: leastGroup(shared.groups),
+		MinGroupLength: leastGroup(groups),
 		// ⛔ FIXED, for the same reason as the three page widths: a group's
 		// length is measured in BYTES, so a width derived from it would change
 		// with the layout and move the stream between the two passes.
 		NBitsDeltaGroupLength: hintByteWidth,
 	}
-	if len(shared.groups) == 0 {
-		// ⛔ A width of 0 is a path bitw has never been asked for; with no
-		// groups nothing uses these, so 1 is the safe statement.
-		hdr.NBitsNObjects = 1
-	}
+	// ⛔ NO `len(groups) == 0` SPECIAL CASE. One stood here setting
+	// NBitsNObjects to 1 "because a width of 0 is a path bitw has never been
+	// asked for" — but groupCountWidth(nil) already returns 1, as its own test
+	// row asserts, so the block restated its result and could never change an
+	// emitted byte. Removed on external review, by the standard that removed
+	// sharedOffset's clamp: a branch that cannot change the output is a claim
+	// nothing can falsify.
 
-	table, err := writeShared(hdr, shared.groups)
+	table, err := writeShared(hdr, groups)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -361,10 +405,21 @@ func groupCountWidth(groups []sharedGroup) int {
 // for an offset that cannot arise — part 8 is emitted after the hint stream, so
 // `at` is past it whenever it is not zero. Nothing could reach the branch, so
 // nothing measured it, and what it did was turn a wrong offset into the one
-// value that means "there is no shared object". CheckLinearized recomputes this
-// offset from the file and says "first shared object offset mismatch", which is
-// how the writer's two real defects were found; a clamp would have hidden one
-// of them behind a plausible zero.
+// value that means "there is no shared object".
+//
+// ⛔⛔⛔ AND WHAT CATCHES A WRONG VALUE HERE IS QPDF, NOT US. This comment said
+// "CheckLinearized recomputes this offset and says `first shared object offset
+// mismatch`". It does not: FirstSharedObj and FirstSharedOffset are written,
+// parsed and compared in a hint-table test, and no checker recomputes either.
+// That sentence is qpdf's wording, quoted from its output and credited to our
+// own code — found by external review, then confirmed by mutation:
+// `return at` here leaves CheckLinearized silent and makes qpdf say
+//
+//	WARNING: first shared object offset mismatch: hint table = 1472; computed = 1300
+//
+// ⚠ So the honest division is: our checker (#67) caught the GROUP LENGTH
+// defect, qpdf caught this one. Recomputing item 2 in CheckLinearized would
+// close the gap and is not in this change.
 func sharedOffset(at, hintLen int) int {
 	if at == 0 {
 		return 0

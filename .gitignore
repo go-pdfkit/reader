@@ -1,5 +1,10 @@
 cov.out
 coverage.out
+
+# ⛔ A background command's log, which a durable-directory rule sends HERE
+# rather than to a volatile one — so `git add -A` sweeps it into a commit.
+# It did, on this branch, and the commit had to be corrected.
+.prwait-*.log
 *.pdf
 # ⛔ except a fixture, deliberately. The rule above keeps stray PDFs and corpus
 # files out of the repository, and every test here builds the documents it

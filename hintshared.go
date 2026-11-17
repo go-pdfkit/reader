@@ -24,12 +24,12 @@ package reader
 // objects. For testdata/linearized-shared.pdf it reports 2 and 3 with
 // first_shared_obj 5, so both runs are populated there.
 type sharedPlan struct {
-	// objects is the table's order: the first-page run, then part 8's.
+	// objects is the table's order: the first-page run, then part 8's. An
+	// object's INDEX here is its Table F.4 item 4 identifier, which is why
+	// there is no map beside it: a `identifier map[int]int` was built on every
+	// call and read by nothing once refsFor started walking this slice, so it
+	// was two statements of the same fact with only one of them used.
 	objects []int
-
-	// identifier maps a document object number to its index in objects, which
-	// is what Table F.4 item 4 stores.
-	identifier map[int]int
 
 	// firstPage is Table F.5 item 3: how many of objects are the first page's.
 	firstPage int
@@ -47,19 +47,23 @@ type sharedPlan struct {
 // ⭐ MEASURED ON QPDF'S OWN OUTPUT, which is also how this was caught. For a
 // two-page file it reports nshared_first_page 3 with part 6 holding objects 7,
 // 8 and 9 and /O = 7 — every first-page object, not the one page 2 shares. And
-// our own checker (#67) refused the first version in one run:
+// our own checker (#67) refused the first version:
 //
 //	shared group 0 says 83 bytes and its 1 object(s) from object 2 occupy 101
-//	first shared object offset mismatch: hint table = 1456; computed = 1292
 //
 // which is the checker-before-writer order of #40 working exactly as intended.
+//
+// ⛔ THE SECOND LINE THAT STOOD HERE WAS QPDF'S, NOT OURS — "first shared
+// object offset mismatch: hint table = 1456; computed = 1292" — and quoting it
+// as part of one run by our checker made this comment claim a capability the
+// package does not have. See sharedOffset: no checker recomputes item 2.
 //
 // ⛔ SO THE ORDER IS THE LAYOUT'S, not a sort of object numbers: `order` is what
 // the emission writes and what the renumbering follows, so entry j of the first
 // run is the j-th part-6 object and part 8's entries follow in the same
 // sequence.
 func planShared(p *Partition, order []int) sharedPlan {
-	plan := sharedPlan{identifier: map[int]int{}}
+	var plan sharedPlan
 
 	var part8 []int
 	for _, num := range order {
@@ -72,9 +76,6 @@ func planShared(p *Partition, order []int) sharedPlan {
 	}
 	plan.firstPage = len(plan.objects)
 	plan.objects = append(plan.objects, part8...)
-	for i, num := range plan.objects {
-		plan.identifier[num] = i
-	}
 	return plan
 }
 

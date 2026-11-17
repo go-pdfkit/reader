@@ -240,9 +240,19 @@ func TestAPageInheritingAnIndirectAttribute(t *testing.T) {
 // these files is not that Linearize returned nil — it is that a page after the
 // first NAMES the objects it shares, which is the whole point of F.4.1 items 4
 // and 5. `laterPageShares` is that claim, and it has witnesses on BOTH sides:
-// five shapes where a later page must name something and six where it must name
+// SIX shapes where a later page must name something and FIVE where it must name
 // NOTHING. A writer that emitted refs for everything, or for nothing, passes the
 // accept column and fails this one.
+//
+// ⚠ Those two numbers read "five … and six" until external review counted the
+// rows: a tally stated in prose beside the table that contains it is worth
+// exactly one recount.
+//
+// ⛔⛔ AND PRESENCE IS ALL THIS TEST JUDGES. It cannot tell a right identifier
+// from a wrong one — reversing refsFor's identifier leaves every row here
+// green. What catches that is TestTheHintTablesDescribeTheFileWeWrote, which
+// decodes each identifier back to an object number; this table's job is the
+// SHAPES, that one's is the values, and neither covers the other.
 //
 // ⭐ The false rows are the ones that keep the writer from over-reaching: a
 // direct inherited value adds no object, a page stating its own inherits
@@ -888,10 +898,11 @@ func TestTheHintTablesRefuseAValueTooWideForItsField(t *testing.T) {
 	tooBig := int(limit) + 1
 
 	for _, tc := range []struct {
-		name  string
-		pages []pageExtent
-		first int
-		want  string
+		name   string
+		pages  []pageExtent
+		first  int
+		shared sharedInput
+		want   string
 	}{
 		{
 			name:  "a page longer than 4 GiB",
@@ -933,9 +944,36 @@ func TestTheHintTablesRefuseAValueTooWideForItsField(t *testing.T) {
 			first: tooBig + 1,
 			want:  "item 2 would be",
 		},
+		// ⛔⛔ THE SHARED SIDE HAD NO GUARD AT ALL UNTIL EXTERNAL REVIEW, and
+		// the reason the page rows above did not cover it is worth keeping:
+		// they are a PAGE's quantities, which stay small in exactly the
+		// document whose SIZE overflows. A file of ten thousand four-kilobyte
+		// pages puts part 8 past 4 GiB with every page row comfortably inside
+		// its field.
+		{
+			name:   "a shared group longer than 4 GiB",
+			pages:  []pageExtent{{objects: 1, start: 0, end: 10, length: 10}},
+			first:  10,
+			shared: sharedInput{lengths: []int{10, tooBig}},
+			want:   "shared group 1 is",
+		},
+		{
+			name:   "part 8 beginning past 4 GiB",
+			pages:  []pageExtent{{objects: 1, start: 0, end: 10, length: 10}},
+			first:  10,
+			shared: sharedInput{lengths: []int{10}, firstOff: tooBig + 2, firstObj: 3},
+			want:   "first shared object's offset",
+		},
+		{
+			name:   "a first shared object numbered past 4 Gi",
+			pages:  []pageExtent{{objects: 1, start: 0, end: 10, length: 10}},
+			first:  10,
+			shared: sharedInput{lengths: []int{10}, firstOff: 20, firstObj: tooBig},
+			want:   "first shared object's number",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := buildHintTables(tc.pages, sharedInput{}, tc.first, 1)
+			_, _, err := buildHintTables(tc.pages, tc.shared, tc.first, 1)
 			if !errors.Is(err, errHintTable) {
 				t.Fatalf("it was truncated instead of refused: %v", err)
 			}

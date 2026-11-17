@@ -675,11 +675,10 @@ func blankExtents(p *Partition, order []int) []pageExtent {
 // NBitsDeltaGroupLength is pinned.
 func blankShared(p *Partition, order []int) sharedInput {
 	plan := planShared(p, order)
-	groups := make([]sharedGroup, len(plan.objects))
-	for i := range groups {
-		groups[i] = sharedGroup{NObjects: 1}
+	return sharedInput{
+		lengths:   make([]int, len(plan.objects)),
+		firstPage: plan.firstPage,
 	}
-	return sharedInput{groups: groups, firstPage: plan.firstPage}
 }
 
 // measureShared fills in the group lengths and part 8's location from this
@@ -694,15 +693,15 @@ func (d *Document) measureShared(p *Partition, order []int, num map[int]int,
 	offsets, ends []int) sharedInput {
 	plan := planShared(p, order)
 	out := sharedInput{
-		groups:    make([]sharedGroup, len(plan.objects)),
+		lengths:   make([]int, len(plan.objects)),
 		firstPage: plan.firstPage,
 	}
 	for i, old := range plan.objects {
 		n := num[old]
-		out.groups[i] = sharedGroup{
-			NObjects: 1,
-			Length:   uint32(ends[n] - offsets[n]),
-		}
+		// ⛔ IN BYTES AND IN int: buildHintTables owns the refusal above 32
+		// bits, so a measurement that does not fit arrives there to be named
+		// rather than wrapping silently here.
+		out.lengths[i] = ends[n] - offsets[n]
 		// Items 1 and 2 name part 8's first object, which is the first one
 		// after the first-page run.
 		if i == plan.firstPage {
