@@ -295,6 +295,14 @@ func endOfBlockEOLs(k int) int {
 // is more than four times A4 at 600 dots to the inch.
 var maxCCITTPixels = 1 << 28
 
+// maxCCITTColumns bounds ONE ROW, which maxCCITTPixels cannot: that is a count
+// of pixels in a whole image, and `curr` below is a byte a pixel, so a stream
+// of a few bytes could name a row of 256 MiB and stay inside the image budget.
+// A fax is 1728 pixels wide at Group 3 standard resolution and 2560 at the
+// widest this format describes; A4 at 1200 dots to the inch is about 9 920.
+// 2^16 is six times that, and caps a row at 64 KiB.
+var maxCCITTColumns = 1 << 16
+
 // ccittDecode turns a fax into bilevel samples: one bit a pixel, each row
 // padded to a byte boundary, which is what every other image filter in this
 // package produces and what a stream dictionary's /Width, /Height and
@@ -305,6 +313,26 @@ func ccittDecode(data []byte, p ccittParams) ([]byte, error) {
 	}
 	if p.rows < 0 {
 		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d rows", p.rows)
+	}
+	// ⛔⛔ ONE ROW IS BOUNDED ON ITS OWN, BEFORE THE PAIR IS. The check below
+	// needs /Rows, which is OPTIONAL and defaults to zero, so for the ordinary
+	// fax it did not run at all — and `curr` below allocated whatever the file
+	// asked for. The in-loop budget cannot stand in for this: it is read after
+	// a row has already been allocated. Found by the audit #73 asked for.
+	//
+	// ⭐ AND THE LIMIT IS A WIDTH, NOT THE IMAGE BUDGET REUSED. The first fix
+	// here compared /Columns against maxCCITTPixels, which is a count of
+	// PIXELS IN A WHOLE IMAGE: correct, and far too loose, because `curr` is
+	// ONE BYTE PER PIXEL, so a few-byte stream could still reach a 256 MiB
+	// row. That is #70's lesson arriving late — an absolute cap borrowed from
+	// a different quantity is not a bound on this one. A fax is 1728 pixels
+	// wide at Group 3 standard resolution, 2560 at the widest this format
+	// describes, and about 9 920 for A4 at 1200 dots to the inch; 2^16 is six
+	// times that and caps the row at 64 KiB. Found in review.
+	if p.columns > maxCCITTColumns {
+		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d columns, past the "+
+			"limit of %d: no fax is that wide, and a row is a byte a pixel here",
+			p.columns, maxCCITTColumns)
 	}
 	if p.rows > 0 && p.columns > maxCCITTPixels/p.rows {
 		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d by %d pixels, "+

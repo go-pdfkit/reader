@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("2 0 obj<</Type/ObjStm///N 10000000000000/First 10>>stream 24T0P00000ಱa\xd070000a00\xd07000a\x88V0\x00\xca\x061XB\xc9X\xfd\x90ʂ0\xfd\x80\xc4\xf4\xd40;;1 0 obj<</0000000000000000 2 0R/000000 11 0R/0000000000000/0000/000001/00000000000/000002 0>>endstream")
