@@ -26,9 +26,13 @@ func applyPredictor(data []byte, parm Dict, r Resolver) ([]byte, error) {
 	colors := intParm(parm, "Colors", 1, r)
 	bpc := intParm(parm, "BitsPerComponent", 8, r)
 	columns := intParm(parm, "Columns", 1, r)
-	if colors < 1 || bpc < 1 || columns < 1 {
-		return nil, fmt.Errorf("reader: predictor: /Colors %d /BitsPerComponent %d /Columns %d", colors, bpc, columns)
-	}
+	// ⛔ A VALUE BELOW 1 IS REFUSED INSIDE rowBytes, NOT HERE, and that move is
+	// the point. Refusing it here left rowBytes safe only for a caller that had
+	// already checked — the exact property rowGeometry was DELETED for one
+	// commit ago rather than documented, since rowBytes divides by bpc and by
+	// columns and a zero would panic. A guard belongs with the arithmetic it
+	// protects, not in whoever happens to call it first. Found by the review
+	// that found the overflow.
 
 	// ⛔⛔⛔ A ROW LONGER THAN THE WHOLE STREAM IS A BOMB, NOT A ROW. /Columns,
 	// /Colors and /BitsPerComponent are numbers the FILE chose, and their
@@ -122,6 +126,15 @@ func rowBytes(colors, bpc, columns int) (rowLen, bpp int64, err error) {
 	tooBig := func() error {
 		return fmt.Errorf("reader: predictor: /Colors %d /BitsPerComponent %d "+
 			"/Columns %d describe a row too large to measure", colors, bpc, columns)
+	}
+	// ⛔⛔ THE DIVISIONS BELOW ARE WHY THIS REFUSAL LIVES HERE. They are what
+	// makes the overflow check safe, and `math.MaxInt64 / int64(bpc)` panics for
+	// a bpc of 0 — so a rowBytes that trusted its three file-chosen arguments
+	// would be safe only when called correctly, which is the property that got
+	// rowGeometry deleted. The caller's own check is gone; this one is it.
+	if colors < 1 || bpc < 1 || columns < 1 {
+		return 0, 0, fmt.Errorf("reader: predictor: /Colors %d /BitsPerComponent %d "+
+			"/Columns %d: each must be at least 1", colors, bpc, columns)
 	}
 	bits := int64(colors)
 	if bits > math.MaxInt64/int64(bpc) {

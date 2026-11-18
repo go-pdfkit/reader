@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -265,27 +268,67 @@ func TestRowBytes(t *testing.T) {
 // make([]byte, negative) panicked — the guard skipped by the very input it was
 // written for. Found by external review.
 //
-// ⛔⛔ AND THE 32-BIT CASE IS THE COMMITTED REPRODUCER'S OWN NUMBERS.
-// /Colors 1 /BitsPerComponent 8 /Columns 977777777 is a product of
-// 7 822 222 216, which wraps a 32-bit int to -767 712 376 and a row length of
-// -95 964 046 — so testdata/fuzz/FuzzLinearize/ccf3735d005f4673 PANICKED on
-// linux/386 and linux/arm while CI, which vets those targets without running
-// them, stayed green. The arithmetic is checkable by hand, and was.
+// ⛔⛔ AND THE 32-BIT CASES ARE THE COMMITTED REPRODUCERS' OWN NUMBERS. There
+// are TWO of them, each with its own case below, and /Colors 1
+// /BitsPerComponent 8 is what both leave to the defaults:
+//
+//	3b1b3cdb9d35987f  /Columns 977777777  bits 7 822 222 216
+//	                  int32: bits -767 712 376   row  -95 964 046
+//	ccf3735d005f4673  /Columns 911111111  bits 7 288 888 888
+//	                  int32: bits -1 301 045 704  row -162 630 712
+//
+// Both wrap NEGATIVE where int is 32 bits, so both PANICKED on linux/386 and
+// linux/arm while CI, which vets those targets without running them, stayed
+// green.
+//
+// ⛔⛔⛔ AND THIS COMMENT USED TO NAME THE WRONG ONE OF THE TWO: it printed
+// 977777777's arithmetic and concluded "so ccf3735d005f4673 panicked", which is
+// the seed carrying 911111111. The claim survived — both panicked — so nothing
+// failed and nothing went red; only the pairing was false, which is the kind of
+// error a passing suite cannot see. What let it hide: the second seed had NO
+// CASE OF ITS OWN here, so a committed reproducer could not contradict a
+// sentence that attributed its numbers elsewhere. Both are asserted now, and
+// the figures above come from a program, not from arithmetic done by hand.
 //
 // ⭐ These assertions are architecture-independent BY CONSTRUCTION: rowBytes
 // returns int64, so the value below is the true product on a 32-bit build too,
 // and a wrap anywhere in the chain fails the comparison rather than hiding in
 // the sign bit.
 func TestARowTooLargeToMeasureIsRefusedRatherThanWrapped(t *testing.T) {
-	t.Run("the committed reproducer's numbers, which wrap a 32-bit int", func(t *testing.T) {
-		got, _, err := rowBytes(1, 8, 977777777)
-		if err != nil {
-			t.Fatalf("a measurable row was refused: %v", err)
-		}
-		if got != 977777777 {
-			t.Errorf("rowBytes(1,8,977777777) = %d, want 977777777 — a wrap", got)
-		}
-	})
+	// ⭐ ONE SUBTEST PER COMMITTED REPRODUCER, each naming its own seed. A single
+	// case standing for both is what made the mislabelling above possible.
+	for _, tc := range []struct {
+		seed    string
+		columns int
+	}{
+		{"3b1b3cdb9d35987f", 977777777},
+		{"ccf3735d005f4673", 911111111},
+	} {
+		t.Run("testdata/fuzz/FuzzLinearize/"+tc.seed+", which wraps a 32-bit int", func(t *testing.T) {
+			// ⭐⭐ THE PAIRING CHECKS ITSELF. Writing "seed X carries /Columns N"
+			// in a table is the same gesture that mislabelled the comment above:
+			// a name recalled beside a number measured. So the seed is READ and
+			// asked whether it really holds this number — the assertion that
+			// would have gone red the moment the two were swapped.
+			path := filepath.Join("testdata", "fuzz", "FuzzLinearize", tc.seed)
+			seed, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("the seed this case is named for could not be read: %v", err)
+			}
+			if want := strconv.Itoa(tc.columns); !bytes.Contains(seed, []byte(want)) {
+				t.Fatalf("%s does not contain %s, so this case is named after the "+
+					"wrong seed", path, want)
+			}
+
+			got, _, err := rowBytes(1, 8, tc.columns)
+			if err != nil {
+				t.Fatalf("a measurable row was refused: %v", err)
+			}
+			if got != int64(tc.columns) {
+				t.Errorf("rowBytes(1,8,%d) = %d, want %d — a wrap", tc.columns, got, tc.columns)
+			}
+		})
+	}
 
 	// ⛔ EACH MULTIPLY HAS ITS OWN WITNESS, because each is a separate chance to
 	// wrap and a guard with no case of its own is an untested claim.
@@ -339,6 +382,66 @@ func TestARowTooLargeToMeasureIsRefusedRatherThanWrapped(t *testing.T) {
 		parm := Dict{"Predictor": Integer(12), "Columns": Integer(wide)}
 		if _, err := applyPredictor([]byte{0, 1, 2}, parm, nil); err == nil {
 			t.Fatal("a 2^60-column row was decoded")
+		}
+	})
+}
+
+// FuzzApplyPredictor lets the fuzzer choose the four numbers the FILE chooses.
+//
+// ⛔⛔ IT EXISTS BECAUSE NO COMMITTED TARGET COULD EXPRESS THIS PR'S INPUT
+// CLASS, and the two seeds above are the only subjects the bound ever had.
+// FuzzDecode builds its own /Columns as `1 + int(colors>>2)%64`
+// (fuzz_test.go), so its rows are at most about a kilobyte, and
+// FuzzDecodeRecovering pins /Columns 4 (recover_test.go). Both reach
+// applyPredictor; NEITHER can reach a row worth refusing. A bound defended by
+// two static files is a bound tested at two points of a four-dimensional
+// space — which is how the overflow survived the suite that was written for it.
+//
+// ⭐ The budget is the guard's own promise, not a copy of the loop: past the
+// refusal a row is at most max(maxUnbackedRow, len(data)), a PNG row consumes
+// its filter byte before its data, and a partial last row adds at most one
+// more row — so the output cannot exceed len(data) + that maximum. Nothing
+// here recomputes how many rows the decoder walks; this fails if the output
+// grows without bound, which is the whole claim.
+//
+// ⚠ Deliberately NOT bounded like a bomb test (GOMEMLIMIT, ulimit -v): the
+// refusal under test is what keeps the allocation small, so capping the
+// allocation from outside would hide exactly the failure being hunted. A guard
+// that stops working takes the worker down, and the fuzzer records the input.
+func FuzzApplyPredictor(f *testing.F) {
+	// The two committed reproducers' parameters, and ordinary shapes beside
+	// them so a refusal that swallowed every input would show up as a failure
+	// here rather than as a clean run.
+	f.Add(10, 1, 8, 977777777, []byte("b100808"))
+	f.Add(12, 1, 8, 911111111, []byte("b10traa802"))
+	f.Add(12, 1, 8, 4, []byte{0, 1, 2, 3, 4})
+	f.Add(2, 3, 8, 2, []byte{1, 2, 3, 4, 5, 6})
+	f.Add(2, 1, 16, 2, []byte{0, 1, 0, 2})
+	f.Add(1, 1, 8, 1, []byte{9})
+	f.Add(10, 0, 0, 0, []byte{})
+
+	f.Fuzz(func(t *testing.T, pred, colors, bpc, columns int, data []byte) {
+		parm := Dict{
+			"Predictor":        Integer(int64(pred)),
+			"Colors":           Integer(int64(colors)),
+			"BitsPerComponent": Integer(int64(bpc)),
+			"Columns":          Integer(int64(columns)),
+		}
+		got, err := applyPredictor(data, parm, nil)
+		if err != nil {
+			if got != nil {
+				t.Fatalf("refused and returned %d bytes anyway", len(got))
+			}
+			return
+		}
+		room := int64(maxUnbackedRow)
+		if n := int64(len(data)); n > room {
+			room = n
+		}
+		if budget := int64(len(data)) + room; int64(len(got)) > budget {
+			t.Fatalf("/Predictor %d /Colors %d /BitsPerComponent %d /Columns %d "+
+				"turned %d bytes into %d, past a ceiling of %d",
+				pred, colors, bpc, columns, len(data), len(got), budget)
 		}
 	})
 }

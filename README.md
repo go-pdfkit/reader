@@ -72,6 +72,7 @@ the **document structure**:
   A password is tried as the user password and as the owner password, and
   `Open` uses the empty one, so a file protected only against editing opens
   with no password at all.
+- **Content streams** — a tokeniser that yields operators with their operands
   and steps over rubbish rather than losing the operations around it, with
   inline images read whole. Where an inline image ends is the one genuinely
   ambiguous thing in a content stream, since its data may spell EI itself;
@@ -108,6 +109,80 @@ compared on page count, media boxes and the bytes of every content stream.
 **All 118 833 match**, 35.5 GB in and 35.2 GB out, in twenty-eight seconds —
 and **all 118 833 match again** when the packed writer is used instead, which
 brings the output down to **94.6%** of the input.
+
+### ⛔⛔ A hundred-byte file that asks for a gigabyte, and the bound that overflowed
+
+Two committed seeds, each about a hundred bytes, ask through
+`/DecodeParms << /Predictor 1x /Columns … >>` for a row of most of a gigabyte.
+The predictor allocated it — twice, since PNG prediction keeps the previous row
+— and then walked every byte:
+
+| seed | `/Columns` | row | from | amplification |
+|---|---|---|---|---|
+| `testdata/fuzz/FuzzLinearize/3b1b3cdb9d35987f` | 977 777 777 | 932.5 MiB | 102 B | 9 586 057× |
+| `testdata/fuzz/FuzzLinearize/ccf3735d005f4673` | 911 111 111 | 868.9 MiB | 105 B | 8 677 249× |
+
+⛔ **The absolute cap next door could not see either of them.** `maxDecodedSize`
+is 1 GiB and the larger row is 932 MiB — just under. **An absolute limit cannot
+express a ratio**: "a hundred bytes must not become a gigabyte" is a statement
+about the bytes that are *present*, and no constant knows how many those are.
+
+⚠ **The ratio alone is wrong, and a test said so immediately.** The first
+version refused `rowLen > len(data)` outright, which `TestPNGPredictorTruncatedRow`
+refuted: §7.4.4's salvage means a damaged last row is *legitimately* shorter
+than the bytes it needs, and #16 zero-fills it on purpose. So the bound is a
+**floor and a ratio** — a row past 1 MiB that the stream cannot back is refused,
+and below the floor inventing a few zeros costs nothing worth defending.
+
+⛔⛔ **Then the bound was bypassed by the overflow it was written to stop.** It
+was computed in plain `int`, inside the arithmetic it was bounding. Where `int`
+is 64 bits `1 × 8 × 977777777` is merely a large number; **where `int` is 32
+bits it wraps**, and a negative row length passes every `>` test there is:
+
+| seed | product | wrapped to | row length | what happened |
+|---|---|---|---|---|
+| `3b1b3cdb9d35987f` | 7 822 222 216 | −767 712 376 | −95 964 046 | `make([]byte, negative)` panics |
+| `ccf3735d005f4673` | 7 288 888 888 | −1 301 045 704 | −162 630 712 | `make([]byte, negative)` panics |
+
+Both files committed as regression tests **were the crash** on `linux/386` and
+`linux/arm`, while `go vet` compiles those targets **without running them** and
+CI stayed green over it. `rowBytes` now measures in `int64` and asks *"would
+this multiply exceed the maximum"* **before** each multiply — a division, never
+a comparison after the fact, because the wrapped value is an ordinary number.
+Both values narrow to `int` only once the guard has bounded them.
+
+⛔ **`rowGeometry` was deleted, not documented as unsafe.** The first correction
+left it with a comment saying its callers had been checked, which was false:
+past the guard a row may still be as large as `len(data)`, the decompressed
+stream is capped at 1 GiB, and 1 GiB × 8 bits wraps a 32-bit `int` just as
+surely. **A function that is safe only when called correctly is one somebody
+calls incorrectly** — and the same review then found that property in the
+replacement: `rowBytes` divides by `/BitsPerComponent` and `/Columns`, so a zero
+panics, and it was safe only because `applyPredictor` refused a value below 1
+first. That check now lives **inside** `rowBytes`, with the divisions it guards.
+
+⚠ A test *constant* wider than `int` does not compile on a 32-bit target, which
+`go vet` said twice — once for the literals and once for `int(int64(x))`, still
+a constant expression folded before any `t.Skip` can run. Those go through
+variables. The cases that matter are **not** skipped: both `/Columns` values fit
+in an `int32`, so the wrap a 386 build really suffers is asserted on every
+target, and only the `int64` cases a 32-bit build cannot express are skipped.
+
+⛔⛔ **And nothing could fuzz the parameters until now.** `FuzzDecode` builds its
+own `/Columns` as `1 + int(colors>>2)%64` and `FuzzDecodeRecovering` pins
+`/Columns 4`: both reach `applyPredictor`, **neither can reach a row worth
+refusing**. The bound's only subjects were the two static files above — a guard
+tested at two points of a four-dimensional space, which is how the overflow
+survived the suite written for it. `FuzzApplyPredictor` hands the fuzzer all
+four numbers and holds the output to the guard's own promise, `len(data)` plus
+`max(1 MiB, len(data))`: **39 649 010 executions, 133 interesting inputs, no
+failure** (at a 1-minute load of 23, so the *rate* is not a measurement and the
+count is a floor).
+
+⭐ Every part of this came from **fuzzing and external review, not from reading
+the code**: the allocation because no target had reached the predictor with a
+plausible `/Columns`, and the overflow because the reviewer's machine ran that
+target about four times faster than the one it was written on.
 
 ### Linearization (Fast Web View)
 
