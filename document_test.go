@@ -313,6 +313,36 @@ func TestObjectStreamOddities(t *testing.T) {
 	}
 }
 
+// ⛔⛔ THE BOUND ON /N ROUNDS UP, AND THIS IS WHY. #73's ceiling is "a pair is
+// four bytes at least, so at most that many pairs fit in the index" — but the
+// LAST pair needs no trailing separator: `0 0` is THREE bytes and lexes as two
+// integers, end-of-input terminating the second. Floored, first/4 is ZERO
+// there, and a stream holding exactly one object yielded NOTHING.
+//
+// ⭐ A bound that quietly eats a document is worse than the bomb it was added
+// for, because the bomb is loud. Caught in review before it shipped; the
+// refusal it belongs to is still measured by the fuzz seed
+// testdata/fuzz/FuzzLinearize/86bc84b0ce34ab5c.
+func TestAnIndexTooShortToRoundUpStillYieldsItsObject(t *testing.T) {
+	b := newBuilder()
+	b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	b.obj(3, "<< /Type /Page /MediaBox [0 0 10 10] >>")
+	// "0 0" is the whole index: three bytes, one pair, no trailing space.
+	b.streamObj(4, "/Type /ObjStm /N 1 /First 3", []byte("0 0<< /Say 42 >>"))
+	d, err := Open(b.table("/Root 1 0 R"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs, err := d.objectStream(4)
+	if err != nil {
+		t.Fatalf("objectStream(4): %v", err)
+	}
+	if len(objs) != 1 {
+		t.Fatalf("a three-byte index yielded %d object(s), want 1 — first/4 floored", len(objs))
+	}
+}
+
 func TestIntOr(t *testing.T) {
 	if got := intOr(Integer(4), 9); got != 4 {
 		t.Errorf("intOr(4) = %d", got)

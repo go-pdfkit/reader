@@ -222,11 +222,20 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 	//
 	// ⭐ THE CEILING COSTS NOTHING BECAUSE THE DATA ALREADY HOLDS IT: the index
 	// is data[:first], and a pair is two integers and their separators, so at
-	// its very smallest ("0 0 ") it is four bytes. At most first/4 pairs can
-	// exist, whatever /N claims. Nothing about the salvage changes — a file
-	// declaring more objects than its index can hold still yields the ones
-	// really there, because the loop below already stops when the lexer dries
-	// up. What changes is that the claim no longer sizes the allocation.
+	// its very smallest it is four bytes. At most ceil(first/4) pairs can
+	// exist, whatever /N claims. The salvage is unchanged — a file declaring
+	// more objects than its index can hold still yields the ones really there,
+	// because the loop below already stops when the lexer dries up. What
+	// changes is that the claim no longer sizes the allocation.
+	//
+	// ⛔⛔ AND IT IS ceil, NOT first/4, WHICH IS A REGRESSION THIS ALMOST
+	// SHIPPED. The LAST pair needs no trailing separator: `0 0` is THREE bytes
+	// and lexes as two integers, end-of-input terminating the second. A
+	// floored first/4 gives zero for an index of one to three bytes, so a
+	// stream holding exactly one object would have yielded NOTHING where it
+	// used to yield its object — a bound quietly eating a document, which is
+	// worse than the bomb it was added for. Caught in review; the witness is
+	// TestAnIndexTooShortToRoundUpStillYieldsItsObject.
 	//
 	// ⛔ AND THE CLAMP HAPPENS IN int64, BEFORE NARROWING. int(1e13) on a
 	// 32-bit build is a truncation that can land anywhere, including on a
@@ -239,7 +248,7 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 		return objs, nil
 	}
 	first := int(first64)
-	if ceiling := int64(first / 4); n64 > ceiling {
+	if ceiling := int64((first + 3) / 4); n64 > ceiling {
 		n64 = ceiling
 	}
 	n := int(n64)

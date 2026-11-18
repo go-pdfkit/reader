@@ -214,12 +214,23 @@ oversized `make` fails the process regardless. Measured, not assumed —
 
 ⭐ **The ceiling was free, as it usually is in this class.** The index is
 `data[:first]`, a pair is two integers and their separators, so at its smallest
-(`0 0 `) it is four bytes: **at most `first/4` pairs can exist**, whatever `/N`
-claims, and `first` is already bounded by `len(data)`. Nothing about the salvage
-changes — the loop already stopped when the lexer dried up. What changed is that
-a claim no longer sizes an allocation. The clamp happens in `int64` before
-narrowing, for #71's reason: `int(1e13)` on a 32-bit build is a truncation that
-can land on a positive number and sail through `n <= 0`.
+it is four bytes: **at most `ceil(first/4)` pairs can exist**, whatever `/N`
+claims, and `first` is already bounded by `len(data)`. The salvage is unchanged
+— the loop already stopped when the lexer dried up. What changed is that a claim
+no longer sizes an allocation. The clamp happens in `int64` before narrowing,
+for #71's reason: `int(1e13)` on a 32-bit build is a truncation that can land on
+a positive number and sail through `n <= 0`.
+
+⛔⛔ **And it is `ceil`, which this very page got wrong first.** The sentence
+above said `first/4` and "nothing about the salvage changes", and the two
+cannot both be true: the **last** pair needs no trailing separator, so `0 0` is
+*three* bytes and lexes as two integers with end-of-input closing the second.
+Floored, an index of one to three bytes yields **zero** pairs, and a stream
+holding exactly one object would have returned nothing where it used to return
+its object. **A bound that quietly eats a document is worse than the bomb it was
+added for**, because the bomb is loud. Caught in review before it shipped;
+`TestAnIndexTooShortToRoundUpStillYieldsItsObject` is the witness, and it fails
+on `first/4`.
 
 #### And the audit found a fourth
 
@@ -235,8 +246,17 @@ curr := make([]byte, p.columns)                           // runs anyway
 ⛔ **`/Rows` is optional and defaults to zero**, so for an ordinary fax that
 conjunction is false and the check never runs, while the allocation three lines
 down does. The in-loop pixel budget cannot stand in for it: that is read *after*
-a row has already been allocated. One row is now bounded on its own — it cannot
-be larger than the whole image is allowed to be.
+a row has already been allocated. One row is now bounded on its own.
+
+⭐ **And the bound is a width, not the image budget reused** — which is #70's
+lesson arriving late. The first fix compared `/Columns` against
+`maxCCITTPixels`, a count of pixels in a whole *image*: correct, and far too
+loose, because `curr` is **one byte per pixel**, so a few-byte stream could
+still name a row of 256 MiB and stay inside it. **An absolute cap borrowed from
+a different quantity is not a bound on this one.** A fax is 1728 pixels wide at
+Group 3 standard resolution and 2560 at the widest this format describes; A4 at
+1200 dots to the inch is about 9 920. `maxCCITTColumns` is 2^16 — six times
+that, refusing nothing real, and capping a row at 64 KiB.
 
 ⛔⛔ **And fixing it exposed a test that had been passing for the wrong reason.**
 `TestAFaxIsBoundedEvenWhenItSaysNothingAboutItsHeight` lowered the budget to 100
@@ -246,7 +266,20 @@ was written for. Its assertion is `err == nil`, which any other error satisfies
 in silence, so it kept passing with its subject untested. **`covblocks` caught
 it as one uncovered block; the percentage did not** — `go test` still printed
 `100.0%`, rounded, which is [#49](https://github.com/go-pdfkit/reader/issues/49)
-in one line. A bound has to be tested through the path it bounds.
+in one line. A bound has to be tested through the path it bounds, and the test
+now asserts the **message**, since "some error" is what let it drift.
+
+⛔⛔ **The new guard had no fuzz witness either, for the same reason as #72's.**
+`FuzzCCITTDecode` pinned `rows: 4` and `columns ∈ {1, 8, 1728}`, so it could not
+express the one shape that mattered — `/Rows` absent with a large `/Columns`.
+A target whose own parameters exclude the defect class is how both of these
+bounds shipped unfuzzed. It now takes `k`, `rows` and `columns` from the fuzzer.
+
+⚠ **And freeing those parameters cost four covered branches**, because the old
+target was running a deterministic three-by-three grid on every input: a table
+test wearing a fuzz target's clothes, and the only thing reaching those paths.
+The grid is now `TestCCITTDecodeOverAGridOfParameters`, where it is honest about
+what it is, and the fuzzer keeps the space.
 
 ### Linearization (Fast Web View)
 

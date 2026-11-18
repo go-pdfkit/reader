@@ -315,8 +315,13 @@ func TestAFaxThatSaysNothingSensibleIsRefused(t *testing.T) {
 	}{
 		{"no columns", nil, ccittParams{k: -1, columns: 0}},
 		{"negative rows", nil, ccittParams{k: -1, columns: 8, rows: -1}},
+		// ⛔ THE WIDTH IS INSIDE maxCCITTColumns ON PURPOSE. This case is for
+		// the PAIR check — columns times rows past the image budget — and
+		// 2^20 columns is now refused for its width before that check is
+		// reached, which would leave the pair check with no subject. 2^16 by
+		// 2^13 is 2^29 pixels: a legal width, an illegal area.
 		{"more pixels than anyone can want",
-			nil, ccittParams{k: -1, columns: 1 << 20, rows: 1 << 20}},
+			nil, ccittParams{k: -1, columns: 1 << 16, rows: 1 << 13}},
 		{"an extension mode", faxBits(t, "EXT", "000"), g4(8)},
 		{"a run longer than the row", faxBits(t, "H", "W63", "B63"), g4(8)},
 		{"a mode this reader does not know", faxBits(t, "00000001"), g4(8)},
@@ -342,12 +347,19 @@ func TestAFaxThatSaysNothingSensibleIsRefused(t *testing.T) {
 // audit #73 asked for, which is the same class: a count the file chose, used
 // as a size, with the only guard on a different parameter.
 func TestColumnsAreBoundedEvenWhenRowsIsAbsent(t *testing.T) {
-	defer func(old int) { maxCCITTPixels = old }(maxCCITTPixels)
-	maxCCITTPixels = 1 << 10
+	defer func(old int) { maxCCITTColumns = old }(maxCCITTColumns)
+	maxCCITTColumns = 1 << 10
 
-	t.Run("no rows named, and the columns are past the budget", func(t *testing.T) {
-		if _, err := ccittDecode(nil, ccittParams{k: -1, columns: 1 << 20}); err == nil {
-			t.Error("a row of 2^20 bytes was allocated although the budget is 2^10 pixels")
+	t.Run("no rows named, and the columns are past the width limit", func(t *testing.T) {
+		_, err := ccittDecode(nil, ccittParams{k: -1, columns: 1 << 20})
+		if err == nil {
+			t.Fatal("a row of 2^20 bytes was allocated although the limit is 2^10 columns")
+		}
+		// ⛔ THE MESSAGE, NOT MERELY "AN ERROR". This whole test exists because
+		// a refusal arriving from somewhere else reads exactly like the one
+		// being tested — which is what the repair below is about.
+		if !strings.Contains(err.Error(), "names 1048576 columns") {
+			t.Errorf("refused for the wrong reason: %v", err)
 		}
 	})
 
@@ -468,21 +480,64 @@ func TestAFaxReachesTheCallerThroughTheFilterChain(t *testing.T) {
 	}
 }
 
-func FuzzCCITTDecode(f *testing.F) {
-	f.Add(faxBits(f2t(f), "H", "W3", "B5"))
-	f.Add([]byte{0, 0, 0, 0})
-	f.Add([]byte{0xff, 0xff})
-	f.Fuzz(func(t *testing.T, data []byte) {
+// ⭐ THE GRID THE FUZZ TARGET USED TO CARRY, AS A TEST, WHICH IS WHAT IT WAS.
+// FuzzCCITTDecode ran three K values against three widths on every input — a
+// deterministic cross-product, not fuzzing, and the only thing reaching four
+// branches of the decoder. Freeing the fuzzer to choose those parameters took
+// the grid away with it and the blocks went uncovered, so the grid lives here
+// where it is honest about being a table, and the fuzzer keeps the space.
+func TestCCITTDecodeOverAGridOfParameters(t *testing.T) {
+	for _, data := range [][]byte{
+		faxBits(t, "H", "W3", "B5"),
+		{0, 0, 0, 0},
+		{0xff, 0xff},
+	} {
 		for _, k := range []int{-1, 0, 1} {
 			for _, cols := range []int{1, 8, 1728} {
-				// No panic, and never more than the bound allows.
 				out, err := ccittDecode(data, ccittParams{k: k, columns: cols,
 					rows: 4, endOfBlock: true})
 				if err == nil && len(out) != 4*((cols+7)/8) {
-					t.Fatalf("K=%d columns=%d gave %d bytes for 4 rows",
+					t.Errorf("K=%d columns=%d gave %d bytes for 4 rows",
 						k, cols, len(out))
 				}
 			}
+		}
+	}
+}
+
+// ⛔⛔ THE FUZZER CHOOSES k, rows AND columns, AND IT DID NOT USED TO. This
+// target pinned `rows: 4` and `columns ∈ {1, 8, 1728}`, so it could not express
+// the one shape that mattered: /Rows ABSENT with a large /Columns, which is
+// exactly where the guard above was missing. That is the same gap FuzzDecode
+// had on #72 — a target whose own parameters exclude the defect class — and it
+// is why the bound shipped unfuzzed. Found in review.
+func FuzzCCITTDecode(f *testing.F) {
+	f.Add(faxBits(f2t(f), "H", "W3", "B5"), -1, 8, 4)
+	f.Add([]byte{0, 0, 0, 0}, 0, 1728, 4)
+	f.Add([]byte{0xff, 0xff}, 1, 1, 0)
+	// The shape the old target could not reach: no rows named, a huge width.
+	f.Add([]byte{0, 0}, -1, 1<<24, 0)
+	f.Add([]byte{0, 0}, -1, 1, 0)
+
+	f.Fuzz(func(t *testing.T, data []byte, k, cols, rows int) {
+		out, err := ccittDecode(data, ccittParams{k: k, columns: cols,
+			rows: rows, endOfBlock: true})
+		if err != nil {
+			return
+		}
+		// ⭐ The size invariant needs a stated height: with /Rows absent the
+		// decoder reads until the data runs out, so there is no row count to
+		// check against. The bound that governs THAT case is the in-loop pixel
+		// budget, asserted by its own test.
+		if rows > 0 && len(out) != rows*((cols+7)/8) {
+			t.Fatalf("K=%d columns=%d rows=%d gave %d bytes",
+				k, cols, rows, len(out))
+		}
+		// ⛔ And whatever was decoded must fit the width that was allowed:
+		// a row past the limit should have been refused, not produced.
+		if cols > maxCCITTColumns {
+			t.Fatalf("K=%d columns=%d was decoded although the limit is %d",
+				k, cols, maxCCITTColumns)
 		}
 	})
 }
@@ -550,7 +605,18 @@ func TestAFaxIsBoundedEvenWhenItSaysNothingAboutItsHeight(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		long = append(long, "W64")
 	}
-	if _, err := ccittDecode(faxBits(t, long...), g4(100)); err == nil {
-		t.Error("no error from a run past the bound")
+	err := func() error {
+		_, err := ccittDecode(faxBits(t, long...), g4(100))
+		return err
+	}()
+	if err == nil {
+		t.Fatal("no error from a run past the bound")
+	}
+	// ⛔ AND THE MESSAGE IS ASSERTED, WHICH IS THE OTHER HALF OF THE LESSON.
+	// "some error" is what let this case go on passing while its subject went
+	// untested; naming the refusal is what makes it a witness for the RUN
+	// bound rather than for whichever check happens to fire first.
+	if !strings.Contains(err.Error(), "named a run of") {
+		t.Errorf("refused for the wrong reason, so the run bound is still untested: %v", err)
 	}
 }
