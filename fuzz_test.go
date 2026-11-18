@@ -23,6 +23,33 @@ var seedDir = os.Getenv("PDF_SEEDS")
 func addSeeds(f *testing.F, max int, cap int) {
 	f.Add([]byte("%PDF-1.7\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>"))
 	f.Add([]byte("%PDF-1.4\nstartxref\n0\n%%EOF"))
+
+	// ⛔⛔⛔ AND THE COMMITTED PDFs, BECAUSE NEITHER STRING ABOVE OPENS. One has
+	// no startxref and the other no indirect objects, so without PDF_SEEDS set
+	// every target built on this function was fuzzing Open's REJECTION paths
+	// and nothing behind them. Measured on FuzzLinearize by external review,
+	// with counters on each early return: of ~37 000 000 executions, the count
+	// that got past Open was ZERO — while the run reported itself clean.
+	//
+	// ⛔ THE ERROR IS FATAL, NOT DISCARDED. A seed list that silently drops a
+	// file it cannot read is the same defect one layer down: a first version of
+	// this list named two files that do not exist, and `if err == nil` would
+	// have hidden that just as thoroughly as the two strings did.
+	//
+	// ⭐ FIXING IT HERE RATHER THAN IN EACH TARGET is the point: FuzzLinearize
+	// carried its own copy of this list for one commit, and FuzzOpenWithinABudget
+	// — the target this defect most obviously belonged to — still had none.
+	for _, name := range []string{
+		"linearized.pdf", "linearized-objstm.pdf",
+		"linearized-shared.pdf", "linearized-gs.pdf",
+	} {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("seed %s: %v", name, err)
+		}
+		f.Add(b)
+	}
+
 	if seedDir == "" {
 		return
 	}
@@ -186,10 +213,17 @@ func FuzzDecode(f *testing.F) {
 // rather than stopping at the front — plus fronts whose integers are absurd on
 // purpose.
 func FuzzCheckLinearized(f *testing.F) {
+	// ⛔ THE ERROR WAS DISCARDED HERE TOO. `if b, err := …; err == nil` means a
+	// renamed or missing fixture silently removes the only seeds that reach the
+	// deep checks, and the run still reports itself clean — the same shape that
+	// made FuzzLinearize inert for a whole commit. Named from a listing, read
+	// fatally.
 	for _, name := range []string{"linearized.pdf", "linearized-objstm.pdf"} {
-		if b, err := os.ReadFile(filepath.Join("testdata", name)); err == nil {
-			f.Add(b)
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("seed %s: %v", name, err)
 		}
+		f.Add(b)
 	}
 	// ⛔ MaxInt32 in both halves of /H. Written as an addition, the bound check
 	// overflows to a negative number on a 32-bit build and admits the file;
@@ -296,25 +330,12 @@ func FuzzLinearize(f *testing.F) {
 	// fuzz target that cannot reach its subject reports a clean run exactly
 	// like one that cleared it.
 	//
-	// ⚠ NAMED FROM A LISTING, not from memory: a first version of this list
-	// asked for "minimal.pdf" and "two-page.pdf", neither of which exists, and
-	// os.ReadFile's error is DISCARDED here — so two of the four seeds would
-	// have been silently absent, which is the same defect one layer down.
-	seeded := 0
-	for _, name := range []string{
-		"linearized.pdf", "linearized-objstm.pdf",
-		"linearized-shared.pdf", "linearized-gs.pdf",
-	} {
-		b, err := os.ReadFile(filepath.Join("testdata", name))
-		if err != nil {
-			f.Fatalf("seed %s: %v", name, err)
-		}
-		f.Add(b)
-		seeded++
-	}
-	if seeded != 4 {
-		f.Fatalf("%d seed(s) of 4", seeded)
-	}
+	// ⭐ THE SEEDS THAT MAKE IT WORK NOW LIVE IN addSeeds, which every target
+	// here calls. This function carried its own copy for one commit, while
+	// FuzzOpenWithinABudget — the target the Open-side defect most obviously
+	// belonged to — still had none, and a 2-second Open bomb was found by the
+	// WRITER's target rather than by the one built for it. A fix that stays in
+	// one caller is a fix the next caller does not get.
 	f.Fuzz(func(t *testing.T, b []byte) {
 		budget(t, 4*time.Second, len(b), "Linearize", func() {
 			d, err := reader.Open(b)
