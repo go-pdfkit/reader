@@ -309,6 +309,8 @@ func hintShapes() []struct {
 		// meaning "the inputs are silent".
 		{"two pages sharing a /Contents", sharedContentsFixture},
 		{"two pages inheriting ONE indirect /Resources", inheritedResourcesFixture},
+		{"twenty-five pages inheriting ONE indirect /Resources",
+			func(t *testing.T) []byte { return inheritedResourcesPages(t, 25) }},
 		// ⭐ The only shape that puts anything in PART 8: an object pages 2 and
 		// 3 share and page 1 does not reach. Without it the second run is empty
 		// in every judged file and `FirstSharedObj` is never exercised.

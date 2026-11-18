@@ -806,15 +806,31 @@ func contains(xs []int, x int) bool {
 // INDIRECT REFERENCE on the page tree node, so neither page names it.
 func inheritedResourcesFixture(t *testing.T) []byte {
 	t.Helper()
+	return inheritedResourcesPages(t, 2)
+}
+
+// inheritedResourcesPages is the same shape at any page count.
+//
+// ⛔ IT TAKES A COUNT BECAUSE TWO PAGES AND TWENTY-FIVE ARE DIFFERENT SUBJECTS
+// HERE. One shared object among twenty-five pages means twenty-four entries
+// naming the same identifier, a part 6 much larger than part 8, and the widths
+// derived from both — none of which two pages exercises. The shape was judged
+// at 25 pages only for ACCEPTANCE before, by the scope table, which does not
+// look at what the entries say.
+func inheritedResourcesPages(t *testing.T, pages int) []byte {
+	t.Helper()
 	w := NewWriter("1.7")
 	pagesRef := w.Reserve()
 	res := w.Add(Dict{"ProcSet": Array{Name("PDF"), Name("Text")}})
-	c1 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (one) Tj ET")})
-	c2 := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (two) Tj ET")})
-	one := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c1})
-	two := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef, "Contents": c2})
-	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{one, two},
-		"Count":     Integer(2),
+	kids := make(Array, 0, pages)
+	for i := 0; i < pages; i++ {
+		c := w.Add(&Stream{Dict: Dict{},
+			Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i+1))})
+		kids = append(kids, w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+			"Contents": c}))
+	}
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": kids,
+		"Count":     Integer(pages),
 		"Resources": res,
 		"MediaBox":  Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
 	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
@@ -826,13 +842,21 @@ func inheritedResourcesFixture(t *testing.T) []byte {
 	return plain
 }
 
-// ⛔ AND THE NEGATIVE CONTROL: the documents the suite does judge must have
-// nothing shared, or the refusal above would reject them too and the whole
-// corpus would be unreachable.
+// ⛔ AND THE NEGATIVE CONTROL: buildPages' documents must have nothing shared,
+// or the refusal this once guarded would have rejected them too and the whole
+// corpus would have been unreachable.
 //
 // ⭐ "A test suite in which every input passes measures nothing" — and one in
 // which every input is refused measures nothing either. This is the line
 // between the two.
+//
+// ⛔⛔ AND IT NO LONGER SAYS WHAT THE WHOLE CORPUS CONTAINS. Its first words
+// were "the documents the suite does judge must have nothing shared", which was
+// true while every fixture was private and became false the moment hintShapes()
+// gained the sharing shapes — and the sentence would have gone on reading as a
+// guarantee that they were not there. It is about buildPages, and only
+// buildPages: that those four shapes stay private is what makes them the
+// control for the four that do not.
 func TestTheJudgedCorpusSharesNothingBetweenPages(t *testing.T) {
 	for _, pages := range []int{1, 2, 5, 25} {
 		t.Run(fmt.Sprintf("%d pages", pages), func(t *testing.T) {
