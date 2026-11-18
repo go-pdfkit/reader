@@ -169,6 +169,15 @@ var buildHint = buildHintTables
 // every reference. A reader may fetch a shared object earlier than it needs it,
 // never later. See refsFor.
 //
+// ⚠ AND ITEMS 6 AND 7 ARE 0 FOR TWO DIFFERENT PAGES. They are an offset from
+// the page's first byte and a length, both unsigned, so a page that BORROWS a
+// shared content stream — which then lies in part 6, BEFORE the page — has no
+// representable value and gets zeros, exactly like a page with no content
+// stream at all. The format cannot tell those apart and neither can a reader;
+// the suite can, and asserts each case separately. A reader that treats 0 as
+// "nothing to prefetch" is right in both, which is why this is a loss of
+// precision rather than a falsehood.
+//
 // ⭐ EVERY STEP WAS JUDGED BEFORE THE NEXT ONE STARTED, which is why the
 // defects were separable: the partition before the layout, the layout before the
 // fixpoint, the encoder's bytes before any file existed, and the layout before

@@ -226,15 +226,33 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 			// object from /O, and the rest run from Table F.5 item 1. Asking the
 			// planner would agree with the writer by construction, which is the
 			// defect this very test exists to catch.
+			// ⛔⛔ THE GROUPS ARE WALKED, NOT COUNTED ONE PER ENTRY. The first
+			// version added 1 per identifier, which is right only because THIS
+			// writer puts one object in every group — a property of the subject
+			// leaking into the oracle, found by external review. F.4.2 lets a
+			// group hold a run, and hintlength.go walks it the same way: entry j
+			// names the first object of the j-th group, and the groups advance
+			// by their own NObjects. The two coincide today and would not for a
+			// writer that packed runs.
+			objectAt := make([]int, len(tables.sharedGroups))
+			num := lin.FirstPageObject
+			for j, g := range tables.sharedGroups {
+				if j == int(tables.shared.NSharedFirstPage) {
+					num = int(tables.shared.FirstSharedObj)
+				}
+				objectAt[j] = num
+				num += int(g.NObjects)
+			}
+
 			for i, e := range tables.pages {
 				named := map[int]bool{}
 				for _, r := range e.Shared {
-					num := lin.FirstPageObject + int(r.Identifier)
-					if r.Identifier >= tables.shared.NSharedFirstPage {
-						num = int(tables.shared.FirstSharedObj) +
-							int(r.Identifier-tables.shared.NSharedFirstPage)
+					if int(r.Identifier) >= len(objectAt) {
+						t.Errorf("page %d names identifier %d and the table defines %d",
+							i+1, r.Identifier, len(objectAt))
+						continue
 					}
-					named[num] = true
+					named[objectAt[r.Identifier]] = true
 				}
 				want := map[int]bool{}
 				for _, old := range p.Shared[i] {
