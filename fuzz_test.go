@@ -267,6 +267,40 @@ func FuzzCheckLinearized(f *testing.F) {
 // documents are accepted.
 func FuzzLinearize(f *testing.F) {
 	addSeeds(f, 200, 40*1024)
+	// ⛔⛔⛔ THE COMMITTED PDFs, BECAUSE WITHOUT THEM THIS TARGET IS INERT.
+	// addSeeds contributes two hand-written strings unless PDF_SEEDS is set,
+	// and NEITHER OPENS: one has no startxref, the other no indirect objects.
+	// So the fuzzer had to invent a valid cross-reference table and page tree
+	// from `%PDF-1.4\nstartxref\n0\n%%EOF`, and it never did. Measured by
+	// external review with counters on each early return: of ~37 000 000
+	// executions, `opened` was ZERO — every one of them measured Open's
+	// rejection paths, and Partition, the layout and buildHintTables were
+	// never entered.
+	//
+	// ⛔ I had already published "16 035 850 executions, no crash" as if it
+	// said something about the writer. It said nothing about the writer. A
+	// fuzz target that cannot reach its subject reports a clean run exactly
+	// like one that cleared it.
+	//
+	// ⚠ NAMED FROM A LISTING, not from memory: a first version of this list
+	// asked for "minimal.pdf" and "two-page.pdf", neither of which exists, and
+	// os.ReadFile's error is DISCARDED here — so two of the four seeds would
+	// have been silently absent, which is the same defect one layer down.
+	seeded := 0
+	for _, name := range []string{
+		"linearized.pdf", "linearized-objstm.pdf",
+		"linearized-shared.pdf", "linearized-gs.pdf",
+	} {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("seed %s: %v", name, err)
+		}
+		f.Add(b)
+		seeded++
+	}
+	if seeded != 4 {
+		f.Fatalf("%d seed(s) of 4", seeded)
+	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		budget(t, 4*time.Second, len(b), "Linearize", func() {
 			d, err := reader.Open(b)

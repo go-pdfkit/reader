@@ -189,7 +189,71 @@ func (d *Document) Linearize() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return d.linearizeFrom(p)
+	out, err := d.linearizeFrom(p)
+	if err != nil {
+		return nil, err
+	}
+	if err := firstPageAgrees(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// firstPageAgrees refuses a file whose /O names one page while the page TREE
+// in those same bytes presents another.
+//
+// ⛔⛔ THE TWO COME FROM DIFFERENT PLACES, AND THAT IS THE WHOLE POINT. /O is
+// the renumbered Partition.FirstPageObject, which comes from the reader's page
+// ENUMERATION of the input; what a consumer sees as page 1 comes from the
+// /Kids array this writer copies through unchanged. For a well-formed document
+// those are the same page. For a damaged one they are not, and nothing before
+// this noticed: Linearize returned a file, and only CheckLinearized — run on
+// the bytes afterwards, by a caller who thought to — said
+//
+//	/O says object 2 and the first page is object 5
+//
+// ⭐ FOUND BY FUZZING THE WRITER (#69), on a mutated copy of our own
+// testdata/linearized.pdf whose object 3 has its /Type key corrupted to
+// /Ty\x00\x04\x00\x00Page. Its page tree node says /Kids [10 0 R 1 0 R 3 0 R]
+// while the reader enumerates the pages as 1 then 10, so the emitted tree
+// presents a different first page from the one /O was derived from. The corpus
+// entry is testdata/fuzz/FuzzLinearize/25ce7b9529e25889.
+//
+// ⛔ IT IS A POST-CONDITION AND NOT A PRECONDITION ON PURPOSE. Predicting the
+// disagreement would mean re-deriving the reader's page walk here and trusting
+// that the re-derivation matches — a second implementation of the thing being
+// checked. Reading back what was WRITTEN asks the only question that matters:
+// does the file we are about to hand out agree with itself? It costs one Open
+// of our own output, on a writer that already makes two passes.
+//
+// ⚠ It is NOT a substitute for CheckLinearized, which holds every parameter
+// against the document. This is one invariant, chosen because a file that
+// contradicts itself about its first page defeats the entire purpose of
+// linearizing — a reader fetches /O's bytes and draws the wrong page.
+func firstPageAgrees(out []byte) error {
+	w, err := Open(out)
+	if err != nil {
+		return fmt.Errorf("%w: the file we wrote cannot be reopened: %v",
+			ErrCannotLinearize, err)
+	}
+	lin, err := Linearized(out)
+	if err != nil {
+		return fmt.Errorf("%w: the file we wrote has no usable linearization "+
+			"parameters: %v", ErrCannotLinearize, err)
+	}
+	ref, ok := w.PageRef(1)
+	if !ok {
+		return fmt.Errorf("%w: the file we wrote presents no first page",
+			ErrCannotLinearize)
+	}
+	if ref.Num != lin.FirstPageObject {
+		return fmt.Errorf("%w: this document's page tree and its page order "+
+			"disagree about which page is first — /O would say object %d while "+
+			"the page tree reaches object %d, so a reader fetching the first "+
+			"page would draw a different one",
+			ErrCannotLinearize, lin.FirstPageObject, ref.Num)
+	}
+	return nil
 }
 
 // linearizeFrom is Linearize with the partition supplied.

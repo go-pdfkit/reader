@@ -184,6 +184,33 @@ func (d *Document) Partition() (*Partition, error) {
 		return nil, fmt.Errorf("%w: it has no pages", ErrCannotPartition)
 	}
 
+	// ⛔⛔ A PAGE NUMBERED 0 CANNOT BE NAMED, SO IT CANNOT BE LINEARIZED.
+	// 7.3.10 requires an indirect object's number to be a POSITIVE integer,
+	// and `0 0 R` is the null reference — so whatever bytes such a page holds,
+	// no page tree in the file we write can point at it. /O would name an
+	// object the document's own structure cannot reach.
+	//
+	// ⛔ The reader is right to hand it to us: the repair scan takes what the
+	// file says, and a `0 0 obj` header in a damaged file is information about
+	// the damage. Refusing belongs HERE, where the question is whether a
+	// linearized file can be built, and not in Open, which would lose bytes a
+	// caller may still want to read.
+	//
+	// ⭐ FOUND BY FUZZING THE WRITER (#69), on a 177-byte input with no
+	// cross-reference table: the writer emitted a file whose /O said object 2
+	// while the page tree in that same file reached object 1, and
+	// CheckLinearized refused what we had just written. The corpus entry is
+	// testdata/fuzz/FuzzLinearize/b9472aa1230f3b85. Measured before being
+	// blamed: a /Root that is ALSO typed /Page, with legal numbering, is
+	// written and checks clean — so the zero is the cause and not the shape.
+	for i, ref := range pages {
+		if ref.Num < 1 {
+			return nil, fmt.Errorf("%w: page %d is object %d, and 7.3.10 requires a "+
+				"positive object number — %d %d R is the null reference, so no page "+
+				"tree could name it", ErrCannotPartition, i+1, ref.Num, ref.Num, ref.Gen)
+		}
+	}
+
 	// ⛔ Page objects and page tree nodes are the walk's boundary, not its
 	// destination. F.3.7 excludes "page tree nodes or other page objects"
 	// from what part 6 reaches, and F.3.10 puts the page tree in part 9
