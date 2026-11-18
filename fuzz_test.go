@@ -244,3 +244,52 @@ func FuzzCheckLinearized(f *testing.F) {
 		})
 	})
 }
+
+// FuzzLinearize drives the WRITER over documents an attacker chose, which
+// nothing did until v0.18.0.
+//
+// ⛔⛔ THE WRITER IS A CONSUMER OF UNTRUSTED STRUCTURE, and it was fuzzed from
+// neither side. FuzzCheckLinearized drives the reader of a hostile FILE;
+// FuzzOpenWithinABudget stops at Open. Between them sat Partition, the layout,
+// planShared, measureShared and buildHintTables — every one of them walking a
+// page tree, a /Contents array and an inheritance chain that came out of the
+// input, indexing slices by numbers derived from them.
+//
+// ⛔ THE INVARIANT IS THE STRONG ONE: whatever Linearize RETURNS, our own
+// CheckLinearized must accept. A writer that emits a file its own checker
+// refuses has written a hint table that disagrees with the bytes beside it —
+// which is exactly the failure this arc kept finding by hand, and the one qpdf
+// reports as "in computed list but not hint table".
+//
+// ⚠ An ERROR is always an acceptable answer here. Most inputs are not
+// linearizable — six document features are refused outright — and the target is
+// about panics, hangs and a file that contradicts itself, never about how many
+// documents are accepted.
+func FuzzLinearize(f *testing.F) {
+	addSeeds(f, 200, 40*1024)
+	f.Fuzz(func(t *testing.T, b []byte) {
+		budget(t, 4*time.Second, len(b), "Linearize", func() {
+			d, err := reader.Open(b)
+			if err != nil {
+				return
+			}
+			// ⛔ A BOUND ON THE SUBJECT, not on the clock alone. A page tree can
+			// name a hundred thousand pages in a few hundred bytes, and
+			// linearizing one is a legitimate amount of work that says nothing
+			// about the defects this hunts.
+			if n := d.PageCount(); n < 1 || n > 64 {
+				return
+			}
+			out, err := d.Linearize()
+			if err != nil {
+				return
+			}
+			if len(out) == 0 {
+				t.Fatal("Linearize returned no error and no bytes")
+			}
+			if _, err := reader.CheckLinearized(out); err != nil {
+				t.Fatalf("our own checker refuses what our own writer produced: %v", err)
+			}
+		})
+	})
+}
