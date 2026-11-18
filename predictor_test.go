@@ -3,6 +3,7 @@ package reader
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -141,6 +142,73 @@ func TestPNGPredictorTruncatedRow(t *testing.T) {
 	if !bytes.Equal(got, []byte{1, 2, 0, 0}) {
 		t.Errorf("got % d", got)
 	}
+}
+
+// ⛔⛔⛔ A ROW THE STREAM CANNOT BACK IS REFUSED, AND THE RATIO IS WHAT DECIDES.
+// /Columns, /Colors and /BitsPerComponent are numbers the FILE chose and their
+// product is a buffer size: pngPredictor allocates two rows of it and then
+// walks every byte of each. Found by fuzzing the writer (go-pdfkit/reader#69),
+// filed as #70 — 102 bytes carrying /Columns 977777777 /Predictor 10 ask for a
+// row of about 932 MiB.
+//
+// ⛔ maxDecodedSize COULD NOT SEE IT. That cap is 1 GiB and the row is 932 MiB,
+// just under: an absolute limit cannot express "a hundred bytes must not become
+// a gigabyte". Only a comparison with the bytes present can.
+//
+// ⛔⛔ AND THE FIRST BOUND I WROTE WAS `rowLen > len(data)`, WHICH THE SUITE
+// REFUTED IN ONE RUN: TestPNGPredictorTruncatedRow above decodes /Columns 4
+// from three bytes, so a legitimately truncated single row already has a row
+// longer than the whole stream. Salvage is deliberate here. The bound is
+// therefore a FLOOR plus a ratio: under maxUnbackedRow, inventing the zeros a
+// damaged row is missing costs nothing worth defending.
+//
+// ⚠ NO GOMEMLIMIT HARNESS, for the reason the page-count bomb test gives: with
+// the bound in place the refusal happens BEFORE either row is allocated, so
+// there is nothing to contain. The test that would need one is the test without
+// the fix, and that one is the defect.
+func TestAPredictorRowTheStreamCannotBackIsRefused(t *testing.T) {
+	// ⛔ THE FLOOR IS SHRUNK rather than the fixture grown: the var exists for
+	// this, like maxDecodedSize, and a real 1 MiB row in a test would be the
+	// allocation this refuses to make.
+	defer func(old int) { maxUnbackedRow = old }(maxUnbackedRow)
+	maxUnbackedRow = 32
+
+	t.Run("a row past the floor that the stream cannot back", func(t *testing.T) {
+		parm := Dict{"Predictor": Integer(12), "Columns": Integer(4096)}
+		_, err := applyPredictor([]byte{0, 1, 2}, parm, nil)
+		if err == nil {
+			t.Fatal("a 4096-byte row was built from three bytes")
+		}
+		if !strings.Contains(err.Error(), "not backed by the data it claims") {
+			t.Errorf("refused, but not for being unbacked: %v", err)
+		}
+	})
+
+	// ⛔⛔ THE CONTROL, AND IT IS THE WHOLE POINT: the SAME /Columns with the
+	// data to back it is accepted. Without this, "refuses a big row" and
+	// "refuses a row bigger than its data" are the same test, and the bound
+	// could be a size cap wearing a ratio's name.
+	t.Run("the same row with the bytes to back it", func(t *testing.T) {
+		parm := Dict{"Predictor": Integer(12), "Columns": Integer(4096)}
+		data := make([]byte, 1+4096)
+		if _, err := applyPredictor(data, parm, nil); err != nil {
+			t.Fatalf("a 4096-byte row backed by 4097 bytes was refused: %v", err)
+		}
+	})
+
+	// ⛔ AND BELOW THE FLOOR, SALVAGE IS UNTOUCHED — the case that refuted the
+	// first version of this bound, asserted here as a boundary rather than left
+	// to the test above to notice.
+	t.Run("a short row the stream cannot back is still salvaged", func(t *testing.T) {
+		parm := Dict{"Predictor": Integer(12), "Columns": Integer(4)}
+		got, err := applyPredictor([]byte{0, 1, 2}, parm, nil)
+		if err != nil {
+			t.Fatalf("a four-byte row from three bytes is salvage, not a bomb: %v", err)
+		}
+		if !bytes.Equal(got, []byte{1, 2, 0, 0}) {
+			t.Errorf("got % d", got)
+		}
+	})
 }
 
 func TestPaeth(t *testing.T) {

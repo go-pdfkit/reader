@@ -7,6 +7,8 @@ package reader
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -349,6 +351,47 @@ func mustDict(t *testing.T, o Object) Dict {
 		t.Fatalf("%v is not a dictionary", o)
 	}
 	return d
+}
+
+// ⛔⛔⛔ THE FOREIGN DOCUMENTS STILL LINEARIZE, which nothing else here can say.
+// #69 put CheckLinearized into the WRITER's path: Linearize now refuses a file
+// that does not describe itself. The stated mitigation was "hintShapes(), each
+// shape judged by qpdf, goes red if a good document starts being refused" — and
+// external review measured that claim and found it weaker than it sounds. Every
+// shape in hintShapes() is built by this package's own NewWriter, so the whole
+// positive corpus is documents we wrote. A refusal regression on somebody
+// ELSE'S file would pass all of it.
+//
+// ⭐ These four are the foreign corpus: two from qpdf, one from Ghostscript,
+// one with object streams — committed precisely because this package cannot
+// produce them. The fuzz seeds reach them now (addSeeds), but an error is an
+// accepted answer there, so the seed run is blind to exactly this regression.
+//
+// ⚠ It asserts linearizing a file that is ALREADY linearized, which is a real
+// use (re-linearizing after an edit) and not a contrivance.
+func TestTheForeignDocumentsStillLinearize(t *testing.T) {
+	for _, name := range []string{
+		"linearized.pdf", "linearized-objstm.pdf",
+		"linearized-shared.pdf", "linearized-gs.pdf",
+	} {
+		t.Run(name, func(t *testing.T) {
+			in, err := os.ReadFile(filepath.Join("testdata", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, err := Open(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := d.Linearize()
+			if err != nil {
+				t.Fatalf("a document this package did not write was refused: %v", err)
+			}
+			if _, err := CheckLinearized(out); err != nil {
+				t.Fatalf("written, and our own checker refuses it: %v", err)
+			}
+		})
+	}
 }
 
 // ⛔⛔ THE POST-CONDITION OVER BYTES THAT ARE NOT OURS. firstPageAgrees runs on

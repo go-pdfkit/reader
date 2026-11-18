@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("00 0obj<</Filter/Fl/DecodeParms<</Columns 977777777/Predictor 10>>>>stream b100808\tendstreamstartxref1")

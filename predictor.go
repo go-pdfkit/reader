@@ -2,6 +2,16 @@ package reader
 
 import "fmt"
 
+// maxUnbackedRow is how long a predictor row may be without the stream
+// carrying at least that many bytes. It is a var so a test can shrink it, the
+// way maxDecodedSize already is in this package.
+//
+// ⛔ IT IS A FLOOR, NOT A SIZE CAP, and the difference is what maxDecodedSize
+// could not see: that cap is 1 GiB and the row that prompted this was 932 MiB,
+// just under it. An absolute limit cannot express "a hundred bytes must not
+// become a gigabyte" — only a comparison with the data present can.
+var maxUnbackedRow = 1 << 20
+
 // applyPredictor undoes the PNG or TIFF predictor a Flate or LZW stream was
 // filtered through. /Predictor 1, and an absent parameter dictionary, mean
 // there is nothing to undo.
@@ -15,6 +25,44 @@ func applyPredictor(data []byte, parm Dict, r Resolver) ([]byte, error) {
 	columns := intParm(parm, "Columns", 1, r)
 	if colors < 1 || bpc < 1 || columns < 1 {
 		return nil, fmt.Errorf("reader: predictor: /Colors %d /BitsPerComponent %d /Columns %d", colors, bpc, columns)
+	}
+
+	// ⛔⛔⛔ A ROW LONGER THAN THE WHOLE STREAM IS A BOMB, NOT A ROW. /Columns,
+	// /Colors and /BitsPerComponent are numbers the FILE chose, and their
+	// product is a buffer size: pngPredictor allocates two rows of it and then
+	// walks every byte. 102 bytes carrying
+	//
+	//	/DecodeParms << /Columns 977777777 /Predictor 10 >>
+	//
+	// asks for a row of about 932 MiB — two of them, plus a per-byte pass over
+	// each — from a file that fits in a tweet. Found by fuzzing the writer
+	// (#69), filed as #70, and the amplification is about ten million to one.
+	//
+	// ⛔ maxDecodedSize DID NOT CATCH IT, and the near miss is the point: that
+	// cap is 1 GiB and this row is 932 MiB, just under. A bound on the absolute
+	// size cannot see a ratio; this one is relative to the bytes actually
+	// present, which is what makes it a bound on AMPLIFICATION.
+	//
+	// ⛔⛔ THE FIRST VERSION OF THIS GUARD WAS `rowLen > len(data)` AND THE
+	// SUITE REFUTED IT IMMEDIATELY. TestPNGPredictorTruncatedRow decodes
+	// /Columns 4 from three bytes — one filter byte and two of data — so a
+	// legitimately truncated single row ALREADY has a row longer than the whole
+	// stream. The comment here claimed the opposite ("a truncated last row
+	// still leaves rowLen no larger than the data that preceded it"), which is
+	// false for a stream holding exactly one row. Salvage is deliberate: #16
+	// zero-fills what a damaged stream ends inside of.
+	//
+	// ⭐ SO THE BOUND IS ON AMPLIFICATION ABOVE A FLOOR, not on the ratio
+	// alone: under a megabyte, inventing the zeros a damaged row is missing
+	// costs nothing worth defending; above it, a row must be BACKED by at
+	// least as many bytes as it claims. 4 bytes from 3 is salvage; 932 MiB
+	// from 102 is a bomb, and nothing real sits between them.
+	if rowLen, _ := rowGeometry(colors, bpc, columns); rowLen > maxUnbackedRow &&
+		rowLen > len(data) {
+		return nil, fmt.Errorf("reader: predictor: /Colors %d /BitsPerComponent %d "+
+			"/Columns %d make a row of %d bytes and the stream holds %d, so a row "+
+			"past %d bytes is not backed by the data it claims",
+			colors, bpc, columns, rowLen, len(data), maxUnbackedRow)
 	}
 	switch {
 	case pred == 2:
