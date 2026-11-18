@@ -482,7 +482,9 @@ shapes green. It was found by mutation and is now held by a test of its own.
 ⚠ Part 8 has no witness in the generated corpus either — qpdf reports
 `part 8 (other pages, shared): none` for all twelve shapes, because the
 fixtures give every page its own resources. So F.3.9's whole subject is held by
-a hand-built document rather than by the sweep.
+hand-built documents rather than by the sweep: pages 2 and 3 sharing an object
+page 1 does *not* reach is the only shape that fills part 8, and it is the one
+the shared-table work had to build before it could measure anything.
 
 ### Inside the hint tables (F.4), where the parameter checks could not go
 
@@ -903,14 +905,26 @@ by it and by qpdf before the next one started.
 
 `Linearize()` writes Annex F's eleven parts and returns the bytes.
 `qpdf --check` says **`File is linearized`** and raises no complaint it does not
-also raise about the input, on one, two, five and twenty-five page documents
-**whose pages share no objects**.
+also raise about the input — on one, two, five and twenty-five page documents
+whose pages are independent, **and on documents whose pages share objects**,
+which it refused until #68:
 
-⛔⛔ **That scope is load-bearing, and review found it rather than the tests.**
-The shared object hint table (F.4.2) is how a page after the first says which of
-part 6's and part 8's objects it depends on, and this writer emits a *required
-but empty* one. For a document whose pages are independent that is the truth;
-for one whose pages are not, it is a hint table that contradicts the file:
+```
+private-1p                          1167 bytes — qpdf silent
+private-2p                          1411 bytes — qpdf silent
+private-5p                          2158 bytes — qpdf silent
+private-25p                         7162 bytes — qpdf silent
+shared-contents                     1306 bytes — qpdf silent
+inherited-resources                 1494 bytes — qpdf silent
+inherited-25p                       7180 bytes — qpdf silent
+shared-among-later-pages            1711 bytes — qpdf silent
+```
+
+⛔⛔ **The scope that used to be load-bearing was found by review, not by the
+tests.** The shared object hint table (F.4.2) is how a page after the first says
+which of part 6's and part 8's objects it depends on, and the writer emitted a
+*required but empty* one. For a document whose pages are independent that is the
+truth; for one whose pages are not, it is a hint table that contradicts the file:
 
 ```
 WARNING: page 1: shared object 3: in computed list but not hint table
@@ -918,99 +932,185 @@ WARNING: page 1: shared object 3: in computed list but not hint table
 
 measured on two pages sharing one content stream — while our own
 `CheckLinearized` **accepted** that file, so nothing in this package would have
-caught it.
+caught it. `Linearize` was made to refuse rather than describe a file wrongly,
+and the refusal held for as long as the table was empty.
 
 ⛔ **And the whole judged corpus could not express the case.** `buildPages` gives
 every page its own content stream, so no object is reached by two pages and
 `Partition.Shared` is empty on every shape the suite builds. The foreign judge
 was green because the fixtures were silent — the second time in this arc that a
-passing oracle meant "the corpus says nothing". `TestADocumentWhoseLaterPagesShareAnObjectIsRefused`
-commits the missing fixture, and `TestTheJudgedCorpusSharesNothingBetweenPages`
-is its negative control: a suite in which every input is refused measures as
-little as one in which every input passes.
+passing oracle meant "the corpus says nothing".
+`TestTheJudgedCorpusSharesNothingBetweenPages` is the control that keeps saying
+so, and the fixture committed with the refusal is now
+`TestADocumentWhoseLaterPagesShareAnObjectIsWritten`.
 
-⚠ So `Linearize` **refuses** such a document, naming the objects, rather than
-describing it wrongly. Filling that table is a partition question — qpdf reports
-`nshared_total: 3` with part 8 **empty** for the same input — and it is #61.
+### ⛔⛔⛔ And it said it again one step later — the refusal went, the fixtures stayed
 
-### ⛔⛔⛔ And that refusal is far wider than "pages sharing a content stream"
+The first version of this change **removed the refusal and left `hintShapes()`
+untouched**, so the set of documents every hint-table judgement runs over was
+still four private-page shapes and a one-page inherited one. Not one of them
+shares an object. The suite was green at 100% coverage with qpdf required, and
+it was green the same way it had been before: the inputs were silent.
 
-The rule is about **sharing**, and nothing else:
+Found by external review, by mutation, with qpdf 12.4.2 installed:
 
-> refused iff an object a page after the first reaches is **also** reached by the
-> first page or by another page — other than the **catalogue**, which part 4
-> delivers ahead of the first page
+| mutation | what it breaks | suite, before |
+|---|---|---|
+| `refsFor` identifier reversed | every page names the **wrong** shared objects | **exit 0, green** |
+| `sharedOffset` returning `at` | exactly the item-2 defect this arc fixed | **exit 0, green** |
 
-⛔ The catalogue exception is not a special case in the code, which is why it has
-to be in the sentence: `of[catNum] = PartCatalog` is assigned *after* the readers
-loop and overwrites whatever sharing would have made it, so `Shared`'s "part 6 or
-part 8" test cannot see it. That is correct rather than convenient — part 4
-precedes part 6 and arrives with the first page, so a later page depending on the
-catalogue needs no F.4.2 entry. Measured: two pages each carrying `/PieceInfo`
-give the catalogue part 4, `Shared` empty, the document accepted, and
-`qpdf --check` silent. Part 4 holds nothing but the catalogue, so there is no
-second instance.
+Both are red now, and the second is red *through qpdf*, which had been silent
+only because nothing it was shown shared anything. The fix is three lines of
+fixtures — `hintShapes()` carries the shared-`/Contents` shape, the inherited
+shape and a three-page shape whose pages 2 and 3 share an object page 1 does not
+reach — plus the assertion that was missing beside the counts: **each identifier
+is decoded back to an object number** and compared with what the page actually
+reaches, through the reader's own rule (`/O + j`, then `FirstSharedObj`) rather
+than by asking `planShared`, which would agree with the writer by construction.
 
-⛔ **Two narrower rules were written here first and both were wrong**, which is
-why this one is stated in terms of *reaching* rather than of any mechanism:
+⚠ The probe in the pull request body is **hand-run and uncommitted**, and a
+hand-run judge is not a gate. It found real defects; it cannot keep them out.
 
-- *"a multi-page document with an indirect inherited value"* — refuted by a
-  three-level tree whose sub-node carries the reference with exactly **one** page
-  under it: that object is part 7, private to that page, and accepted.
-- *"an inheritable indirect value inherited by more than one page"* — only
-  **sufficient**. Refuted by a page that states its *own* `/Resources` naming the
-  node's object under `/XObject` while the other page inherits it: exactly one
-  page inherits, and the object is shared all the same.
+⭐ One real finding arrived with those fixtures, and not in the shared table: a
+page that **borrows** a content stream has it sitting *before* its own first
+byte — −83 bytes for the shared-`/Contents` shape — and items 6 and 7 are
+unsigned. There is no representable value, so the writer states **none**, and
+the test now asserts that rather than recomputing what the writer does.
+
+### ⭐⭐ The shared object hint table, and the defects the two judges caught
+
+The table describes **two runs**, which is the thing the annex states only
+obliquely: Table F.5 item 3 is the number of entries *for the first page* and
+item 4 the number *in all, including item 3*.
+
+⛔⛔⛔ **The first run is ALL of part 6, not only the objects later pages use**,
+and getting that wrong is what the first version did. Nothing in the table says
+which object an entry describes: item 1 names part 8's first object and the
+first run is **positional** — entry *j* is the *j*-th object of the first page,
+counted from `/O`. An arbitrary subset leaves a reader no way to know which
+objects were meant. Measured on qpdf's own output: a two-page file reports
+`nshared_first_page: 3` with part 6 holding objects 7, 8 and 9 and `/O = 7` —
+every first-page object, not the one page 2 shares. `CheckLinearized` (#67)
+named it in one run:
+
+```
+shared group 0 says 83 bytes and its 1 object(s) from object 2 occupy 101
+```
+
+⛔⛔ **And item 2 is stored as if the hint stream were absent**, exactly like
+Table F.3 item 2. The second defect was caught by **qpdf**:
+
+```
+first shared object offset mismatch: hint table = 1472; computed = 1300
+```
+
+with `H_length: 172`, which is the difference.
+
+⛔⛔⛔ **That sentence said "also ours and also caught by our checker before qpdf
+saw it", and it was false.** `FirstSharedObj` and `FirstSharedOffset` are
+written, parsed and compared in a hint-table test; **no checker recomputes
+either**, and the string above appears nowhere in the Go source — it is qpdf's
+wording, quoted from its output and then credited to us. External review found
+it by grep; mutation confirmed it, with `sharedOffset` returning the raw offset:
+`CheckLinearized` stays silent and qpdf prints exactly the line above. So the
+honest division is **our checker (#67) caught the group length, qpdf caught the
+offset**, and recomputing item 2 in `CheckLinearized` is a gap this change
+leaves open.
+
+⚠ This is the repository's standing lesson arriving one more time: the code was
+right and the prose about it was wrong. Here the prose claimed a capability the
+package does not have, which is the costlier direction — it would have been read
+as evidence that our checker covers item 2.
+
+⭐ `sharedOffset` does that subtraction and **has no clamp**: a version of it
+returned 0 for an offset below the hint length, a branch no emission can reach,
+and what it would have done is turn a wrong offset into the one value meaning
+"there is no shared object".
+
+⭐ **Every group holds one object.** `measureShared` measures one byte length per
+planned object, so a group's length is that object's own extent and no grouping
+decision can be wrong. It costs a few bytes per shared object against a table
+that groups adjacent ones.
+
+⚠ **The numerator is 0 and the denominator 1.** F.4.1 items 5 and 13 are a
+fraction saying *where in the page* a shared object is first used; this writer
+does not track that position, so it says "at the beginning". That is a loss of
+precision, not a falsehood: a reader fetches a shared object too early, never
+too late.
+
+### ⭐ What each inheritance shape puts in the table
 
 ⛔⛔ **Inheritance is a route by which a page reaches an object**, not a separate
 case. Table 30 lets a page omit `/Resources`, `/MediaBox`, `/CropBox` and
 `/Rotate`, and the writer pushes those down because F.3.7 needs part 6
 self-contained — so an inherited reference makes the page reach that object
-exactly as naming it would. It matters here only because it is the route that is
-easy to miss: one shared resource dictionary on the page tree node is the
-ordinary way to write a multi-page PDF, so a large share of real files are
-refused today.
+exactly as naming it would. It is the route that is easy to miss: one shared
+resource dictionary on the page tree node is the ordinary way to write a
+multi-page PDF, which is why the old refusal covered a large share of real files.
 
-| shape | accepted? |
+The column below is **what a page after the first names** — its Table F.4 item 4
+identifiers — because that, not the absence of an error, is what a reader uses:
+
+| shape | a later page names |
 |---|---|
-| one page, inherited indirect `/Resources` | **yes** — nothing to share with |
-| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **yes** — adds no object to reach |
-| multi-page, each page naming a **different** `/Resources` object | **yes** — nothing shared |
-| a **sub-node**'s indirect `/Resources` with **one** page under it | **yes** — part 7, private to that page |
-| a **sub-node**'s indirect `/Resources` with **two** pages under it | **no** — part 8, shared |
-| flat multi-page inheriting one indirect `/Resources` | **no** — needs F.4.2 |
-| one page inherits it, the other reaches it via its **own** `/Resources` | **no** — one inheritor, still shared |
-| two pages naming the **same** `/Resources` object, no inheritance at all | **no** — stating your own is not a cure |
+| one page, inherited indirect `/Resources` | **nothing** — there is no later page |
+| multi-page, inheritable values **direct** (an inline `/MediaBox` array) | **nothing** — adds no object to reach |
+| multi-page, each page naming a **different** `/Resources` object | **nothing** — nothing is shared |
+| a **sub-node**'s indirect `/Resources` with **one** page under it | **nothing** — part 7, private to that page |
+| two pages both reaching the **catalogue** | **nothing** — part 4 arrives ahead of the first page |
+| a **sub-node**'s indirect `/Resources` with **two** pages under it | **the shared object** |
+| flat multi-page inheriting one indirect `/Resources` | **the shared object** |
+| one page inherits it, the other reaches it via its **own** `/Resources` | **the shared object** |
+| two pages naming the **same** `/Resources` object, no inheritance at all | **the shared object** |
+| **twenty-five** pages inheriting one indirect `/Resources` | **the shared object** |
+| two pages sharing a `/Contents` while one inherits an unrelated `/Rotate` | **the `/Contents`**, never the private `/Rotate` |
 
-⚠ **"Each page states its own" is not an exemption**, and that row above says
-"a different object" for a reason: the earlier wording passed for an unstated
-second reason — the fixture gave each page a distinct object. Stating your own
-removes the *inheritance* route, not the sharing.
+⛔ **Both halves of that column are witnesses.** Six shapes must name something
+and five must name nothing, so a writer that emitted identifiers for everything —
+or for nothing, which is what the empty table was — fails it. The previous
+version of this table had an *accepted?* column; with the refusal gone, eleven
+rows of "yes" would have asserted what a single row does.
 
-⛔ Every fixture but the two sub-node rows is a **flat** page tree, which is
-exactly why the first boundary was mis-stated: a flat tree cannot express
-"inherited by one page out of several". The accepting rows carry more weight than
-the refusing ones — without them a stricter reach would refuse everything and the
-suite would stay green.
+⚠ That sentence read "five … and six", and this table listed **ten** of the
+eleven rows — the twenty-five-page one was missing, and with it the only row
+that exercises the shapes at scale. Both were found by external review, by
+counting. A prose tally beside the table it describes is worth one recount, and
+a table transcribed from a test is worth one diff against it.
 
-⚠ **The error names the inheritable key only when that key's own object is the
-shared one.** Asking merely "does this page inherit anything by reference"
-conflates two causes and can state a falsehood: two pages naming the *same*
-`/Contents` explicitly, with one of them under a sub-node carrying an unrelated
-indirect `/Rotate`, produced *"shares object 4 … which it inherits as /Rotate"* —
-where object 4 was written in both page dictionaries and `/Rotate`'s object was
-not shared at all. Both halves were true and the conjunction was not. The
-transitive case is given up deliberately: an object deep under an inherited
-`/Resources` is shared without being that key's value, and there the plain
-message is the honest one.
+⛔ **And this column judges presence only.** It cannot tell a right identifier
+from a wrong one: reversing `refsFor`'s identifier — every page naming objects
+it does not reach — leaves all eleven rows green. The values are judged by
+`TestTheHintTablesDescribeTheFileWeWrote`, which decodes each identifier back to
+an object number through the reader's own rule.
 
-⛔ **The partition had to learn this before the refusal could be right.**
-`reachFromPage` now follows the inherited attributes, because the writer pushes
-them down at emission: if the node's value is a reference, the emitted page names
-an object no *source* page named, and the partition was measuring a different
-document from the one being written. Before that, such a file was **accepted**
-with three defects — and two of them, `/E` and Table F.4 item 1, were older than
-the hint tables:
+⛔ The catalogue row is the one the old rule had to exempt by name, and it still
+holds for the reason it always did: `of[catNum] = PartCatalog` is assigned
+*after* the readers loop, part 4 precedes part 6, and `planShared` plans parts 6
+and 8 only. Part 4 holds nothing but the catalogue, so there is no second
+instance.
+
+⛔ **The rule that is now retired was wrong twice before it was right**, which is
+why it was stated in terms of *reaching* rather than of any mechanism:
+
+- *"a multi-page document with an indirect inherited value"* — refuted by a
+  three-level tree whose sub-node carries the reference with exactly **one** page
+  under it: that object is part 7, private to that page.
+- *"an inheritable indirect value inherited by more than one page"* — only
+  **sufficient**. Refuted by a page that states its *own* `/Resources` naming the
+  node's object under `/XObject` while the other page inherits it: exactly one
+  page inherits, and the object is shared all the same.
+
+Every fixture but the two sub-node rows is a **flat** page tree, which is exactly
+why the first boundary was mis-stated: a flat tree cannot express "inherited by
+one page out of several".
+
+⛔ **The partition had to learn this before either the refusal or the table could
+be right.** `reachFromPage` follows the inherited attributes, because the writer
+pushes them down at emission: if the node's value is a reference, the emitted
+page names an object no *source* page named, and the partition was measuring a
+different document from the one being written. Before that fix, such a file was
+**accepted** with three defects — and two of them, `/E` and Table F.4 item 1,
+were older than the hint tables:
 
 ```
 end of first page section (/E) mismatch: /E = 905; computed = 1190
@@ -1018,10 +1118,10 @@ object count mismatch for page 0: hint table = 2; computed = 3
 page 1: shared object 7: in computed list but not hint table
 ```
 
-⭐ The one-page inherited shape is in both judged loops, because the repair is
-observable only on a document the writer **accepts** — the two-page fixture stops
-at the refusal. Removing the inheritance from the reach reddens it on exactly
-those first two warnings.
+⭐ The same fix that made the refusal correct is what makes the table correct: an
+object the partition cannot see a page reaching is an object the table cannot
+describe. Removing the inheritance from the reach reddens the one-page inherited
+shape on exactly the first two warnings, and the shared shapes on the third.
 
 ⛔⛔ **THE LAYOUT IS PAGE-MAJOR IN PARTS 6 AND 7, AND A FOREIGN CHECKER IS WHY.**
 Within those parts the order is "page by page, each page's own object first",
@@ -1075,12 +1175,11 @@ meant the one subject the step was about was the one subject the judge could not
 speak on. The list grew one entry at a time as qpdf named them and is now
 deleted: every complaint counts.
 
-What remains for #61 is the shared object hint table's *values*. This writer's
-partition puts nothing in part 8, so its table is a required header and no
-groups — but qpdf's own output shows the accounting is wider than part 8:
-linearizing the same two-page input, qpdf reports `nshared_total: 3` with part 8
-**empty**, so it counts first-page objects that later pages also use. Matching
-that is a partition change, not a table change.
+⭐ **The shared object hint table's values are #68 and they are written.** The
+observation that closed the question was qpdf's own output on a two-page input —
+`nshared_total: 3` with part 8 **empty** — which says the accounting is wider
+than part 8: the first run counts first-page objects positionally, whether or
+not a later page uses them. The table above says what each shape now names.
 
 Next wave: the operations built on all of this.
 

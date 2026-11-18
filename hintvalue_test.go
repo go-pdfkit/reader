@@ -148,6 +148,28 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 					}
 					wantLen += lengthOf(t, written, out, order, c)
 				}
+				// ⛔⛔ A SHARED CONTENT STREAM LIES BEFORE THE PAGE THAT BORROWS
+				// IT, and items 6 and 7 cannot say so. They are an offset
+				// "relative to the beginning of the page" and a length, both
+				// unsigned: page 2 of the shared-/Contents shape names page 1's
+				// stream, which sits in part 6 at −83 bytes from page 2's first
+				// byte. There is no representable value, so the writer states
+				// NONE — contentNumbers keeps only the streams a page owns.
+				//
+				// ⛔ This case arrived with the sharing fixtures and is asserted
+				// rather than skipped: "no content stream of its own" and "a
+				// wrong positive delta" must not read alike. Making the oracle
+				// recompute what the writer does would be the usual way to turn
+				// a judge into an echo.
+				if wantOff < pageAt {
+					if e.ContentOffset != 0 || e.ContentLength != 0 {
+						t.Errorf("page %d borrows a content stream %d bytes BEFORE its own "+
+							"first byte, which items 6 and 7 cannot express, and the table "+
+							"says offset %d, length %d", i+1, pageAt-wantOff,
+							e.ContentOffset, e.ContentLength)
+					}
+					continue
+				}
 				if got, want := int(e.ContentOffset), wantOff-pageAt; got != want {
 					t.Errorf("page %d: item 6 says the content stream is %d bytes into the "+
 						"page and it is %d", i+1, got, want)
@@ -158,19 +180,96 @@ func TestTheHintTablesDescribeTheFileWeWrote(t *testing.T) {
 				}
 			}
 
-			// ⛔ THE SHARED TABLE IS PRESENT AND EMPTY, and both halves matter.
-			// Table F.2 marks it Required, so its absence is malformed; this
-			// writer's partition puts nothing in part 8, so it has no groups.
+			// ⛔⛔ THE SHARED TABLE DESCRIBES PART 6 THEN PART 8, and this block
+			// used to assert it was EMPTY — true while the writer refused every
+			// document that shared anything, and false since it writes one.
+			//
+			// ⛔ The first run is ALL of part 6, not only the objects a later
+			// page uses: nothing in the table says which object an entry
+			// describes, so the first run is positional, counted from /O. qpdf
+			// reports nshared_first_page 3 for a file whose part 6 holds three
+			// objects, including the ones no other page touches.
 			if tables.shared == nil {
 				t.Fatal("no shared object hint table, which Table F.2 marks Required")
 			}
-			if got := len(tables.sharedGroups); got != 0 {
-				t.Errorf("the shared table holds %d group(s) and this writer shares nothing",
-					got)
+			part6, part8 := 0, 0
+			for _, part := range p.Of {
+				switch part {
+				case PartFirstPage:
+					part6++
+				case PartShared:
+					part8++
+				}
 			}
-			if tables.shared.NSharedTotal != 0 || tables.shared.NSharedFirstPage != 0 {
-				t.Errorf("the shared table counts %d in all and %d for the first page",
-					tables.shared.NSharedTotal, tables.shared.NSharedFirstPage)
+			if got, want := int(tables.shared.NSharedFirstPage), part6; got != want {
+				t.Errorf("item 3 says %d first-page entr(ies) and part 6 holds %d object(s)",
+					got, want)
+			}
+			if got, want := int(tables.shared.NSharedTotal), part6+part8; got != want {
+				t.Errorf("item 4 says %d entr(ies) in all and parts 6 and 8 hold %d",
+					got, want)
+			}
+			if got, want := len(tables.sharedGroups), part6+part8; got != want {
+				t.Errorf("the table holds %d group(s) and item 4 wants %d", got, want)
+			}
+
+			// ⛔⛔⛔ AND EACH IDENTIFIER NAMES THE RIGHT OBJECT. Counts alone let
+			// the whole table be WRONG and the suite stay green: reversing
+			// refsFor's identifier — every page naming objects it does not
+			// reach — passed this suite with REQUIRE_QPDF=1, qpdf included,
+			// because the only shapes here shared nothing and the only
+			// assertions were counts. External review found that, by mutation,
+			// after this block had already been updated once.
+			//
+			// ⛔ THE EXPECTED OBJECT IS DECODED THE WAY A READER DECODES IT, not
+			// by asking planShared: entry j below NSharedFirstPage is the j-th
+			// object from /O, and the rest run from Table F.5 item 1. Asking the
+			// planner would agree with the writer by construction, which is the
+			// defect this very test exists to catch.
+			// ⛔⛔ THE GROUPS ARE WALKED, NOT COUNTED ONE PER ENTRY. The first
+			// version added 1 per identifier, which is right only because THIS
+			// writer puts one object in every group — a property of the subject
+			// leaking into the oracle, found by external review. F.4.2 lets a
+			// group hold a run, and hintlength.go walks it the same way: entry j
+			// names the first object of the j-th group, and the groups advance
+			// by their own NObjects. The two coincide today and would not for a
+			// writer that packed runs.
+			objectAt := make([]int, len(tables.sharedGroups))
+			num := lin.FirstPageObject
+			for j, g := range tables.sharedGroups {
+				if j == int(tables.shared.NSharedFirstPage) {
+					num = int(tables.shared.FirstSharedObj)
+				}
+				objectAt[j] = num
+				num += int(g.NObjects)
+			}
+
+			for i, e := range tables.pages {
+				named := map[int]bool{}
+				for _, r := range e.Shared {
+					if int(r.Identifier) >= len(objectAt) {
+						t.Errorf("page %d names identifier %d and the table defines %d",
+							i+1, r.Identifier, len(objectAt))
+						continue
+					}
+					named[objectAt[r.Identifier]] = true
+				}
+				want := map[int]bool{}
+				for _, old := range p.Shared[i] {
+					want[numberOf(t, order, old)] = true
+				}
+				for num := range want {
+					if !named[num] {
+						t.Errorf("page %d reaches shared object %d and its entry does "+
+							"not name it: the entry names %v", i+1, num, named)
+					}
+				}
+				for num := range named {
+					if !want[num] {
+						t.Errorf("page %d names shared object %d, which it does not "+
+							"reach: it reaches %v", i+1, num, want)
+					}
+				}
 			}
 		})
 	}
@@ -208,14 +307,70 @@ func hintShapes() []struct {
 			build: func(t *testing.T) []byte { return buildPages(t, pages) },
 		})
 	}
-	out = append(out, struct {
+	for _, shape := range []struct {
 		name  string
 		build func(*testing.T) []byte
 	}{
-		name:  "one page inheriting an indirect /Resources",
-		build: onePageInheritedFixture,
-	})
+		{"one page inheriting an indirect /Resources", onePageInheritedFixture},
+		// ⛔⛔⛔ THE THREE SHARING SHAPES ARE HERE BECAUSE WITHOUT THEM THIS
+		// WHOLE FILE JUDGES NOTHING ABOUT THE SHARED TABLE. Every shape above
+		// gives each page its own objects, so part 8 is empty, every page's
+		// entry holds zero identifiers, and both mutations below passed the
+		// suite with REQUIRE_QPDF=1:
+		//
+		//	refsFor's identifier reversed  — every page names the WRONG objects
+		//	sharedOffset returning `at`    — the item-2 defect this arc fixed
+		//
+		// ⛔ That is the README's own recorded lesson — "the corpus could not
+		// express the case" — repeating one step later: the refusal was
+		// removed, the fixtures were not changed, and a green suite went on
+		// meaning "the inputs are silent".
+		{"two pages sharing a /Contents", sharedContentsFixture},
+		{"two pages inheriting ONE indirect /Resources", inheritedResourcesFixture},
+		{"twenty-five pages inheriting ONE indirect /Resources",
+			func(t *testing.T) []byte { return inheritedResourcesPages(t, 25) }},
+		// ⭐ The only shape that puts anything in PART 8: an object pages 2 and
+		// 3 share and page 1 does not reach. Without it the second run is empty
+		// in every judged file and `FirstSharedObj` is never exercised.
+		{"pages 2 and 3 sharing an object page 1 does not reach", sharedAmongLaterPagesFixture},
+	} {
+		out = append(out, struct {
+			name  string
+			build func(*testing.T) []byte
+		}{name: shape.name, build: shape.build})
+	}
 	return out
+}
+
+// sharedAmongLaterPagesFixture writes three pages where pages 2 and 3 name one
+// /Resources object that page 1 does not reach — the only shape in which the
+// partition assigns PartShared, so the only one whose shared table has a second
+// run for Table F.5 items 1 and 2 to describe.
+func sharedAmongLaterPagesFixture(t *testing.T) []byte {
+	t.Helper()
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	later := w.Add(Dict{"ProcSet": Array{Name("PDF")}})
+
+	first := w.Add(&Stream{Dict: Dict{},
+		Raw: []byte("BT /F1 12 Tf 72 720 Td (one) Tj ET")})
+	kids := Array{w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+		"Contents": first, "Resources": Dict{}})}
+	for i := 2; i <= 3; i++ {
+		c := w.Add(&Stream{Dict: Dict{},
+			Raw: []byte(fmt.Sprintf("BT /F1 12 Tf 72 720 Td (p%d) Tj ET", i))})
+		kids = append(kids, w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+			"Contents": c, "Resources": later}))
+	}
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": kids, "Count": Integer(3),
+		"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+
+	plain, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
 }
 
 // onePageInheritedFixture writes a ONE-page document whose /Resources is an
@@ -269,8 +424,12 @@ func TestTheHintStreamIsTheSameLengthWhateverTheOffsets(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			blank := blankExtents(p)
-			first, _, err := buildHintTables(blank, 0, 0)
+			order, err := p.Order()
+			if err != nil {
+				t.Fatal(err)
+			}
+			blank := blankExtents(p, order)
+			first, _, err := buildHintTables(blank, blankShared(p, order), 0, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -288,9 +447,31 @@ func TestTheHintStreamIsTheSameLengthWhateverTheOffsets(t *testing.T) {
 					hasContent:   true,
 					contentStart: at + 40,
 					contentEnd:   at + 900 + i,
+					// ⛔ THE SAME REFERENCES, because they are pass-invariant:
+					// an identifier indexes the shared table and says nothing
+					// about where a byte landed. Dropping them here would make
+					// the two calls differ in their INPUT and the comparison
+					// would prove nothing about the layout.
+					shared: blank[i].shared,
 				}
 			}
-			second, _, err := buildHintTables(filled, 1000000, 120)
+
+			// ⛔ AND THE SAME GROUPS, with lengths a layout might produce. The
+			// count is what fixes the table's size; the lengths ride in a
+			// pinned 32-bit field.
+			sharedBlank := blankShared(p, order)
+			sharedFilled := sharedInput{
+				lengths:   make([]int, len(sharedBlank.lengths)),
+				firstPage: sharedBlank.firstPage,
+			}
+			for i := range sharedFilled.lengths {
+				sharedFilled.lengths[i] = 700 + i*13
+			}
+			if len(sharedFilled.lengths) > sharedFilled.firstPage {
+				sharedFilled.firstObj, sharedFilled.firstOff = 9, 500000
+			}
+
+			second, _, err := buildHintTables(filled, sharedFilled, 1000000, 120)
 			if err != nil {
 				t.Fatal(err)
 			}
