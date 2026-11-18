@@ -212,11 +212,37 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 		return objs, nil
 	}
 	data := dec.Data
-	n := int(intOr(s.Dict.Get("N"), 0))
-	first := int(intOr(s.Dict.Get("First"), 0))
-	if n <= 0 || first <= 0 || first > len(data) {
+	// ⛔⛔⛔ /N IS A COUNT THE FILE CHOSE, AND IT WAS A SLICE CAPACITY.
+	// `2 0 obj<</Type/ObjStm///N 10000000000000/First 10>>` — fifty bytes —
+	// made this ask for a 160 000 001 441 792-byte block, and an out-of-memory
+	// is a FATAL ERROR, not a panic: a caller that wraps Open in recover(),
+	// which is the reasonable defence against a malformed file, is not
+	// protected. The old guard bounded `first` against len(data) and said
+	// NOTHING about `n`. #73, found by fuzzing in the review of #72.
+	//
+	// ⭐ THE CEILING COSTS NOTHING BECAUSE THE DATA ALREADY HOLDS IT: the index
+	// is data[:first], and a pair is two integers and their separators, so at
+	// its very smallest ("0 0 ") it is four bytes. At most first/4 pairs can
+	// exist, whatever /N claims. Nothing about the salvage changes — a file
+	// declaring more objects than its index can hold still yields the ones
+	// really there, because the loop below already stops when the lexer dries
+	// up. What changes is that the claim no longer sizes the allocation.
+	//
+	// ⛔ AND THE CLAMP HAPPENS IN int64, BEFORE NARROWING. int(1e13) on a
+	// 32-bit build is a truncation that can land anywhere, including on a
+	// positive number that passes `n <= 0` — the same mistake the predictor's
+	// rowBytes was rewritten for in #71. first is narrowed only once len(data)
+	// has bounded it, and n only once first has.
+	n64 := intOr(s.Dict.Get("N"), 0)
+	first64 := intOr(s.Dict.Get("First"), 0)
+	if n64 <= 0 || first64 <= 0 || first64 > int64(len(data)) {
 		return objs, nil
 	}
+	first := int(first64)
+	if ceiling := int64(first / 4); n64 > ceiling {
+		n64 = ceiling
+	}
+	n := int(n64)
 	l := &lexer{buf: data[:first]}
 	type pair struct{ num, off int }
 	pairs := make([]pair, 0, n)

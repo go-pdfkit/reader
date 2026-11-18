@@ -329,6 +329,37 @@ func TestAFaxThatSaysNothingSensibleIsRefused(t *testing.T) {
 	}
 }
 
+// ⛔⛔ /Rows IS OPTIONAL, AND WITHOUT IT NOTHING BOUNDED /Columns BEFORE THE
+// ALLOCATION. The case above it — 2^20 by 2^20 — is refused by the guard that
+// reads `p.rows > 0 && p.columns > maxCCITTPixels/p.rows`, and that conjunction
+// is the hole: /Rows DEFAULTS TO ZERO, so the ordinary file skips the check
+// entirely. `make([]byte, p.columns)` then runs first, and the in-loop budget
+// that would have caught it is tested only once a row has already been
+// allocated.
+//
+// ⭐ The limit is lowered rather than the columns raised, so this test proves
+// the ordering with a megabyte instead of a fatal allocation. Found by the
+// audit #73 asked for, which is the same class: a count the file chose, used
+// as a size, with the only guard on a different parameter.
+func TestColumnsAreBoundedEvenWhenRowsIsAbsent(t *testing.T) {
+	defer func(old int) { maxCCITTPixels = old }(maxCCITTPixels)
+	maxCCITTPixels = 1 << 10
+
+	t.Run("no rows named, and the columns are past the budget", func(t *testing.T) {
+		if _, err := ccittDecode(nil, ccittParams{k: -1, columns: 1 << 20}); err == nil {
+			t.Error("a row of 2^20 bytes was allocated although the budget is 2^10 pixels")
+		}
+	})
+
+	// ⛔ THE CONTROL, because a refusal that fires on everything is not a bound:
+	// a fax within the budget must still be read, with /Rows just as absent.
+	t.Run("no rows named, and the columns fit", func(t *testing.T) {
+		if _, err := ccittDecode(make([]byte, 64), ccittParams{k: -1, columns: 8}); err != nil {
+			t.Errorf("an 8-column fax inside the budget was refused: %v", err)
+		}
+	})
+}
+
 func TestAFaxWithNoRowsAtAllDecodesToNothing(t *testing.T) {
 	// All-zero data is fill, not a picture. Zeros decode as perfectly good
 	// modes — pass mode is 0001 — so a decoder that does not stop here invents
@@ -505,12 +536,21 @@ func TestAFaxIsBoundedEvenWhenItSaysNothingAboutItsHeight(t *testing.T) {
 	}
 	// A run may be built up from make-up codes without ever terminating, and
 	// is bounded the same way.
+	//
+	// ⛔⛔ THE COLUMN COUNT HERE IS 100, NOT 1728, AND THE REASON IS THE POINT.
+	// It was g4(1728) while the budget was 100, so once /Columns gained a bound
+	// of its own this case was refused for ITS columns and never reached the
+	// run at all — and the assertion is `err == nil`, which a different error
+	// satisfies in silence. The test went on passing while its subject went
+	// untested; `covblocks` caught it as one uncovered block, the coverage
+	// percentage did not (it still read 100.0%, rounded — see #49).
+	// A bound must be tested through the path it bounds.
 	maxCCITTPixels = 100
 	long := []string{"H"}
 	for i := 0; i < 8; i++ {
 		long = append(long, "W64")
 	}
-	if _, err := ccittDecode(faxBits(t, long...), g4(1728)); err == nil {
+	if _, err := ccittDecode(faxBits(t, long...), g4(100)); err == nil {
 		t.Error("no error from a run past the bound")
 	}
 }

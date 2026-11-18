@@ -117,7 +117,7 @@ Two committed seeds, each about a hundred bytes, ask through
 The predictor allocated it — twice, since PNG prediction keeps the previous row
 — and then walked every byte:
 
-| seed | `/Columns` | row | from | amplification |
+| seed | `/Columns` | row | file | amplification |
 |---|---|---|---|---|
 | `testdata/fuzz/FuzzLinearize/3b1b3cdb9d35987f` | 977 777 777 | 932.5 MiB | 102 B | 9 586 057× |
 | `testdata/fuzz/FuzzLinearize/ccf3735d005f4673` | 911 111 111 | 868.9 MiB | 105 B | 8 677 249× |
@@ -183,6 +183,70 @@ count is a floor).
 the code**: the allocation because no target had reached the predictor with a
 plausible `/Columns`, and the overflow because the reviewer's machine ran that
 target about four times faster than the one it was written on.
+
+### ⛔⛔⛔ A count the file chose, used as a size — three times, and the third kills the process
+
+The predictor bound above is one instance of a class this package has now hit
+three times, each found by a different instrument and each fixed in isolation
+before the pattern was named:
+
+| | the number the file chose | was used as | asked for |
+|---|---|---|---|
+| #56 | the page offset table's shared-reference count | a loop bound | 1 bit in, 8 bytes out |
+| #70 | `/Columns`, `/Colors`, `/BitsPerComponent` | a row allocation | a 102-byte **file**, 932 MiB |
+| #73 | an object stream's `/N` | a **slice capacity** | a 50-byte **object**, 160 TB |
+
+⛔⛔ **The third is worse in kind, not only in size.** `make([]pair, 0, n)` with
+`n` straight from `/N` ends the process with
+
+```
+runtime: out of memory: cannot allocate 160000001441792-byte block
+fatal error: out of memory
+```
+
+That is a **fatal error, not a panic**: `recover()` does not catch it, so the
+reasonable defence — wrapping `Open` in a recover for malformed input — is no
+defence at all. The path is `Open` → `Get` → `getFromObjectStream`, and object
+streams are where every modern PDF keeps its catalogue. ⚠ `GOMEMLIMIT` does not
+help either: it is a target the collector aims at, not a refusal, and a single
+oversized `make` fails the process regardless. Measured, not assumed —
+`GOMEMLIMIT=2GiB` still died.
+
+⭐ **The ceiling was free, as it usually is in this class.** The index is
+`data[:first]`, a pair is two integers and their separators, so at its smallest
+(`0 0 `) it is four bytes: **at most `first/4` pairs can exist**, whatever `/N`
+claims, and `first` is already bounded by `len(data)`. Nothing about the salvage
+changes — the loop already stopped when the lexer dried up. What changed is that
+a claim no longer sizes an allocation. The clamp happens in `int64` before
+narrowing, for #71's reason: `int(1e13)` on a 32-bit build is a truncation that
+can land on a positive number and sail through `n <= 0`.
+
+#### And the audit found a fourth
+
+Auditing every `make` whose size traces back to a dictionary value — the work
+#73 asked for — turned up one more, in CCITT:
+
+```go
+if p.rows > 0 && p.columns > maxCCITTPixels/p.rows { … }  // the only bound
+stride := (p.columns + 7) / 8
+curr := make([]byte, p.columns)                           // runs anyway
+```
+
+⛔ **`/Rows` is optional and defaults to zero**, so for an ordinary fax that
+conjunction is false and the check never runs, while the allocation three lines
+down does. The in-loop pixel budget cannot stand in for it: that is read *after*
+a row has already been allocated. One row is now bounded on its own — it cannot
+be larger than the whole image is allowed to be.
+
+⛔⛔ **And fixing it exposed a test that had been passing for the wrong reason.**
+`TestAFaxIsBoundedEvenWhenItSaysNothingAboutItsHeight` lowered the budget to 100
+and then decoded with `/Columns 1728`; once columns had a bound of their own,
+that case was refused for *its columns* and never reached the run-length path it
+was written for. Its assertion is `err == nil`, which any other error satisfies
+in silence, so it kept passing with its subject untested. **`covblocks` caught
+it as one uncovered block; the percentage did not** — `go test` still printed
+`100.0%`, rounded, which is [#49](https://github.com/go-pdfkit/reader/issues/49)
+in one line. A bound has to be tested through the path it bounds.
 
 ### Linearization (Fast Web View)
 

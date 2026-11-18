@@ -306,6 +306,17 @@ func ccittDecode(data []byte, p ccittParams) ([]byte, error) {
 	if p.rows < 0 {
 		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d rows", p.rows)
 	}
+	// ⛔⛔ ONE ROW IS BOUNDED ON ITS OWN, BEFORE THE PAIR IS. The check below
+	// needs /Rows, which is OPTIONAL and defaults to zero, so for the ordinary
+	// fax it did not run at all — and `make([]byte, p.columns)` three lines on
+	// allocated whatever the file asked for. The in-loop budget cannot stand in
+	// for this: it is read after a row has already been allocated.
+	// Found by the audit #73 asked for.
+	if p.columns > maxCCITTPixels {
+		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d columns, past the "+
+			"limit of %d pixels: one row cannot be larger than the whole image may be",
+			p.columns, maxCCITTPixels)
+	}
 	if p.rows > 0 && p.columns > maxCCITTPixels/p.rows {
 		return nil, fmt.Errorf("reader: /CCITTFaxDecode names %d by %d pixels, "+
 			"past the limit of %d", p.columns, p.rows, maxCCITTPixels)
