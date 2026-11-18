@@ -213,7 +213,7 @@ func (d *Document) objectStream(num int) (map[int]Object, error) {
 	}
 	data := dec.Data
 	// ⛔⛔⛔ /N IS A COUNT THE FILE CHOSE, AND IT WAS A SLICE CAPACITY.
-	// `2 0 obj<</Type/ObjStm///N 10000000000000/First 10>>` — fifty bytes —
+	// `2 0 obj<</Type/ObjStm///N 10000000000000/First 10>>` — fifty-one bytes —
 	// made this ask for a 160 000 001 441 792-byte block, and an out-of-memory
 	// is a FATAL ERROR, not a panic: a caller that wraps Open in recover(),
 	// which is the reasonable defence against a malformed file, is not

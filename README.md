@@ -194,7 +194,18 @@ before the pattern was named:
 |---|---|---|---|
 | #56 | the page offset table's shared-reference count | a loop bound | 1 bit in, 8 bytes out |
 | #70 | `/Columns`, `/Colors`, `/BitsPerComponent` | a row allocation | a 102-byte **file**, 932 MiB |
-| #73 | an object stream's `/N` | a **slice capacity** | a 50-byte **object**, 160 TB |
+| #73 | an object stream's `/N` | a **slice capacity** | a 51-byte **object**, 160 TB |
+
+⚠ **That object is 51 bytes, and this table said 50 when it was written** — in
+the issue's title, in the release notes, on the landing page and here. `wc -c`
+returned **51**, the right answer; I then wrote *"includes the trailing newline
+the tool added"* beside it and subtracted one. The file's last byte is `>`;
+there was no newline, and the parenthetical was never checked.
+**A correct measurement annotated with an assumption is an assumption** — the
+annotation outranked the instrument, and the wrong figure went to four public
+surfaces before an external review asked for it again.
+`TestTheDocumentedReproducerIsTheLengthTheCommentClaims` now holds the string
+and the number together, since that is the pair that drifted.
 
 ⛔⛔ **The third is worse in kind, not only in size.** `make([]pair, 0, n)` with
 `n` straight from `/N` ends the process with

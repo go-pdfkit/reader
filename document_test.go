@@ -323,6 +323,22 @@ func TestObjectStreamOddities(t *testing.T) {
 // for, because the bomb is loud. Caught in review before it shipped; the
 // refusal it belongs to is still measured by the fuzz seed
 // testdata/fuzz/FuzzLinearize/86bc84b0ce34ab5c.
+// ⛔ THE STRING AND THE NUMBER LIVE TOGETHER, because they drifted apart. The
+// comment in document.go and the README both quote this object and state its
+// length; both said "fifty" while it is fifty-one. The measurement had been
+// taken correctly (`wc -c` said 51) and then overruled by an unchecked
+// parenthetical about a trailing newline that was not there.
+//
+// ⭐ A prose figure nothing asserts is a claim, and this is the cheapest
+// possible assertion: the literal the documentation quotes, measured.
+func TestTheDocumentedReproducerIsTheLengthTheCommentClaims(t *testing.T) {
+	const documented = `2 0 obj<</Type/ObjStm///N 10000000000000/First 10>>`
+	if len(documented) != 51 {
+		t.Errorf("the object document.go and the README quote is %d bytes, and both "+
+			"say fifty-one", len(documented))
+	}
+}
+
 func TestAnIndexTooShortToRoundUpStillYieldsItsObject(t *testing.T) {
 	b := newBuilder()
 	b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
