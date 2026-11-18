@@ -244,3 +244,100 @@ func FuzzCheckLinearized(f *testing.F) {
 		})
 	})
 }
+
+// FuzzLinearize drives the WRITER over documents an attacker chose, which
+// nothing did until v0.18.0.
+//
+// ⛔⛔ THE WRITER IS A CONSUMER OF UNTRUSTED STRUCTURE, and it was fuzzed from
+// neither side. FuzzCheckLinearized drives the reader of a hostile FILE;
+// FuzzOpenWithinABudget stops at Open. Between them sat Partition, the layout,
+// planShared, measureShared and buildHintTables — every one of them walking a
+// page tree, a /Contents array and an inheritance chain that came out of the
+// input, indexing slices by numbers derived from them.
+//
+// ⛔ THE INVARIANT IS THE STRONG ONE: whatever Linearize RETURNS, our own
+// CheckLinearized must accept. A writer that emits a file its own checker
+// refuses has written a hint table that disagrees with the bytes beside it —
+// which is exactly the failure this arc kept finding by hand, and the one qpdf
+// reports as "in computed list but not hint table".
+//
+// ⛔⛔ AND LINEARIZE NOW ENFORCES THAT INVARIANT ITSELF, so this assertion can
+// no longer fail while the post-condition stands. Keeping it is deliberate and
+// its job has changed: it is the REGRESSION GUARD for the post-condition — the
+// day somebody removes firstPageAgrees as "a redundant extra parse", the three
+// corpus entries under testdata/fuzz/FuzzLinearize go red here. An assertion
+// that holds by construction is a tautology when nothing enforces it and a
+// gate when something does; this one names which it is.
+//
+// ⛔ WHAT THE FUZZER CAN STILL FIND is therefore: a panic, a hang past the
+// budget, and — the one worth watching — a document the post-condition starts
+// REFUSING that it used to write. The second kind is not visible from here
+// (an error is an accepted answer), which is why the positive corpus in
+// hintShapes(), judged by qpdf, is what keeps the refusal honest.
+//
+// ⚠ An ERROR is always an acceptable answer here. Most inputs are not
+// linearizable — six document features are refused outright — and the target is
+// about panics, hangs and a file that contradicts itself, never about how many
+// documents are accepted.
+func FuzzLinearize(f *testing.F) {
+	addSeeds(f, 200, 40*1024)
+	// ⛔⛔⛔ THE COMMITTED PDFs, BECAUSE WITHOUT THEM THIS TARGET IS INERT.
+	// addSeeds contributes two hand-written strings unless PDF_SEEDS is set,
+	// and NEITHER OPENS: one has no startxref, the other no indirect objects.
+	// So the fuzzer had to invent a valid cross-reference table and page tree
+	// from `%PDF-1.4\nstartxref\n0\n%%EOF`, and it never did. Measured by
+	// external review with counters on each early return: of ~37 000 000
+	// executions, `opened` was ZERO — every one of them measured Open's
+	// rejection paths, and Partition, the layout and buildHintTables were
+	// never entered.
+	//
+	// ⛔ I had already published "16 035 850 executions, no crash" as if it
+	// said something about the writer. It said nothing about the writer. A
+	// fuzz target that cannot reach its subject reports a clean run exactly
+	// like one that cleared it.
+	//
+	// ⚠ NAMED FROM A LISTING, not from memory: a first version of this list
+	// asked for "minimal.pdf" and "two-page.pdf", neither of which exists, and
+	// os.ReadFile's error is DISCARDED here — so two of the four seeds would
+	// have been silently absent, which is the same defect one layer down.
+	seeded := 0
+	for _, name := range []string{
+		"linearized.pdf", "linearized-objstm.pdf",
+		"linearized-shared.pdf", "linearized-gs.pdf",
+	} {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("seed %s: %v", name, err)
+		}
+		f.Add(b)
+		seeded++
+	}
+	if seeded != 4 {
+		f.Fatalf("%d seed(s) of 4", seeded)
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		budget(t, 4*time.Second, len(b), "Linearize", func() {
+			d, err := reader.Open(b)
+			if err != nil {
+				return
+			}
+			// ⛔ A BOUND ON THE SUBJECT, not on the clock alone. A page tree can
+			// name a hundred thousand pages in a few hundred bytes, and
+			// linearizing one is a legitimate amount of work that says nothing
+			// about the defects this hunts.
+			if n := d.PageCount(); n < 1 || n > 64 {
+				return
+			}
+			out, err := d.Linearize()
+			if err != nil {
+				return
+			}
+			if len(out) == 0 {
+				t.Fatal("Linearize returned no error and no bytes")
+			}
+			if _, err := reader.CheckLinearized(out); err != nil {
+				t.Fatalf("our own checker refuses what our own writer produced: %v", err)
+			}
+		})
+	})
+}

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("0trailer <</Root 8 00R / 0/000[<0000000000000000000000000000000000000000>] >>0000000000000A8 0 obj << /Pages << >>/Type /Page >>0 0 obj <</Type/Page>>")

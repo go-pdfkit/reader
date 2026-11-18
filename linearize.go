@@ -189,7 +189,76 @@ func (d *Document) Linearize() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return d.linearizeFrom(p)
+	out, err := d.linearizeFrom(p)
+	if err != nil {
+		return nil, err
+	}
+	if err := firstPageAgrees(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// firstPageAgrees refuses a file whose /O names one page while the page TREE
+// in those same bytes presents another.
+//
+// ⛔⛔ THE TWO COME FROM DIFFERENT PLACES, AND THAT IS THE WHOLE POINT. /O is
+// the renumbered Partition.FirstPageObject, which comes from the reader's page
+// ENUMERATION of the input; what a consumer sees as page 1 comes from the
+// /Kids array this writer copies through unchanged. For a well-formed document
+// those are the same page. For a damaged one they are not, and nothing before
+// this noticed: Linearize returned a file, and only CheckLinearized — run on
+// the bytes afterwards, by a caller who thought to — said
+//
+//	/O says object 2 and the first page is object 5
+//
+// ⭐ FOUND BY FUZZING THE WRITER (#69), on a mutated copy of our own
+// testdata/linearized.pdf whose object 3 has its /Type key corrupted to
+// /Ty\x00\x04\x00\x00Page. Its page tree node says /Kids [10 0 R 1 0 R 3 0 R]
+// while the reader enumerates the pages as 1 then 10, so the emitted tree
+// presents a different first page from the one /O was derived from. The corpus
+// entry is testdata/fuzz/FuzzLinearize/25ce7b9529e25889.
+//
+// ⛔ IT IS A POST-CONDITION AND NOT A PRECONDITION ON PURPOSE. Predicting the
+// disagreement would mean re-deriving the reader's page walk here and trusting
+// that the re-derivation matches — a second implementation of the thing being
+// checked. Reading back what was WRITTEN asks the only question that matters:
+// does the file we are about to hand out agree with itself?
+//
+// ⛔⛔⛔ AND IT ASKS THE WHOLE QUESTION, NOT ONE FIELD OF IT. The first version
+// compared only /O against the reopened document's first page. External review
+// refuted it in 90 seconds on its own fuzz target: the SAME input-walk versus
+// output-tree disagreement reappears one field over, in /N —
+//
+//	/N says 2 page(s) and the document has 1
+//
+// on a mutated linearized.pdf whose /Kids names an object 18 that is absent.
+// Patching /O then /N then /E is a list that grows by one entry per fuzz run,
+// and CheckLinearized already states the whole invariant: it holds EVERY
+// parameter against the document. So the writer runs its own checker over its
+// own output.
+//
+// ⛔ THAT IS NOT CIRCULAR, AND THE REASON IS WORTH KEEPING. Both sides use the
+// reader, but over DIFFERENT documents: the parameters were frozen from the
+// INPUT's page enumeration, while the check walks the page tree of the OUTPUT,
+// which this writer copies through unchanged. What it cannot catch is a defect
+// INSIDE the reader, which would agree with itself on both — it proves
+// self-consistency, never conformance. qpdf is what judges conformance here.
+//
+// ⚠ THE COST, STATED: one full parse of our own output, on a writer that
+// already makes two passes over the document.
+//
+// ⚠ THE RISK, STATED: a defect of OURS now surfaces as "this document cannot
+// be linearized" rather than as a wrong file, which could mask a regression on
+// a document that deserves to be written. What keeps that honest is the
+// positive corpus — every shape in hintShapes(), each judged by qpdf — which
+// goes red the moment a good document starts being refused.
+func firstPageAgrees(out []byte) error {
+	if _, err := CheckLinearized(out); err != nil {
+		return fmt.Errorf("%w: the file we wrote does not describe itself, so this "+
+			"document cannot be linearized faithfully: %v", ErrCannotLinearize, err)
+	}
+	return nil
 }
 
 // linearizeFrom is Linearize with the partition supplied.

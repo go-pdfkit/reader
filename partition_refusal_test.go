@@ -493,6 +493,76 @@ func TestADocumentWithNoPagesIsRefused(t *testing.T) {
 	}
 }
 
+// ⛔⛔ A PAGE NUMBERED 0 CANNOT BE NAMED BY ANY PAGE TREE WE WRITE. 7.3.10
+// requires an indirect object's number to be a positive integer, and `0 0 R`
+// is the null reference — so whatever that page holds, no reference in the
+// file we write can point at it, and /O would name an object the structure
+// cannot reach.
+//
+// ⭐ FOUND BY FUZZING THE WRITER, not by reading it. The writer emitted a file
+// whose /O said object 2 while the page tree in that same file reached object
+// 1, and CheckLinearized refused what Linearize had just produced — the first
+// real writer/checker disagreement this package has had. The input is kept at
+// testdata/fuzz/FuzzLinearize/b9472aa1230f3b85.
+//
+// ⛔ THE ZERO IS THE CAUSE AND NOT THE COMPANY IT KEEPS. The fuzzer's input
+// also had a /Root that was itself typed /Page, no cross-reference table, and
+// a malformed `8 00R` reference, so the cheap explanation was "it is garbage".
+// Measured instead: a /Root that is ALSO a page, written with legal numbering
+// and no repair path, is linearized and checks CLEAN. That control is below.
+func TestAPageNumberedZeroIsRefused(t *testing.T) {
+	in := []byte("0trailer <</Root 8 00R / 0/000[<0000000000000000000000000000000000000000>] >>" +
+		"0000000000000A8 0 obj << /Pages << >>/Type /Page >>0 0 obj <</Type/Page>>")
+	d, err := Open(in)
+	if err != nil {
+		t.Fatalf("the reader should still OPEN it — the refusal belongs to the "+
+			"writer, not to Open: %v", err)
+	}
+	if _, err := d.Partition(); !errors.Is(err, ErrCannotPartition) {
+		t.Fatalf("a document whose first page is object 0 was partitioned: %v", err)
+	} else if !strings.Contains(err.Error(), "null reference") {
+		t.Errorf("refused, but not for the reason that makes it unwritable: %v", err)
+	}
+
+	// ⛔ AND THE WHOLE WRITER REFUSES IT, not just the partition: before this
+	// guard, Linearize returned a FILE, and only our own checker — run on the
+	// bytes afterwards — noticed it contradicted itself.
+	if _, err := d.Linearize(); !errors.Is(err, ErrCannotPartition) {
+		t.Fatalf("Linearize still produced something for a page numbered 0: %v", err)
+	}
+}
+
+// ⛔ THE CONTROL FOR THE ROW ABOVE: the same pathological SHAPE — a catalogue
+// that is itself typed /Page — with legal object numbers is WRITTEN. Without
+// it, "a page numbered 0 is refused" and "a weird page tree is refused" are
+// the same sentence, and the guard could be far wider than its reason.
+func TestARootThatIsAlsoAPageIsStillWritten(t *testing.T) {
+	w := NewWriter("1.7")
+	pagesRef := w.Reserve()
+	c := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT /F1 12 Tf 72 720 Td (a) Tj ET")})
+	page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+		"Contents": c, "Resources": Dict{}})
+	w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page},
+		"Count":    Integer(1),
+		"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+	root := w.Add(Dict{"Type": Name("Page"), "Pages": pagesRef})
+	in, err := w.Finish(Dict{"Root": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.Linearize()
+	if err != nil {
+		t.Fatalf("a catalogue typed /Page, with legal numbering, was refused: %v", err)
+	}
+	if _, err := CheckLinearized(out); err != nil {
+		t.Fatalf("our own checker refuses it: %v", err)
+	}
+}
+
 // ⛔ A DIRECT CATALOGUE HAS NO OBJECT NUMBER, and part 4 is a set of object
 // numbers. The file is unusual rather than malformed — 7.5.5 requires /Root to
 // be an indirect reference, so this is a file that breaks that — and the

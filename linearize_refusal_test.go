@@ -350,3 +350,118 @@ func mustDict(t *testing.T, o Object) Dict {
 	}
 	return d
 }
+
+// ⛔⛔ THE POST-CONDITION OVER BYTES THAT ARE NOT OURS. firstPageAgrees runs on
+// what Linearize just wrote, so from Linearize its refusal is unreachable: our
+// own output describes itself or the writer is broken. An unreachable branch
+// is an untested claim, and this package's coverage gate refuses to carry one
+// — so the function takes plain bytes and is called with bytes it will refuse.
+//
+// ⭐ No seam, no injected failure: the function's whole input is a []byte, and
+// the cheapest honest test of "what does it say about bytes like these" is to
+// hand it bytes like these.
+//
+// ⛔ THE CASES ARE KEPT THOUGH THE BRANCHES MERGED. The function used to carry
+// three of its own guards — unreadable bytes, no parameters, no first page —
+// and now wraps CheckLinearized, which states the whole invariant rather than
+// three fields of it. One error path instead of three; these three inputs
+// still reach it by three different routes, and each asserts the REASON the
+// checker gave, so a change that made them all fail alike would show.
+func TestWhatTheFirstPageCheckSaysAboutBytesThatAreNotOurs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   func(*testing.T) []byte
+		want string
+	}{
+		{
+			name: "bytes that are not a PDF at all",
+			in:   func(*testing.T) []byte { return []byte("not a pdf") },
+			want: "does not begin with %PDF-",
+		},
+		{
+			// ⛔ Opens as a document and has NO /Linearized dictionary, which
+			// is every ordinary PDF — the branch exists because a caller
+			// handing us someone else's bytes gets a named error rather than
+			// a nil dereference.
+			name: "a readable document with no linearization parameters",
+			in: func(t *testing.T) []byte {
+				t.Helper()
+				w := NewWriter("1.7")
+				pagesRef := w.Reserve()
+				c := w.Add(&Stream{Dict: Dict{}, Raw: []byte("BT ET")})
+				page := w.Add(Dict{"Type": Name("Page"), "Parent": pagesRef,
+					"Contents": c, "Resources": Dict{}})
+				w.Put(pagesRef, Dict{"Type": Name("Pages"), "Kids": Array{page},
+					"Count":    Integer(1),
+					"MediaBox": Array{Integer(0), Integer(0), Integer(612), Integer(792)}})
+				root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+				b, err := w.Finish(Dict{"Root": root})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			},
+			want: "not a dictionary",
+		},
+		{
+			// ⛔⛔ IT OPENS, IT HAS PARAMETERS, AND IT HAS NO PAGE. A first
+			// version truncated testdata/linearized.pdf and landed on the
+			// "cannot be reopened" branch instead — the file stopped having a
+			// startxref, so it never reached the question being asked. This
+			// one is built: a real cross-reference table, a catalogue, an
+			// EMPTY page tree, and a /Linearized dictionary as object 1.
+			//
+			// ⛔ /L must be the file's OWN length, and writing it twice is not
+			// enough: Integer is not zero-padded, so a ten-digit guess makes a
+			// file seven bytes shorter than it claims ("/L says 329 bytes and
+			// the file is 322"). It is iterated to a FIXED POINT instead.
+			name: "linearization parameters over a document with no first page",
+			in: func(t *testing.T) []byte {
+				t.Helper()
+				build := func(length int) []byte {
+					t.Helper()
+					w := NewWriter("1.7")
+					w.Add(Dict{
+						"Linearized": Integer(1),
+						"L":          Integer(length),
+						"H":          Array{Integer(0), Integer(0)},
+						"O":          Integer(3),
+						"E":          Integer(1),
+						"N":          Integer(0),
+						"T":          Integer(1),
+					})
+					pagesRef := w.Reserve()
+					w.Put(pagesRef, Dict{"Type": Name("Pages"),
+						"Kids": Array{}, "Count": Integer(0)})
+					root := w.Add(Dict{"Type": Name("Catalog"), "Pages": pagesRef})
+					b, err := w.Finish(Dict{"Root": root})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return b
+				}
+				b := build(0)
+				for i := 0; i < 8; i++ {
+					next := build(len(b))
+					if len(next) == len(b) {
+						return next
+					}
+					b = next
+				}
+				t.Fatal("/L did not settle: the fixture cannot declare its own length")
+				return nil
+			},
+			want: "/N says 0 page(s)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := firstPageAgrees(tc.in(t))
+			if !errors.Is(err, ErrCannotLinearize) {
+				t.Fatalf("it accepted them: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("refused, but not for %q: %v", tc.want, err)
+			}
+		})
+	}
+}
