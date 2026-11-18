@@ -464,6 +464,26 @@ silent — the reader does not fail, it reads the wrong bytes:
 | `/AcroForm` | F.3.5 takes only the top-level form dictionary; F.3.10 takes the field hierarchy |
 | `/Encrypt` | F.3.5 requires the encryption dictionary *and every value in it* in part 4 |
 | a page with `/Thumb` | F.3.10 gives thumbnails and their shared objects two ordered categories of their own |
+| a page numbered **0** | 7.3.10 requires a positive object number and `0 0 R` is the null reference, so no page tree we write could name it |
+| a document whose written form would not describe itself | the parameters are taken from the input's page enumeration and the page tree is copied through, so a damaged document can make the two disagree |
+
+⛔⛔ **The last two rows were found by fuzzing the writer, not by reading it**,
+and the second one three times over — once as `/O`, once as `/N`, and once more
+only because the reviewer's machine ran the target four times faster than mine.
+Patching the field a fuzz run happens to name is a list that grows by one entry
+per run, so `Linearize` runs `CheckLinearized` over its **own output** and
+refuses a file that does not describe itself.
+
+⚠ That check is **self-consistency, not conformance**: both sides use this
+package's reader, over two different documents — the parameters frozen from the
+input's page walk, against the page tree of the output. A defect *inside* the
+reader would agree with itself on both and pass. qpdf is what judges conformance.
+
+⚠ And it has a cost of its own, stated rather than hidden: a defect of **ours**
+now appears as "this document cannot be linearized" instead of as a wrong file,
+which could mask a regression on a document that deserves to be written. The
+positive corpus — every shape in `hintShapes()`, each judged by qpdf — is what
+goes red if that starts happening.
 
 ⛔ **`/Thumb` and `/Parent` are skipped at the page**, which F.3.7 states
 outright: part 6 holds what "its Contents, Resources, Annots, and B entries"

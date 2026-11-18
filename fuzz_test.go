@@ -261,6 +261,20 @@ func FuzzCheckLinearized(f *testing.F) {
 // which is exactly the failure this arc kept finding by hand, and the one qpdf
 // reports as "in computed list but not hint table".
 //
+// ⛔⛔ AND LINEARIZE NOW ENFORCES THAT INVARIANT ITSELF, so this assertion can
+// no longer fail while the post-condition stands. Keeping it is deliberate and
+// its job has changed: it is the REGRESSION GUARD for the post-condition — the
+// day somebody removes firstPageAgrees as "a redundant extra parse", the three
+// corpus entries under testdata/fuzz/FuzzLinearize go red here. An assertion
+// that holds by construction is a tautology when nothing enforces it and a
+// gate when something does; this one names which it is.
+//
+// ⛔ WHAT THE FUZZER CAN STILL FIND is therefore: a panic, a hang past the
+// budget, and — the one worth watching — a document the post-condition starts
+// REFUSING that it used to write. The second kind is not visible from here
+// (an error is an accepted answer), which is why the positive corpus in
+// hintShapes(), judged by qpdf, is what keeps the refusal honest.
+//
 // ⚠ An ERROR is always an acceptable answer here. Most inputs are not
 // linearizable — six document features are refused outright — and the target is
 // about panics, hangs and a file that contradicts itself, never about how many

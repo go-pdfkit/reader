@@ -351,17 +351,22 @@ func mustDict(t *testing.T, o Object) Dict {
 	return d
 }
 
-// ⛔⛔ THE POST-CONDITION'S OWN FAILURE PATHS, reached by calling it directly.
-// firstPageAgrees runs on what Linearize just wrote, so from Linearize its
-// three defensive branches are unreachable: our own output opens, carries
-// linearization parameters, and has a first page. An unreachable branch is an
-// untested claim, and this package's coverage gate refuses to carry one — so
-// the function takes plain bytes and the branches are exercised with bytes
-// that are not our output.
+// ⛔⛔ THE POST-CONDITION OVER BYTES THAT ARE NOT OURS. firstPageAgrees runs on
+// what Linearize just wrote, so from Linearize its refusal is unreachable: our
+// own output describes itself or the writer is broken. An unreachable branch
+// is an untested claim, and this package's coverage gate refuses to carry one
+// — so the function takes plain bytes and is called with bytes it will refuse.
 //
 // ⭐ No seam, no injected failure: the function's whole input is a []byte, and
 // the cheapest honest test of "what does it say about bytes like these" is to
 // hand it bytes like these.
+//
+// ⛔ THE CASES ARE KEPT THOUGH THE BRANCHES MERGED. The function used to carry
+// three of its own guards — unreadable bytes, no parameters, no first page —
+// and now wraps CheckLinearized, which states the whole invariant rather than
+// three fields of it. One error path instead of three; these three inputs
+// still reach it by three different routes, and each asserts the REASON the
+// checker gave, so a change that made them all fail alike would show.
 func TestWhatTheFirstPageCheckSaysAboutBytesThatAreNotOurs(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -371,7 +376,7 @@ func TestWhatTheFirstPageCheckSaysAboutBytesThatAreNotOurs(t *testing.T) {
 		{
 			name: "bytes that are not a PDF at all",
 			in:   func(*testing.T) []byte { return []byte("not a pdf") },
-			want: "cannot be reopened",
+			want: "does not begin with %PDF-",
 		},
 		{
 			// ⛔ Opens as a document and has NO /Linearized dictionary, which
@@ -396,7 +401,7 @@ func TestWhatTheFirstPageCheckSaysAboutBytesThatAreNotOurs(t *testing.T) {
 				}
 				return b
 			},
-			want: "no usable linearization parameters",
+			want: "not a dictionary",
 		},
 		{
 			// ⛔⛔ IT OPENS, IT HAS PARAMETERS, AND IT HAS NO PAGE. A first
@@ -446,7 +451,7 @@ func TestWhatTheFirstPageCheckSaysAboutBytesThatAreNotOurs(t *testing.T) {
 				t.Fatal("/L did not settle: the fixture cannot declare its own length")
 				return nil
 			},
-			want: "presents no first page",
+			want: "/N says 0 page(s)",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

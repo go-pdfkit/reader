@@ -223,35 +223,40 @@ func (d *Document) Linearize() ([]byte, error) {
 // disagreement would mean re-deriving the reader's page walk here and trusting
 // that the re-derivation matches — a second implementation of the thing being
 // checked. Reading back what was WRITTEN asks the only question that matters:
-// does the file we are about to hand out agree with itself? It costs one Open
-// of our own output, on a writer that already makes two passes.
+// does the file we are about to hand out agree with itself?
 //
-// ⚠ It is NOT a substitute for CheckLinearized, which holds every parameter
-// against the document. This is one invariant, chosen because a file that
-// contradicts itself about its first page defeats the entire purpose of
-// linearizing — a reader fetches /O's bytes and draws the wrong page.
+// ⛔⛔⛔ AND IT ASKS THE WHOLE QUESTION, NOT ONE FIELD OF IT. The first version
+// compared only /O against the reopened document's first page. External review
+// refuted it in 90 seconds on its own fuzz target: the SAME input-walk versus
+// output-tree disagreement reappears one field over, in /N —
+//
+//	/N says 2 page(s) and the document has 1
+//
+// on a mutated linearized.pdf whose /Kids names an object 18 that is absent.
+// Patching /O then /N then /E is a list that grows by one entry per fuzz run,
+// and CheckLinearized already states the whole invariant: it holds EVERY
+// parameter against the document. So the writer runs its own checker over its
+// own output.
+//
+// ⛔ THAT IS NOT CIRCULAR, AND THE REASON IS WORTH KEEPING. Both sides use the
+// reader, but over DIFFERENT documents: the parameters were frozen from the
+// INPUT's page enumeration, while the check walks the page tree of the OUTPUT,
+// which this writer copies through unchanged. What it cannot catch is a defect
+// INSIDE the reader, which would agree with itself on both — it proves
+// self-consistency, never conformance. qpdf is what judges conformance here.
+//
+// ⚠ THE COST, STATED: one full parse of our own output, on a writer that
+// already makes two passes over the document.
+//
+// ⚠ THE RISK, STATED: a defect of OURS now surfaces as "this document cannot
+// be linearized" rather than as a wrong file, which could mask a regression on
+// a document that deserves to be written. What keeps that honest is the
+// positive corpus — every shape in hintShapes(), each judged by qpdf — which
+// goes red the moment a good document starts being refused.
 func firstPageAgrees(out []byte) error {
-	w, err := Open(out)
-	if err != nil {
-		return fmt.Errorf("%w: the file we wrote cannot be reopened: %v",
-			ErrCannotLinearize, err)
-	}
-	lin, err := Linearized(out)
-	if err != nil {
-		return fmt.Errorf("%w: the file we wrote has no usable linearization "+
-			"parameters: %v", ErrCannotLinearize, err)
-	}
-	ref, ok := w.PageRef(1)
-	if !ok {
-		return fmt.Errorf("%w: the file we wrote presents no first page",
-			ErrCannotLinearize)
-	}
-	if ref.Num != lin.FirstPageObject {
-		return fmt.Errorf("%w: this document's page tree and its page order "+
-			"disagree about which page is first — /O would say object %d while "+
-			"the page tree reaches object %d, so a reader fetching the first "+
-			"page would draw a different one",
-			ErrCannotLinearize, lin.FirstPageObject, ref.Num)
+	if _, err := CheckLinearized(out); err != nil {
+		return fmt.Errorf("%w: the file we wrote does not describe itself, so this "+
+			"document cannot be linearized faithfully: %v", ErrCannotLinearize, err)
 	}
 	return nil
 }
