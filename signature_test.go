@@ -192,7 +192,8 @@ func TestSignaturesInheritanceAndNames(t *testing.T) {
 	}
 	s := sigs[0]
 	if s.Field != "form.sig" || s.Filter != "Adobe.PPKLite" || s.SubFilter != "adbe.pkcs7.detached" ||
-		s.Name != "Ann" || s.Reason != "r" || s.Location != "l" || s.M != "D:2026" {
+		s.Name != "" || s.Reason != "" || s.Location != "" || s.M != "" || s.DictionarySigned {
+		// (the claims are withheld: this signature covers nothing)
 		t.Fatalf("got %+v", s)
 	}
 	// No /ByteRange: listed, with the refusal, and no Contents.

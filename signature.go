@@ -63,17 +63,19 @@ type Signature struct {
 	// reserves after the DER removed. It is nil when Err is set.
 	Contents []byte
 	// Name, Reason, Location and M are the signer's claims — who, why, where and
-	// when (M is the date string as written). They are covered by the signature
-	// ONLY when DictionarySigned is true; otherwise an incremental update could
-	// have supplied them (a new dictionary copying /ByteRange and /Contents),
-	// and they are not evidence of anything. Field, the field's /T, is read from
+	// when (M is the date string as written). They are filled in ONLY when
+	// DictionarySigned is true, and empty otherwise: an incremental update could
+	// have supplied them (a new dictionary copying /ByteRange and /Contents), and
+	// a forged value must not be displayable by accident. Even then they are the
+	// signer's claims, not evidence. Field, the field's /T, is read from
 	// the field dictionaries, which this package never ties to the signed
 	// bytes: it is a label, not a signed claim, even when DictionarySigned.
 	Name, Reason, Location, M string
 	// DictionarySigned is true when the signature dictionary was read from an
 	// uncompressed indirect object that contains the gap, so its bytes outside
 	// /Contents lie inside the signed ranges. It is false when the dictionary is
-	// direct, sits in an object stream, or its position cannot be established.
+	// direct, sits in an object stream, its position cannot be established, or
+	// its end lies beyond the second range.
 	DictionarySigned bool
 	// CoversWholeFile is true when the ranges end at the end of the file, so no
 	// byte was added after signing. False for an earlier signature once an
@@ -362,11 +364,6 @@ func (w *sigWalk) signature(field string, sd Dict, h holder) Signature {
 	if n, ok := ToName(w.resolved(sd.Get("SubFilter"))); ok {
 		s.SubFilter = string(n)
 	}
-	s.Name, _ = TextString(w.resolved(sd.Get("Name")))
-	s.Reason, _ = TextString(w.resolved(sd.Get("Reason")))
-	s.Location, _ = TextString(w.resolved(sd.Get("Location")))
-	s.M, _ = TextString(w.resolved(sd.Get("M")))
-
 	arr, ok := ToArray(w.resolved(sd.Get("ByteRange")))
 	if !ok {
 		s.Err = fmt.Errorf("%w: the signature dictionary has no /ByteRange array", ErrByteRange)
@@ -392,12 +389,20 @@ func (w *sigWalk) signature(field string, sd Dict, h holder) Signature {
 		s.Err = g.err
 		return s
 	}
-	signed, err := d.checkContentsObject(sd, h, g.contents, g.r[0][1])
+	signed, err := d.checkContentsObject(sd, h, g.contents, g.r[0][1], g.r[1][1])
 	if err != nil {
 		s.Err = err
 		return s
 	}
 	s.DictionarySigned = signed
+	// ⛔ The signer's claims are handed out only when the signature covers them:
+	// a caller cannot display a forged /Name by accident.
+	if signed {
+		s.Name, _ = TextString(w.resolved(sd.Get("Name")))
+		s.Reason, _ = TextString(w.resolved(sd.Get("Reason")))
+		s.Location, _ = TextString(w.resolved(sd.Get("Location")))
+		s.M, _ = TextString(w.resolved(sd.Get("M")))
+	}
 	s.Contents = g.der
 	s.CoversWholeFile = g.r[1][1] == len(d.buf)
 	return s
@@ -451,8 +456,9 @@ func (d *Document) gap(br []int64) (contents []byte, r [2][2]int, err error) {
 // signed reports whether that positional check ran and passed, that is whether
 // the dictionary's own bytes lie inside the signed ranges. It is false, with no
 // error, for a dictionary the position of which cannot be established (direct
-// or in an object stream) in a file that is not encrypted.
-func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart int) (signed bool, err error) {
+// or in an object stream) in a file that is not encrypted, or whose tail the
+// second range (ending at end) leaves out.
+func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart, end int) (signed bool, err error) {
 	if d.decrypt == nil {
 		parsed, ok := ToString(sd.Get("Contents"))
 		if !ok {
@@ -476,6 +482,13 @@ func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapSt
 	// were checked against the file before this runs).
 	if e.offset < 0 || e.offset > int64(gapStart) || bytes.Contains(d.buf[e.offset:gapStart], []byte("endobj")) {
 		return false, fmt.Errorf("%w: the gap is not inside object %d, which holds the signature dictionary", ErrByteRange, h.ref.Num)
+	}
+	// The dictionary must END inside the signed bytes too: its tail lies before
+	// the object's "endobj", and a signer that wrote a short second range left
+	// that tail out. No "endobj" at all places no end, so nothing is vouched for.
+	tail := bytes.Index(d.buf[gapStart:], []byte("endobj"))
+	if tail == -1 || gapStart+tail > end {
+		return false, nil
 	}
 	return true, nil
 }

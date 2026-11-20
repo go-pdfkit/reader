@@ -324,3 +324,44 @@ func TestWriteSignatureVerifyFuzzSeeds(t *testing.T) {
 		}
 	}
 }
+
+func TestSignatureDictionaryMustEndInsideTheSignedBytes(t *testing.T) {
+	// A signer that wrote a short second range left the dictionary's tail out:
+	// the signature is listed, but does not cover the dictionary, and its claims
+	// are withheld. The edge: a second range that ends where "endobj" begins
+	// covers the whole dictionary.
+	file, _, end := signedByHand(t, "")
+	tail := bytes.Index(file[end:], []byte("endobj"))
+	if tail < 3 {
+		t.Fatalf("fixture changed: %d", tail)
+	}
+	for _, c := range []struct {
+		len1   int
+		signed bool
+	}{{tail, true}, {tail - 1, false}, {2, false}} {
+		f, start, e := signedByHand(t, "")
+		br := fmt.Sprintf("[0 %010d %010d %010d]", start, e, c.len1)
+		f, _, _ = signedByHand(t, br)
+		sigs, err := mustOpen(t, f).Signatures()
+		if err != nil || len(sigs) != 1 || sigs[0].Err != nil || sigs[0].DictionarySigned != c.signed {
+			t.Fatalf("second range of %d bytes: %+v %v", c.len1, sigs, err)
+		}
+	}
+	// The edge of the edge: "endobj" right at the end of the gap is an object end
+	// found at offset 0, not an absence.
+	d := mustOpen(t, file)
+	if _, err := d.Signatures(); err != nil {
+		t.Fatal(err)
+	}
+	keep := append([]byte(nil), d.buf[end:end+6]...)
+	copy(d.buf[end:], "endobj")
+	if sigs, _ := d.Signatures(); len(sigs) != 1 || sigs[0].Err != nil || !sigs[0].DictionarySigned {
+		t.Fatalf("%+v", sigs)
+	}
+	copy(d.buf[end:], keep)
+	// Nothing after the gap says where the object ends: nothing is vouched for.
+	copy(d.buf[end:], bytes.ReplaceAll(d.buf[end:], []byte("endobj"), []byte("endobX")))
+	if sigs, _ := d.Signatures(); len(sigs) != 1 || sigs[0].Err != nil || sigs[0].DictionarySigned {
+		t.Fatalf("%+v", sigs)
+	}
+}

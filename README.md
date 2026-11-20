@@ -1469,9 +1469,22 @@ stream: an incremental update can re-point `/V` at a new dictionary that copies
 the original `/ByteRange` and `/Contents` and forges those claims, and the
 signature still verifies (not whole, but valid; `pdfsig` agrees: valid, "Not
 total document signed", the forged field name, and a signing time taken from the
-CMS, never from `/M`). So read the claims only when `DictionarySigned` is true;
-the field name is never signed by this check. A `/ByteRange` entry must be a
-direct integer, and the gaps of one document may decode to 32 MiB in total.
+CMS, never from `/M`). So `/Name`, `/Reason`, `/Location` and `/M` are
+**withheld** (left empty) unless `DictionarySigned` is true, and it is true only
+when the dictionary starts before the gap in its own object and ends before the
+second range does; the field name is never signed by this check. A `/ByteRange`
+entry must be a direct integer, and the gaps of one document may decode to 32 MiB
+in total.
+
+**Verification is bounded per document.** `signature.VerifyAll` verifies at most
+**64 distinct signatures** (distinct sub-filter, ranges and CMS: fields that share
+one dictionary count once, and each result gets its own copy of the
+certificates) and at most **1 GiB of signed bytes** in total; the rest come back
+with an error wrapping `signature.ErrTooManySignatures`. A heavily signed real
+PDF has tens of signatures, not thousands, and each verification copies and
+hashes every signed byte, so without a bound N signatures in a file of size S
+cost N×S. The CMS is parsed before the file is copied, so a signature that
+cannot be read costs nothing.
 
 ## Install
 

@@ -3,10 +3,12 @@ package signature_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -81,14 +83,20 @@ func TestRelocatedDictionaryIsNotSigned(t *testing.T) {
 	if r.Err != nil || r.Signature.CoversWholeFile {
 		t.Fatalf("the probe's premise changed: err=%v whole=%v", r.Err, r.Signature.CoversWholeFile)
 	}
-	if r.Signature.Name != "Forged Name" || r.Signature.Field != "CEO-Approval" {
-		t.Fatalf("the probe's forged claims were not read: %+v", r.Signature)
+	if r.Signature.Field != "CEO-Approval" {
+		t.Fatalf("the probe's forged field was not read: %+v", r.Signature)
+	}
+	// The forged claims are withheld, not merely flagged.
+	if s := r.Signature; s.Name != "" || s.Reason != "" || s.Location != "" || s.M != "" {
+		t.Fatalf("forged claims handed out: %q %q %q %q", s.Name, s.Reason, s.Location, s.M)
 	}
 	if r.Signature.DictionarySigned {
 		t.Fatal("a dictionary supplied by an incremental update, in an object stream, was reported as covered by the signature")
 	}
-	if orig := results(t, load(t, "rsa-detached.pdf")); !orig[0].Signature.DictionarySigned {
-		t.Fatal("the original dictionary is inside the signed bytes")
+	if orig := results(t, load(t, "rsa-detached.pdf")); !orig[0].Signature.DictionarySigned ||
+		orig[0].Signature.Name != "Test Signer" || orig[0].Signature.Reason != "fixture" ||
+		orig[0].Signature.Location != "Montpellier" || orig[0].Signature.M != "D:20261120120000Z" {
+		t.Fatalf("the original dictionary is inside the signed bytes, and its claims are handed out: %+v", orig[0].Signature)
 	}
 }
 
@@ -165,5 +173,122 @@ func TestWriteRelocatedFuzzSeed(t *testing.T) {
 	body := "go test fuzz v1\n[]byte(" + strconv.Quote(string(relocated(t))) + ")\n"
 	if err := os.WriteFile(filepath.Join(dir, "relocated-dictionary"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// manyDirect builds a file whose catalogue holds n direct signature fields, each
+// with its own direct dictionary, its own /Contents string and so its own
+// /ByteRange, and padding that makes the file bigger.
+func manyDirect(tb testing.TB, n int, contents string, pad int) []byte {
+	tb.Helper()
+	var f strings.Builder
+	f.WriteString("%PDF-1.7\n")
+	o1 := f.Len()
+	f.WriteString("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&f, "<< /T (f%d) /FT /Sig /V << /SubFilter /adbe.pkcs7.detached /ByteRange [0 0000000000 0000000000 0000000000] /Contents <%s> >> >>\n", i, contents)
+	}
+	f.WriteString("] >> >>\nendobj\n")
+	f.WriteString(strings.Repeat("% padding to make the file bigger\n", pad))
+	o2 := f.Len()
+	f.WriteString("2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n")
+	x := f.Len()
+	fmt.Fprintf(&f, "xref\n0 3\n0000000000 65535 f \n%010d 00000 n \n%010d 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", o1, o2, x)
+	file := []byte(f.String())
+	pos := 0
+	for i := 0; i < n; i++ {
+		br := pos + bytes.Index(file[pos:], []byte("/ByteRange ")) + len("/ByteRange ")
+		c := br + bytes.Index(file[br:], []byte("/Contents ")) + len("/Contents ")
+		g := len(contents) + 2
+		copy(file[br:], fmt.Sprintf("[0 %010d %010d %010d]", c, c+g, len(file)-c-g))
+		pos = c + g
+	}
+	return file
+}
+
+func limitedAlloc(tb testing.TB, file []byte) (rs []signature.Result, alloc uint64) {
+	tb.Helper()
+	d, err := reader.Open(file)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(128 << 20))
+	runtime.GC()
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	rs, err = signature.VerifyAll(d)
+	runtime.ReadMemStats(&m1)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return rs, m1.TotalAlloc - m0.TotalAlloc
+}
+
+func countTooMany(rs []signature.Result) (n int) {
+	for _, r := range rs {
+		if errors.Is(r.Err, signature.ErrTooManySignatures) {
+			n++
+		}
+	}
+	return n
+}
+
+// 4000 dictionaries with an empty /Contents each: distinct dedup keys, and the
+// whole file copied for each one before the CMS was found unreadable (2.35 GB).
+func TestVerifyAllDistinctEmptySignaturesCostNothing(t *testing.T) {
+	file := manyDirect(t, 4000, "", 3000)
+	rs, alloc := limitedAlloc(t, file)
+	if len(rs) != 4000 {
+		t.Fatalf("%d results", len(rs))
+	}
+	// Below what 64 copies of the file would allocate: the CMS is parsed first.
+	if alloc > 16<<20 {
+		t.Fatalf("%d signatures in a %d KB file allocated %d MB", len(rs), len(file)>>10, alloc>>20)
+	}
+	if got := countTooMany(rs); got != 4000-64 {
+		t.Fatalf("%d refused for the count, want %d", got, 4000-64)
+	}
+}
+
+// Signatures whose CMS parses are the ones that cost a copy: bounded by count.
+func TestVerifyAllBoundsDistinctSignatures(t *testing.T) {
+	orig := load(t, "rsa-detached.pdf")
+	d0, _ := reader.Open(orig)
+	s0, _ := d0.Signatures()
+	file := manyDirect(t, 100, fmt.Sprintf("%x", s0[0].Contents), 10)
+	rs, _ := limitedAlloc(t, file)
+	if len(rs) != 100 || countTooMany(rs) != 36 {
+		t.Fatalf("%d results, %d refused for the count", len(rs), countTooMany(rs))
+	}
+	for _, r := range rs[:64] {
+		if !errors.Is(r.Err, signature.ErrInvalid) {
+			t.Fatalf("a signature within the bound: %v", r.Err)
+		}
+	}
+	// ...and by the total signed bytes.
+	defer signature.LimitVerify(1000, 3*int64(len(file)))()
+	if rs, _ = limitedAlloc(t, file); countTooMany(rs) != 97 {
+		t.Fatalf("%d refused for the bytes, want 97", countTooMany(rs))
+	}
+}
+
+func TestVerifyAllResultsOwnTheirCertificates(t *testing.T) {
+	orig := load(t, "rsa-detached.pdf")
+	sx := bytes.LastIndex(orig, []byte("startxref"))
+	prev, err := strconv.Atoi(string(bytes.Fields(orig[sx+len("startxref"):])[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _ := update(orig, prev, 8, []int{5, 7}, []string{
+		"<< /Fields [4 0 R 7 0 R] /SigFlags 3 >>",
+		"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig2) /Rect [0 0 0 0] /F 132 /P 3 0 R /V 6 0 R >>",
+	}, "")
+	rs := results(t, file)
+	if len(rs) != 2 || rs[0].Err != nil || rs[1].Err != nil || len(rs[0].Certificates) != 1 {
+		t.Fatalf("%+v", rs)
+	}
+	rs[0].Certificates[0] = nil
+	if rs[1].Certificates[0] == nil {
+		t.Fatal("two results share one Certificates slice")
 	}
 }
