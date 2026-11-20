@@ -13,7 +13,8 @@ module takes existing PDF bytes apart: lexer, object model, cross-reference
 tables and streams, stream filters, the standard security handler, the page
 tree, and content streams. It also writes the same object graph back out,
 which is what every operation on an existing file needs.
-Nothing outside the Go standard library is required, so it builds for
+Nothing outside the Go standard library is required by the package itself
+(only the `reader/signature` sub-package uses go-authn/cms), so it builds for
 `GOOS=js/wasm` and every 64-bit architecture the fleet targets.
 
 ## Status
@@ -1385,6 +1386,76 @@ than part 8: the first run counts first-page objects positionally, whether or
 not a later page uses them. The table above says what each shape now names.
 
 Next wave: the operations built on all of this.
+
+### Digital signatures: read and verify
+
+`Document.Signatures()` lists the signature fields that hold a signature
+(12.7.4.5): it walks `/AcroForm /Fields` and `/Kids` (bounded in depth and in
+field count, cycle-safe), takes `/FT` and `/V` from an ancestor when the field
+has none, and returns one `Signature` per signed field: the fully qualified
+field name, `/Filter`, `/SubFilter`, `/ByteRange`, the `/Contents` DER, the
+signer's claimed `/Name`, `/Reason`, `/Location` and `/M`, and
+`CoversWholeFile` — whether the ranges end at the end of the file. An earlier
+signature of a file with an incremental update after it is valid and not whole;
+that is how forms are filled and signatures stacked, and judging what the update
+changed is the caller's.
+
+`Document.SignedBytes(sig)` returns the bytes the signature covers, and
+**validates the `/ByteRange` before reading through it**. It is also what the
+verifier calls, so nothing is hashed that was not checked.
+
+The sub-package `reader/signature` verifies on top of
+[go-authn/cms](https://github.com/go-authn/cms):
+
+```go
+d, err := reader.Open(file)
+// ...
+results, err := signature.VerifyAll(d)
+// ...
+for _, r := range results {
+    fmt.Println(r.Signature.Field, r.Err == nil, r.Signature.CoversWholeFile)
+    // r.Certificates: hand to crypto/x509 and a revocation checker
+}
+```
+
+- **Verified:** `adbe.pkcs7.detached` and `ETSI.CAdES.detached` — every signer's
+  signature over exactly the `/ByteRange` bytes, by the certificate the CMS
+  names, with the signed attributes' digest.
+- **Refused, with an error wrapping `signature.ErrUnsupported`:**
+  `adbe.pkcs7.sha1` and `adbe.x509.rsa_sha1` (SHA-1, which go-authn/cms refuses,
+  named in the message) and every other `/SubFilter`. poppler's `pdfsig` calls
+  the committed SHA-1 fixture valid; this package refuses it on purpose.
+- **Refused as a `/ByteRange` that the file does not bear out
+  (`reader.ErrByteRange`)**, which is the signature-wrapping class of attacks:
+  not exactly two ranges; a negative number; a first range that does not start at
+  0; ranges that overlap, descend or touch; a range past the end of the file, or
+  a number that overflows (sums are never formed, so 32-bit `int` is safe); a gap
+  that is not exactly one `<hex>` string — a widened gap, a second string, a
+  comment; a string that is not the dictionary's own `/Contents` (value compared
+  on an unencrypted file; on an encrypted one, the gap must lie inside the object
+  that holds the dictionary); a CMS that carries its own copy of the content
+  under a detached `/SubFilter`.
+- **A bad signature does not hide the others.** `Signature.Err` holds the
+  refusal and `Contents` is nil; `Signatures` itself fails only on a form too
+  large or too deep to walk (`reader.ErrTooManyFields`).
+- **The caller's:** trust. Whether the signing certificate chains to something
+  you trust, was valid when the signature was made, and was not revoked — and the
+  signing time, which `/M` merely claims. Nor does it judge a document timestamp
+  (`ETSI.RFC3161`), what an incremental update changed, or the visual appearance.
+- **`/Contents` is read from the file's bytes, never decrypted.** ISO 32000-1
+  §7.6.1 lists no exception for it, so this is a choice (the ranges leave out
+  the raw bytes, and a decrypted copy is not what they bound). ISO 32000-2 was
+  not opened for this change.
+
+The oracle is poppler's `pdfsig`: every fixture under `signature/testdata`
+(signed by OpenSSL, regenerated with `SIGNATURE_REGENERATE=1`, private keys
+discarded) and seven tamperings of one of them — a byte flipped in each range, a
+gap widened or started inside the string, a range past the end, overlapping
+ranges, a flipped signature value — must get the same verdict from `pdfsig` and
+from this package, and the same answer to "whole document". Without `pdfsig` the
+test **skips and says so**; CI installs it and sets `PDFSIG_REQUIRE=1`. `go test
+-fuzz` targets: `FuzzSignatures`, `FuzzByteRange` (corpus under `testdata/fuzz`)
+and `FuzzVerifyAll`.
 
 ## Install
 

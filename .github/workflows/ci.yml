@@ -96,14 +96,25 @@ jobs:
       - name: Say which qpdf will judge
         run: qpdf --version
 
+      # poppler's pdfsig is the judge for signature verdicts: reader/signature
+      # must agree with it on every committed fixture and every tampering of
+      # one. Printed, so "which pdfsig agreed" is answerable from the log.
+      - name: Install pdfsig (poppler-utils), the judge of signature verdicts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+          pdfsig -v
+
       - name: go vet
         run: go vet ./...
 
-      # REQUIRE_QPDF makes a missing judge FAIL here instead of skipping. It
-      # is set on this lane only, because this is the lane that installs it.
+      # REQUIRE_QPDF and PDFSIG_REQUIRE make a missing judge FAIL here instead
+      # of skipping. They are set on this lane only, because this is the lane
+      # that installs the judges.
       - name: Test with coverage
         env:
           REQUIRE_QPDF: "1"
+          PDFSIG_REQUIRE: "1"
         run: go test -covermode=set -coverprofile=coverage.out ./...
 
       - name: Assert exact 100% statement coverage

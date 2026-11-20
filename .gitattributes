@@ -1,0 +1,6 @@
+# Signed PDFs are byte-exact: the signature covers their bytes, and a
+# checkout that rewrites a line ending breaks every one of them.
+signature/testdata/*.pdf binary
+signature/testdata/*.crt text eol=lf
+testdata/fuzz/FuzzSignatures/* text eol=lf
+testdata/fuzz/FuzzByteRange/* text eol=lf
