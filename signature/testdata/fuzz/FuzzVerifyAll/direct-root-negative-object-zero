@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("%PDF-1.7\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n-000000005 00000 n \n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 3 /Root << /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [<< /T (s) /FT /Sig /V << /Type /Sig /SubFilter /adbe.pkcs7.detached /ByteRange [0 0000000334 0000000400 0000000036] /Contents <0000000000000000000000000000000000000000000000000000000000000000> >> >>] >> >> >>\nstartxref\n61\n%%EOF\n")

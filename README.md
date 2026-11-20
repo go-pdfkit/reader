@@ -1395,6 +1395,7 @@ field count, cycle-safe), takes `/FT` and `/V` from an ancestor when the field
 has none, and returns one `Signature` per signed field: the fully qualified
 field name, `/Filter`, `/SubFilter`, `/ByteRange`, the `/Contents` DER, the
 signer's claimed `/Name`, `/Reason`, `/Location` and `/M`, and
+`DictionarySigned` (below) and
 `CoversWholeFile` — whether the ranges end at the end of the file. An earlier
 signature of a file with an incremental update after it is valid and not whole;
 that is how forms are filled and signatures stacked, and judging what the update
@@ -1452,10 +1453,25 @@ The oracle is poppler's `pdfsig`: every fixture under `signature/testdata`
 discarded) and seven tamperings of one of them — a byte flipped in each range, a
 gap widened or started inside the string, a range past the end, overlapping
 ranges, a flipped signature value — must get the same verdict from `pdfsig` and
-from this package, and the same answer to "whole document". Without `pdfsig` the
+from this package, and, **where both say the signature is valid**, the same answer
+to "whole document". For a refused signature the two disagree about "whole" (this
+package reports false for a range it refused, true for a bad CMS in sound ranges),
+and the test does not compare them there. Without `pdfsig` the
 test **skips and says so**; CI installs it and sets `PDFSIG_REQUIRE=1`. `go test
--fuzz` targets: `FuzzSignatures`, `FuzzByteRange` (corpus under `testdata/fuzz`)
-and `FuzzVerifyAll`.
+-fuzz` targets: `FuzzSignatures`, `FuzzByteRange` and `FuzzVerifyAll` (corpora
+under `testdata/fuzz` and `signature/testdata/fuzz`).
+
+**What the signature covers, and what it does not.** `Signature.DictionarySigned`
+is true when the signature dictionary was read from an uncompressed indirect
+object that contains the gap, so its `/Name`, `/Reason`, `/Location` and `/M` lie
+inside the signed ranges. It is false for a direct dictionary or one in an object
+stream: an incremental update can re-point `/V` at a new dictionary that copies
+the original `/ByteRange` and `/Contents` and forges those claims, and the
+signature still verifies (not whole, but valid; `pdfsig` agrees: valid, "Not
+total document signed", the forged field name, and a signing time taken from the
+CMS, never from `/M`). So read the claims only when `DictionarySigned` is true;
+the field name is never signed by this check. A `/ByteRange` entry must be a
+direct integer, and the gaps of one document may decode to 32 MiB in total.
 
 ## Install
 

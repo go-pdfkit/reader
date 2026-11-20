@@ -85,6 +85,9 @@ func TestFixtures(t *testing.T) {
 					t.Errorf("#%d unsupported=%v, err=%v", i, signature.IsUnsupported(r.Err), r.Err)
 				}
 				if w.valid {
+					if !r.Signature.DictionarySigned {
+						t.Errorf("#%d: its dictionary sits in the signed bytes, but DictionarySigned is false", i)
+					}
 					if r.Signature.CoversWholeFile != w.whole {
 						t.Errorf("#%d CoversWholeFile=%v, want %v", i, r.Signature.CoversWholeFile, w.whole)
 					}
@@ -315,6 +318,10 @@ func TestPdfsigAgrees(t *testing.T) {
 				if o.valid != theirs[i].valid {
 					t.Errorf("%s #%d: pdfsig valid=%v, ours valid=%v (%v)", f.name, i+1, theirs[i].valid, o.valid, ours[i].Err)
 				}
+				// Compared only when both say valid, and the README says no more:
+				// for a refused signature the two disagree about "whole" (poppler
+				// reports it from the ranges it read; this package reports false
+				// for a range it refused, and true for a bad CMS in sound ranges).
 				if o.valid && theirs[i].valid && o.whole != theirs[i].whole {
 					t.Errorf("%s #%d: pdfsig whole=%v, ours whole=%v", f.name, i+1, theirs[i].whole, o.whole)
 				}

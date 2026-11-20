@@ -63,9 +63,18 @@ type Signature struct {
 	// reserves after the DER removed. It is nil when Err is set.
 	Contents []byte
 	// Name, Reason, Location and M are the signer's claims — who, why, where and
-	// when (M is the date string as written). Nothing signs them except the
-	// signature's own covered bytes: they are not evidence of anything.
+	// when (M is the date string as written). They are covered by the signature
+	// ONLY when DictionarySigned is true; otherwise an incremental update could
+	// have supplied them (a new dictionary copying /ByteRange and /Contents),
+	// and they are not evidence of anything. Field, the field's /T, is read from
+	// the field dictionaries, which this package never ties to the signed
+	// bytes: it is a label, not a signed claim, even when DictionarySigned.
 	Name, Reason, Location, M string
+	// DictionarySigned is true when the signature dictionary was read from an
+	// uncompressed indirect object that contains the gap, so its bytes outside
+	// /Contents lie inside the signed ranges. It is false when the dictionary is
+	// direct, sits in an object stream, or its position cannot be established.
+	DictionarySigned bool
 	// CoversWholeFile is true when the ranges end at the end of the file, so no
 	// byte was added after signing. False for an earlier signature once an
 	// incremental update was appended (and that is legitimate: forms are filled
@@ -193,9 +202,16 @@ func (d *Document) Signatures() ([]Signature, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &sigWalk{d: d, seen: map[Ref]bool{}, emitted: map[string]bool{}}
-	root, _ := d.trailer.Get("Root").(Ref)
-	form, hold, _ := w.deref(cat.Get("AcroForm"), holder{root, true})
+	w := &sigWalk{d: d, seen: map[Ref]bool{}, emitted: map[string]bool{},
+		byDict: map[Ref]Signature{}, gaps: map[[4]int64]*gapRead{}}
+	// ⛔ A holder is "ok" only when the object really was read from its xref
+	// entry. A direct /Root is not an object of its own: asserting Ref{0} here
+	// credited the catalogue to object 0 and sliced the file at its offset.
+	var hold holder
+	if root, isRef := d.trailer.Get("Root").(Ref); isRef {
+		hold = holder{root, true}
+	}
+	form, hold, _ := w.deref(cat.Get("AcroForm"), hold)
 	fd, _ := ToDict(form)
 	fields, fhold, _ := w.deref(fd.Get("Fields"), hold)
 	arr, _ := ToArray(fields)
@@ -221,6 +237,25 @@ type sigWalk struct {
 	// emitted holds field name + /V reference of every signature listed.
 	emitted map[string]bool
 	out     []Signature
+	// byDict holds the signature read from each /V reference, so that N fields
+	// pointing at one dictionary cost one read, not N.
+	byDict map[Ref]Signature
+	// gaps holds each distinct /ByteRange's decoded gap, and gapBytes the total
+	// decoded so far, against maxGapBytes.
+	gaps     map[[4]int64]*gapRead
+	gapBytes int
+}
+
+// maxGapBytes bounds the bytes all the gaps of one document decode to together.
+// A variable so that a test can lower it.
+var maxGapBytes = 1 << 25
+
+// gapRead is the result of reading one /ByteRange's gap, once.
+type gapRead struct {
+	contents []byte // every decoded byte, for the comparison with the parsed /Contents
+	der      []byte // the trimmed DER, a copy that does not pin contents
+	r        [2][2]int
+	err      error
 }
 
 // deref follows one indirect reference, returning the object and the numbered
@@ -295,6 +330,16 @@ func (w *sigWalk) node(o Object, prefix string, ft Name, v Object, vh holder, h 
 			return nil
 		}
 		w.emitted[key] = true
+		// Another field named this dictionary: same signature, its own name.
+		if s, done := w.byDict[r]; done {
+			s.Field = name
+			w.out = append(w.out, s)
+			return nil
+		}
+		s := w.signature(name, sd, vh2)
+		w.byDict[r] = s
+		w.out = append(w.out, s)
+		return nil
 	}
 	w.out = append(w.out, w.signature(name, sd, vh2))
 	return nil
@@ -332,7 +377,9 @@ func (w *sigWalk) signature(field string, sd Dict, h holder) Signature {
 	// length but four.
 	s.ByteRange = make([]int64, len(arr))
 	for i, e := range arr {
-		n, isInt := w.resolved(e).(Integer)
+		// Direct integers only: Table 252 has every value of a signature
+		// dictionary direct once a byte-range digest is present.
+		n, isInt := e.(Integer)
 		if !isInt {
 			s.ByteRange = nil
 			s.Err = fmt.Errorf("%w: entry %d is not an integer", ErrByteRange, i)
@@ -340,18 +387,48 @@ func (w *sigWalk) signature(field string, sd Dict, h holder) Signature {
 		}
 		s.ByteRange[i] = int64(n)
 	}
-	contents, r, err := d.gap(s.ByteRange)
+	g := w.readGap(s.ByteRange)
+	if g.err != nil {
+		s.Err = g.err
+		return s
+	}
+	signed, err := d.checkContentsObject(sd, h, g.contents, g.r[0][1])
 	if err != nil {
 		s.Err = err
 		return s
 	}
-	if err := d.checkContentsObject(sd, h, contents, r[0][1]); err != nil {
-		s.Err = err
-		return s
-	}
-	s.Contents = trimPadding(contents)
-	s.CoversWholeFile = r[1][1] == len(d.buf)
+	s.DictionarySigned = signed
+	s.Contents = g.der
+	s.CoversWholeFile = g.r[1][1] == len(d.buf)
 	return s
+}
+
+// readGap is d.gap, once per distinct /ByteRange, and bounded in total: the
+// same gap named by two thousand fields is decoded once, and ranges that each
+// name a different region cannot together decode more than maxGapBytes. The
+// DER is a copy, so no Signature pins the whole decoded gap.
+func (w *sigWalk) readGap(br []int64) *gapRead {
+	var key [4]int64
+	cached := len(br) == 4
+	if cached {
+		copy(key[:], br)
+		if g, ok := w.gaps[key]; ok {
+			return g
+		}
+	}
+	g := &gapRead{}
+	if g.r, g.err = checkByteRange(br, len(w.d.buf)); g.err == nil {
+		w.gapBytes += (g.r[1][0] - g.r[0][1]) / 2
+		if w.gapBytes > maxGapBytes {
+			g.err = fmt.Errorf("%w: the gaps of this document's signatures decode to more than %d bytes together", ErrByteRange, maxGapBytes)
+		} else if g.contents, g.err = decodeGap(w.d.buf[g.r[0][1]:g.r[1][0]]); g.err == nil {
+			g.der = append([]byte{}, trimPadding(g.contents)...)
+		}
+	}
+	if cached {
+		w.gaps[key] = g
+	}
+	return g
 }
 
 // gap validates the ranges and decodes the one hex string between them. The
@@ -370,14 +447,19 @@ func (d *Document) gap(br []int64) (contents []byte, r [2][2]int, err error) {
 // bytes. On an encrypted one the parser's value is decrypted and so useless, and
 // the check is positional instead (when the dictionary sits in an uncompressed
 // indirect object): the gap must lie inside that object's bytes.
-func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart int) error {
+//
+// signed reports whether that positional check ran and passed, that is whether
+// the dictionary's own bytes lie inside the signed ranges. It is false, with no
+// error, for a dictionary the position of which cannot be established (direct
+// or in an object stream) in a file that is not encrypted.
+func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart int) (signed bool, err error) {
 	if d.decrypt == nil {
 		parsed, ok := ToString(sd.Get("Contents"))
 		if !ok {
-			return fmt.Errorf("%w: the signature dictionary has no /Contents string", ErrByteRange)
+			return false, fmt.Errorf("%w: the signature dictionary has no /Contents string", ErrByteRange)
 		}
 		if !bytes.Equal(parsed, contents) {
-			return fmt.Errorf("%w: the string in the gap is not the dictionary's /Contents", ErrByteRange)
+			return false, fmt.Errorf("%w: the string in the gap is not the dictionary's /Contents", ErrByteRange)
 		}
 	}
 	e := d.xref[h.ref.Num]
@@ -385,16 +467,17 @@ func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapSt
 		if d.decrypt != nil {
 			// Nothing ties the gap to the dictionary, and the value check
 			// above could not run: refuse rather than guess.
-			return fmt.Errorf("%w: in an encrypted file the signature dictionary must sit in its own uncompressed object, so that the gap can be placed in it", ErrByteRange)
+			return false, fmt.Errorf("%w: in an encrypted file the signature dictionary must sit in its own uncompressed object, so that the gap can be placed in it", ErrByteRange)
 		}
-		return nil
+		return false, nil
 	}
-	// e.offset is in the file: this object was read from it to get here
-	// (getAtOffset refuses an offset outside it), so it can be sliced from.
-	if e.offset > int64(gapStart) || bytes.Contains(d.buf[e.offset:gapStart], []byte("endobj")) {
-		return fmt.Errorf("%w: the gap is not inside object %d, which holds the signature dictionary", ErrByteRange, h.ref.Num)
+	// h.ok means the object was read through this xref entry, but the slice is
+	// guarded all the same: 0 <= offset <= gapStart <= len(d.buf) (the ranges
+	// were checked against the file before this runs).
+	if e.offset < 0 || e.offset > int64(gapStart) || bytes.Contains(d.buf[e.offset:gapStart], []byte("endobj")) {
+		return false, fmt.Errorf("%w: the gap is not inside object %d, which holds the signature dictionary", ErrByteRange, h.ref.Num)
 	}
-	return nil
+	return true, nil
 }
 
 // SignedBytes returns the bytes the signature covers: the file's two ranges,

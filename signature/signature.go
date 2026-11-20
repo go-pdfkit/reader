@@ -21,6 +21,7 @@
 package signature
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -82,10 +83,34 @@ func VerifyAll(d *reader.Document) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Verification is a function of the sub-filter, the ranges and the CMS bytes,
+	// and it copies and hashes the whole file: fields that share one signature
+	// dictionary are verified once, not once each.
+	type key struct {
+		sub string
+		br  [4]int64
+		cms [sha256.Size]byte
+	}
+	type verdict struct {
+		certs []*x509.Certificate
+		err   error
+	}
+	done := map[key]verdict{}
 	out := make([]Result, len(sigs))
 	for i, s := range sigs {
 		out[i].Signature = s
-		out[i].Certificates, out[i].Err = Verify(d, s)
+		if s.Err != nil { // refused cheaply, and carries no ranges worth keying
+			out[i].Certificates, out[i].Err = Verify(d, s)
+			continue
+		}
+		k := key{sub: s.SubFilter, cms: sha256.Sum256(s.Contents)}
+		copy(k.br[:], s.ByteRange)
+		v, ok := done[k]
+		if !ok {
+			v.certs, v.err = Verify(d, s)
+			done[k] = v
+		}
+		out[i].Certificates, out[i].Err = v.certs, v.err
 	}
 	return out, nil
 }
