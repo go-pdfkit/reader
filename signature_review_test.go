@@ -226,6 +226,32 @@ func TestSignaturesManyFieldsOneDictionaryDecodeOnce(t *testing.T) {
 	}
 }
 
+func TestSignatureDirectDictionariesWithOneByteRangeShareTheirGap(t *testing.T) {
+	// Two direct /V dictionaries, no reference to cache by, naming the same
+	// ranges: the gap is read once and the DER is one copy.
+	zeros := strings.Repeat("0", 64)
+	one := "<< /T (%s) /FT /Sig /V << /SubFilter /adbe.pkcs7.detached /ByteRange [0 0000000000 0000000000 0000000000] /Contents <" + zeros + "> >> >>"
+	file := formDoc("["+fmt.Sprintf(one, "a")+fmt.Sprintf(one, "b")+"]", nil)
+	start := bytes.Index(file, []byte("/Contents <")) + len("/Contents ")
+	end := start + 66
+	br := fmt.Sprintf("[0 %010d %010d %010d]", start, end, len(file)-end)
+	for at := 0; ; {
+		i := bytes.Index(file[at:], []byte("/ByteRange "))
+		if i < 0 {
+			break
+		}
+		copy(file[at+i+len("/ByteRange "):], br)
+		at += i + 1
+	}
+	sigs, err := mustOpen(t, file).Signatures()
+	if err != nil || len(sigs) != 2 || sigs[0].Err != nil || sigs[1].Err != nil {
+		t.Fatalf("%+v %v", sigs, err)
+	}
+	if &sigs[0].Contents[0] != &sigs[1].Contents[0] {
+		t.Error("the same gap was decoded and copied twice")
+	}
+}
+
 func TestSignatureGapsAreBoundedInTotal(t *testing.T) {
 	// Direct /V dictionaries each naming a different end for the gap: nothing to
 	// cache by reference, and each would allocate half its gap before the first
