@@ -16,3 +16,8 @@ coverage.out
 # without which the checker's positive tests skip there and the coverage gate
 # fails while reading 100% locally.
 !testdata/*.pdf
+# ...and the signed ones under signature/testdata: a signature is made by a
+# private key that is discarded, so these files cannot be rebuilt in code and
+# CI has no key to make them. (An earlier push of this branch lacked them,
+# because the rule above ignored them, and every lane went red.)
+!signature/testdata/*.pdf
