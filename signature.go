@@ -5,6 +5,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // Reading digital signatures (ISO 32000-1 §12.8). This file finds the
@@ -242,6 +243,12 @@ type sigWalk struct {
 	// byDict holds the signature read from each /V reference, so that N fields
 	// pointing at one dictionary cost one read, not N.
 	byDict map[Ref]Signature
+	// endobjs holds the offset of every "endobj" in the file, ascending, built
+	// once on first need: the positional checks of N dictionaries in one object
+	// are then N binary searches, not N scans of that object (16 000 fields in
+	// one 2.1 MB object took 17 s scanning). A cache per OBJECT would not do:
+	// nested "N 0 obj" headers before one distant "endobj" each scan to it.
+	endobjs []int
 	// gaps holds each distinct /ByteRange's decoded gap, and gapBytes the total
 	// decoded so far, against maxGapBytes.
 	gaps     map[[4]int64]*gapRead
@@ -389,7 +396,7 @@ func (w *sigWalk) signature(field string, sd Dict, h holder) Signature {
 		s.Err = g.err
 		return s
 	}
-	signed, err := d.checkContentsObject(sd, h, g.contents, g.r[0][1], g.r[1][1])
+	signed, err := d.checkContentsObject(sd, h, g.contents, g.r[0][1], g.r[1][1], w.endobjOffsets)
 	if err != nil {
 		s.Err = err
 		return s
@@ -458,7 +465,7 @@ func (d *Document) gap(br []int64) (contents []byte, r [2][2]int, err error) {
 // error, for a dictionary the position of which cannot be established (direct
 // or in an object stream) in a file that is not encrypted, or whose tail the
 // second range (ending at end) leaves out.
-func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart, end int) (signed bool, err error) {
+func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapStart, end int, endobjs func() []int) (signed bool, err error) {
 	if d.decrypt == nil {
 		parsed, ok := ToString(sd.Get("Contents"))
 		if !ok {
@@ -480,17 +487,53 @@ func (d *Document) checkContentsObject(sd Dict, h holder, contents []byte, gapSt
 	// h.ok means the object was read through this xref entry, but the slice is
 	// guarded all the same: 0 <= offset <= gapStart <= len(d.buf) (the ranges
 	// were checked against the file before this runs).
-	if e.offset < 0 || e.offset > int64(gapStart) || bytes.Contains(d.buf[e.offset:gapStart], []byte("endobj")) {
+	if e.offset < 0 || e.offset > int64(gapStart) {
+		return false, fmt.Errorf("%w: the gap is not inside object %d, which holds the signature dictionary", ErrByteRange, h.ref.Num)
+	}
+	// The first "endobj" at or after the object's start must not end before the
+	// gap does begin: one that does closes the object before the gap.
+	ends := endobjs()
+	first, _ := slices.BinarySearch(ends, int(e.offset))
+	if first < len(ends) && ends[first]+len(endobj) <= gapStart {
 		return false, fmt.Errorf("%w: the gap is not inside object %d, which holds the signature dictionary", ErrByteRange, h.ref.Num)
 	}
 	// The dictionary must END inside the signed bytes too: its tail lies before
 	// the object's "endobj", and a signer that wrote a short second range left
 	// that tail out. No "endobj" at all places no end, so nothing is vouched for.
-	tail := bytes.Index(d.buf[gapStart:], []byte("endobj"))
-	if tail == -1 || gapStart+tail > end {
+	tail, _ := slices.BinarySearch(ends, gapStart)
+	if tail == len(ends) || ends[tail] > end {
 		return false, nil
 	}
 	return true, nil
+}
+
+var endobj = []byte("endobj")
+
+// endobjOffsets returns the offset of every "endobj" in the file, ascending,
+// indexing the file on the first call. "endobj" cannot overlap itself, so one
+// forward scan finds every occurrence.
+func (w *sigWalk) endobjOffsets() []int {
+	if w.endobjs == nil {
+		w.endobjs = indexEndobjs(w.d.buf)
+	}
+	return w.endobjs
+}
+
+// indexEndobjs is a variable so that a test can count the scans of the file.
+var indexEndobjs = func(buf []byte) []int { return indexOf(buf, endobj) }
+
+// indexOf returns the offsets of the non-overlapping occurrences of sep in buf,
+// ascending; an empty, non-nil slice when there is none.
+func indexOf(buf, sep []byte) []int {
+	at := []int{}
+	for i := 0; ; {
+		k := bytes.Index(buf[i:], sep)
+		if k < 0 {
+			return at
+		}
+		at = append(at, i+k)
+		i += k + len(sep)
+	}
 }
 
 // SignedBytes returns the bytes the signature covers: the file's two ranges,
